@@ -71,7 +71,22 @@ module Lua
       @fs = fs
       block_scope(block)
       emit(Op::RETURN, 0, 0)
+      pack(p)
       p
+    end
+
+    # Execution encoding: op | a<<8 | b<<24 | c<<44 (a signed 16, b/c 20).
+    private def pack(p : Proto) : Nil
+      packed = Array(UInt64).new(p.code.size)
+      p.code.each do |i|
+        w = i.op.value.to_u64!
+        w |= (i.a & 0xFFFF).to_u64! << 8
+        w |= (i.b & 0xFFFFF).to_u64! << 24
+        w |= (i.c & 0xFFFFF).to_u64! << 44
+        packed << w
+      end
+      p.packed = packed
+      p.protos.each { |child| pack(child) }
     end
 
     private def fs : FuncState
@@ -967,8 +982,7 @@ module Lua
         frame = @frames[@fsize - 1]
           cl = frame.closure
           proto = cl.proto
-          code = proto.code
-          cp = code.to_unsafe # code never changes after compile: unchecked reads
+          cp = proto.packed.to_unsafe # frozen after compile: unchecked reads
           consts = proto.consts
           kp = consts.to_unsafe # same: consts are frozen after compile
           lines = proto.lines
@@ -982,12 +996,12 @@ module Lua
             # sp refresh per iteration: the stack buffer may have been
             # reallocated (ensure_stack) by any op that re-entered the VM.
             sp = stack.to_unsafe
-            inst = cp[pc]
+            w = cp[pc]
             pc += 1
-            op = inst.op
-            a = inst.a
-            b = inst.b
-            c = inst.c
+            op = (w & 0xFF).to_u8!.unsafe_as(Op)
+            a = ((w >> 8).to_i64! << 48 >> 48).to_i32!
+            b = ((w >> 24).to_i64! << 44 >> 44).to_i32!
+            c = ((w >> 44).to_i64! << 44 >> 44).to_i32!
             case op
             when .move?      then sp[base + a] = sp[base + b]
             when .loadnil?
@@ -1228,8 +1242,7 @@ module Lua
                     frame = nf
                     cl = fn
                     proto = p
-                    code = p.code
-                    cp = code.to_unsafe
+                    cp = p.packed.to_unsafe
                     consts = p.consts
                     kp = consts.to_unsafe
                     lines = p.lines
@@ -1323,8 +1336,7 @@ module Lua
               frame = cf
               cl = cf.closure
               proto = cl.proto
-              code = proto.code
-              cp = code.to_unsafe
+              cp = proto.packed.to_unsafe
               consts = proto.consts
               kp = consts.to_unsafe
               lines = proto.lines

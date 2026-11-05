@@ -308,9 +308,13 @@ module Lua
     end
   end
 
-  # Compiled function body.
+  # Compiled function body. `code` holds readable Insts while compiling;
+  # `packed` is the execution form — one UInt64 per instruction
+  # (op:8 | a:16s | b:20s | c:20s) — half the fetch traffic of the 16-byte
+  # struct and the fixed encoding the JIT will consume.
   class Proto
     property code = [] of Inst
+    property packed = [] of UInt64
     property lines = [] of Int32 # line per instruction, for error messages
     property consts = [] of LuaValue
     property protos = [] of Proto
