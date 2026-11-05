@@ -8,7 +8,7 @@ end
 
 def startup_overhead(vm) # min of 5 empty runs, subtracted from every bench
   cmd = VMS.fetch(vm)[:bin]
-  empty = File.join(BENCH_DIR, "results", ".empty.lua")
+  empty = File.join(Dir.tmpdir, "lua5-bench-empty.lua")
   FileUtils.mkdir_p(File.dirname(empty))
   File.write(empty, "")
   5.times.map do
@@ -18,18 +18,21 @@ def startup_overhead(vm) # min of 5 empty runs, subtracted from every bench
   end.min
 end
 
-def run_suite(vm)
+def run_suite(vm, filter = nil)
   conf = VMS.fetch(vm)
   cmd  = conf[:bin]
   abort "Missing interpreter #{cmd.first} — see bench/vendor (build Lua/LuaJIT first)." unless File.executable?(cmd.first)
 
+  benches = filter ? BENCHES.select { |name, _param| name == filter } : BENCHES
+  abort "Unknown bench '#{filter}'. Available: #{BENCHES.map(&:first).join(', ')}" if benches.empty? && filter
+
   reps    = (ENV["BENCH_REPS"]    || 3).to_i
   timeout = (ENV["BENCH_TIMEOUT"] || (vm == "clua" ? 120 : 300)).to_i
   overhead = startup_overhead(vm)
-  puts "#{conf[:label]}: reps=#{reps} timeout=#{timeout}s startup-overhead=#{overhead.round(4)}s"
+  puts "#{conf[:label]}: benches=#{benches.size} reps=#{reps} timeout=#{timeout}s startup-overhead=#{overhead.round(4)}s"
 
   results = {}
-  BENCHES.each do |name, param|
+  benches.each do |name, param|
     file = File.join(SUITE, "#{name}.lua")
     times, sha, status = [], nil, "ok"
     reps.times do
@@ -79,13 +82,15 @@ end
 
 namespace :benchmark do
   %w[lua jitlua].each do |vm|
-    desc "Run bench suite on #{VMS.fetch(vm)[:label]}"
-    task(vm.to_sym) { run_suite(vm) }
+    desc "Run bench suite on #{VMS.fetch(vm)[:label]} (optional: one bench name)"
+    task(vm.to_sym, [:bench]) do |_t, args|
+      run_suite(vm, args[:bench])
+    end
   end
 
-  desc "Run bench suite on the Crystal interpreter (builds bin/lua5 if missing)"
-  task :clua do
+  desc "Run bench suite on the Crystal interpreter (builds bin/lua5; optional: one bench name)"
+  task :clua, [:bench] do |_t, args|
     build_clua!
-    run_suite("clua")
+    run_suite("clua", args[:bench])
   end
 end

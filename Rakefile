@@ -18,6 +18,7 @@ require "fileutils"
 require "json"
 require "open3"
 require "digest"
+require "tmpdir"
 
 REPO_ROOT = File.expand_path(__dir__)
 BENCH_DIR = File.join(REPO_ROOT, "bench")

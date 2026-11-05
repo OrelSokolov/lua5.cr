@@ -4,6 +4,8 @@
 module Lua
   alias LuaValue = Nil | Bool | Float64 | String | LuaTable | LuaClosure | LuaFunction | LuaUserData
 
+  EMPTY_VALS = [] of LuaValue
+
   def self.type_name(v : LuaValue) : String
     case v
     when Nil            then "nil"
@@ -90,25 +92,6 @@ module Lua
     end
   end
 
-  # Non-local exits for the tree interpreter.
-  class ReturnSignal < Exception
-    property values : Array(LuaValue) = [] of LuaValue
-  end
-
-  class BreakSignal < Exception
-  end
-
-  # Proper tail call: `return f(args)` unwinds one interpreter frame and
-  # re-enters Interp#call in a loop instead of recursing.
-  class TailCallSignal < Exception
-    property fn : LuaValue
-    property args : Array(LuaValue)
-
-    def initialize(@fn, @args)
-      super("tail call")
-    end
-  end
-
   # --- table ---
 
   class LuaTable
@@ -160,13 +143,119 @@ module Lua
     end
   end
 
-  # --- functions ---
+  # --- bytecode (see vm.cr for the compiler and the dispatch loop) ---
+
+  enum Op : UInt8
+    MOVE      # A: R[A] = R[B]                                  (B: src)
+    LOADNIL   # A..A+B = nil
+    LOADBOOL  # R[A] = (B != 0)
+    LOADK     # R[A] = K[B]
+    GETGLOBAL # R[A] = G[K[B]]            (K[B] is a String)
+    SETGLOBAL # G[K[B]] = R[A]
+    GETUPVAL  # R[A] = U[B]
+    SETUPVAL  # U[B] = R[A]
+    GETTABLE  # R[A] = R[B][R[C]]
+    SETTABLE  # R[A][R[B]] = R[C]
+    SELF      # R[A+1] = R[B]; R[A] = R[B][K[C]]          (K[C] is a String)
+    NEWTABLE  # R[A] = {}
+    SETLIST   # R[A][C+1..C+B] = R[A+1..A+B]; B == -1: up to top
+    ADD       # R[A] = R[B] + R[C]   (metatable-dispatched, string coercion)
+    SUB
+    MUL
+    DIV
+    MOD
+    POW
+    UNM       # R[A] = -R[B]
+    NOT       # R[A] = not R[B]
+    LEN       # R[A] = #R[B]
+    CONCAT    # R[A] = R[A] .. .. .. R[B]   (right-fold)
+    EQ        # R[A] = (R[B] == R[C])
+    NEQ       # R[A] = (R[B] ~= R[C])
+    LT        # R[A] = (R[B] < R[C])
+    LE        # R[A] = (R[B] <= R[C])
+    JMP       # pc += B
+    JMPF      # pc += B unless truthy(R[A])
+    JMPT      # pc += B if truthy(R[A])
+    CALL      # call R[A]; B = #args (-1: to top); C = #results (-1: all, 0: none)
+    TAILCALL  # return R[A](args at A+1..); B as CALL
+    RETURN    # return R[A..A+B-1]; B == -1: to top, 0: none
+    VARARG    # R[A..] = varargs; B as CALL's C (-1: all + top, n: exact, 0: none)
+    CLOSURE   # R[A] = closure over P[B], upvalues resolved here
+    CLOSE     # close upvalues at registers >= A
+    FORPREP   # numeric-for setup at A..A+2; jump B if the loop never runs
+    FORLOOP   # numeric-for step+test at A; jump B to body start
+    TFORCALL  # generic-for at A (f, s, ctrl), C control vars at A+3..; jump B back
+  end
+
+  struct Inst
+    property op : Op
+    property a : Int32
+    property b : Int32
+    property c : Int32
+
+    def initialize(@op : Op, @a : Int32 = 0, @b : Int32 = 0, @c : Int32 = 0)
+    end
+  end
+
+  # How a nested function's upvalue is resolved at CLOSURE time.
+  class UpvalDesc
+    getter name : String
+    # true: `index` is a register of the enclosing function;
+    # false: `index` is an upvalue of the enclosing function.
+    getter? from_stack : Bool
+    getter index : Int32
+
+    def initialize(@name, @from_stack, @index)
+    end
+  end
+
+  # Compiled function body.
+  class Proto
+    property code = [] of Inst
+    property lines = [] of Int32 # line per instruction, for error messages
+    property consts = [] of LuaValue
+    property protos = [] of Proto
+    property upvals = [] of UpvalDesc
+    property num_params : Int32 = 0
+    property? vararg : Bool = false
+    property max_stack : Int32 = 2
+    getter chunkname : String
+
+    def initialize(@chunkname)
+    end
+  end
+
+  # A captured local: either "open" (still a slot in the shared VM stack)
+  # or "closed" (a cell of its own, after its scope exited).
+  class UpValue
+    property stack : Array(LuaValue)?
+    property idx : Int32
+    property value : LuaValue = nil
+
+    def initialize(@stack, @idx)
+    end
+  end
 
   class LuaClosure
-    getter proto : AST::FuncE
-    getter env : Env
+    getter proto : Proto
+    getter upvals : Array(UpValue)
 
-    def initialize(@proto, @env)
+    def initialize(@proto, @upvals)
+    end
+  end
+
+  # One VM call frame. Registers live in the shared Interp stack at
+  # base..top; R[0] is the closure itself, params follow at R[1..].
+  class Frame
+    property closure : LuaClosure
+    property base : Int32
+    property pc : Int32 = 0
+    property top : Int32
+    property varargs : Array(LuaValue)
+    # C operand of the CALL that pushed this frame (-1/0/n).
+    property want : Int32 = -1
+
+    def initialize(@closure, @base, @top, @varargs)
     end
   end
 
@@ -192,51 +281,6 @@ module Lua
     property metatable : LuaTable? = nil
 
     def initialize(@obj : Exposable)
-    end
-  end
-
-  # --- environments ---
-
-  # A local slot; closures capture the cell, not the value.
-  class Cell
-    property value : LuaValue = nil
-  end
-
-  class Env
-    property varargs : Array(LuaValue)? = nil
-    @vars = {} of String => Cell
-
-    def initialize(@parent : Env? = nil, @func_env = false)
-    end
-
-    def func_env? : Bool
-      @func_env
-    end
-
-    def define(name : String, val : LuaValue) : Nil
-      c = Cell.new
-      c.value = val
-      @vars[name] = c
-    end
-
-    def find(name : String) : Cell?
-      e : Env? = self
-      while e
-        if c = e.@vars[name]?
-          return c
-        end
-        e = e.@parent
-      end
-      nil
-    end
-
-    def find_varargs : Array(LuaValue)?
-      e : Env? = self
-      while e
-        return e.varargs if e.func_env?
-        e = e.@parent
-      end
-      nil
     end
   end
 end

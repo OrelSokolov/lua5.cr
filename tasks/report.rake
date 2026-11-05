@@ -42,7 +42,8 @@ namespace :benchmark do
           row << "—#{r['status'][0] if r && r['status'] != 'ok'}".strip # —t (timeout) / —e (err)
         else
           mark = ""
-          if v != "jitlua" &&
+          # series prints its own elapsed time — its output never matches byte-wise
+          if v != "jitlua" && name != "series" &&
              data = runs.dig("jitlua") and r2 = data[:json]["results"][name] and
              r2["output_sha"] != r["output_sha"]
             mark = " !"
