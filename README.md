@@ -1,4 +1,4 @@
-# lua5.cr
+# lua5.cr - luabind layer for crystal with Lua interpreter itself
 
 Lua 5.1 interpreter written entirely in Crystal — a module-by-module port of
 [MoonSharp](https://github.com/moonsharp-devs/moonsharp) (C#). No native Lua,
