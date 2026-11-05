@@ -740,10 +740,16 @@ module Lua
   # --- execution (port of MoonSharp Execution/Vm / lua's lvm.c) ---
 
   class Interp
+    # Call frames in a grow-only buffer with a logical size: call/return
+    # never touches the Array (no push/pop churn) and slots above @fsize
+    # are the reuse pool.
     @frames = [] of Frame
-    @frame_pool = [] of Frame
+    @fsize = 0
     @stack = Array(LuaValue).new(4096, nil.as(LuaValue))
     @open_upvals = [] of UpValue
+    # Highest stack index currently captured by an open upvalue; lets hot
+    # paths skip close_upvals entirely when nothing this deep is captured.
+    @open_max = -1
 
     private def ensure_stack(n : Int32) : Nil
       while @stack.size <= n
@@ -756,16 +762,20 @@ module Lua
     # each frame's register window (base + max_stack), whichever is higher.
     private def stack_hi : Int32
       hi = 0
-      @frames.each do |f|
+      i = 0
+      while i < @fsize
+        f = @frames[i]
         hi = f.top if f.top > hi
         w = f.base + f.closure.proto.max_stack
         hi = w if w > hi
+        i += 1
       end
       hi
     end
 
     def close_upvals(min_idx : Int32) : Nil
       i = 0
+      closed = false
       while i < @open_upvals.size
         u = @open_upvals[i]
         if (s = u.stack) && u.idx >= min_idx
@@ -774,9 +784,17 @@ module Lua
           last = @open_upvals.size - 1
           @open_upvals.swap(i, last)
           @open_upvals.pop
+          closed = true
         else
           i += 1
         end
+      end
+      if closed
+        m = -1
+        @open_upvals.each do |u|
+          m = u.idx if u.idx > m
+        end
+        @open_max = m
       end
     end
 
@@ -786,6 +804,7 @@ module Lua
       end
       u = UpValue.new(@stack, abs)
       @open_upvals << u
+      @open_max = abs if abs > @open_max
       u
     end
 
@@ -806,14 +825,19 @@ module Lua
       end
       top = newbase + {p.max_stack, argn + 1}.max
       ensure_stack(top + argn + 4)
-      nf = @frame_pool.pop? || Frame.new(fn, newbase, top, vars)
+      if @fsize < @frames.size
+        nf = @frames[@fsize]
+      else
+        nf = Frame.new(fn, newbase, top, vars)
+        @frames << nf
+      end
       nf.closure = fn
       nf.base = newbase
       nf.top = top
       nf.varargs = vars
       nf.pc = 0
       nf.want = want
-      @frames << nf
+      @fsize += 1
     end
 
     # Call a non-closure value from the VM (native / __call table), used by
@@ -834,10 +858,9 @@ module Lua
       end
     end
 
-    # Pop the top frame, keeping it for reuse (calls must not allocate).
+    # Pop the top frame: just shrink the logical size (the slot is reused).
     private def retire_frame : Nil
-      f = @frames.pop
-      @frame_pool << f if @frame_pool.size < 4096
+      @fsize -= 1
     end
 
     # Place call results at R[ra] according to the CALL C operand.
@@ -867,7 +890,7 @@ module Lua
     # Returns true if that was the entry frame of this run_vm (finish up).
     private def frame_return(frame : Frame, res : Array(LuaValue)) : Bool
       stack = @stack
-      cf = @frames.size >= 2 ? @frames[@frames.size - 2] : nil
+      cf = @fsize >= 2 ? @frames[@fsize - 2] : nil
       if cf.nil?
         retire_frame
         return true
@@ -896,37 +919,10 @@ module Lua
       false
     end
 
-    # Return of a Lua frame: results are already in the stack at
-    # base+A..; shift them down to base.. (no intermediate Array alloc).
-    private def frame_return_fast(frame : Frame, a : Int32, nres : Int32) : Nil
-      cf = @frames[@frames.size - 2]
-      base = frame.base
-      stack = @stack
-      if a > 0 && nres > 0
-        i = 0
-        while i < nres
-          stack[base + i] = stack[base + a + i]
-          i += 1
-        end
-      end
-      case frame.want
-      when -1 then cf.top = base + nres
-      when 0  then cf.top = base
-      else
-        i = nres
-        while i < frame.want
-          stack[base + i] = nil
-          i += 1
-        end
-        cf.top = base + frame.want
-      end
-      retire_frame
-    end
-
     # Execute a closure in the VM. Re-entrant: native functions called from
     # the loop enter here again with their own frame stack segment.
     def run_vm(cl0 : LuaClosure, args : Array(LuaValue)) : Array(LuaValue)
-      entry_frames = @frames.size
+      entry_frames = @fsize
       entry_base = stack_hi
       base0 = entry_base
       p0 = cl0.proto
@@ -945,13 +941,18 @@ module Lua
       end
       f0 = Frame.new(cl0, base0, base0 + {p0.max_stack, args.size + 1}.max, vars)
       f0.want = 0
-      @frames << f0
+      if @fsize < @frames.size
+        @frames[@fsize] = f0
+      else
+        @frames << f0
+      end
+      @fsize += 1
       results = Lua::EMPTY_VALS
       done = false
 
       begin
       until done
-        frame = @frames[@frames.size - 1]
+        frame = @frames[@fsize - 1]
           cl = frame.closure
           proto = cl.proto
           code = proto.code
@@ -1168,7 +1169,7 @@ module Lua
               ste = sp[base + a + 2].as(Float64)
               ctrl += ste
               if ste > 0 ? ctrl <= lim : ctrl >= lim
-                close_upvals(base + a) unless @open_upvals.empty? # freeze this iteration's loop var
+                close_upvals(base + a) if @open_max >= base + a # freeze this iteration's loop var
                 sp[base + a] = ctrl
                 pc += b
               end
@@ -1187,10 +1188,46 @@ module Lua
                 pc += b
               end
             when .call?
-              fn = stack[base + a]
+              fn = sp[base + a]
               argn = b == -1 ? frame.top - (base + a + 1) : b
               if fn.is_a?(LuaClosure)
                 frame.pc = pc
+                p = fn.proto
+                # fast path: exact args, no varargs, stack already sized —
+                # push the frame inline and switch without leaving the loop
+                if p.num_params == argn && !p.vararg?
+                  newbase = base + a
+                  top2 = newbase + {p.max_stack, argn + 1}.max
+                  if top2 + argn + 4 < @stack.size
+                    fp = @frames.to_unsafe
+                    if @fsize < @frames.size
+                      nf = fp[@fsize]
+                    else
+                      nf = Frame.new(fn, newbase, top2, Lua::EMPTY_VALS)
+                      @frames << nf
+                    end
+                    nf.closure = fn
+                    nf.base = newbase
+                    nf.top = top2
+                    nf.varargs = Lua::EMPTY_VALS
+                    nf.pc = 0
+                    nf.want = c
+                    @fsize += 1
+                    frame = nf
+                    cl = fn
+                    proto = p
+                    code = p.code
+                    cp = code.to_unsafe
+                    consts = p.consts
+                    kp = consts.to_unsafe
+                    lines = p.lines
+                    upvals = fn.upvals
+                    uv = upvals.to_unsafe
+                    base = newbase
+                    pc = 0
+                    next
+                  end
+                end
                 push_call(fn, base + a, argn, c)
                 break # re-fetch frame
               else
@@ -1203,7 +1240,7 @@ module Lua
               @line = lines[pc - 1]
               fn = stack[base + a]
               argn = b == -1 ? frame.top - (base + a + 1) : b
-              close_upvals(base) unless @open_upvals.empty?
+              close_upvals(base) if @open_max >= base
               if fn.is_a?(LuaClosure)
                 # slide fn + args down over the current frame and reuse it
                 i = 0
@@ -1231,7 +1268,7 @@ module Lua
                 break # re-fetch frame
               else
                 r = call_value(fn, base + a, argn)
-                if @frames.size == entry_frames + 1 || frame_return(frame, r)
+                if @fsize == entry_frames + 1 || frame_return(frame, r)
                   results = r
                   done = true
                   break
@@ -1240,23 +1277,58 @@ module Lua
               end
             when .return?
               nres = b == -1 ? frame.top - (base + a) : b
-              if @frames.size == entry_frames + 1
+              if @fsize == entry_frames + 1
                 results = Array(LuaValue).new(nres) { |j| stack[base + a + j] }
                 done = true
                 break
               end
-              close_upvals(base) unless @open_upvals.empty?
-              frame_return_fast(frame, a, nres)
-              break # re-fetch caller frame
+              close_upvals(base) if @open_max >= base
+              # inline frame return: shift results down, switch to the
+              # caller's frame without leaving the dispatch loop
+              fp = @frames.to_unsafe
+              cf = fp[@fsize - 2]
+              if a > 0 && nres > 0
+                st = @stack
+                i = 0
+                while i < nres
+                  st[base + i] = st[base + a + i]
+                  i += 1
+                end
+              end
+              case frame.want
+              when -1 then cf.top = base + nres
+              when 0  then cf.top = base
+              else
+                st = @stack
+                i = nres
+                while i < frame.want
+                  st[base + i] = nil
+                  i += 1
+                end
+                cf.top = base + frame.want
+              end
+              @fsize -= 1
+              frame = cf
+              cl = cf.closure
+              proto = cl.proto
+              code = proto.code
+              cp = code.to_unsafe
+              consts = proto.consts
+              kp = consts.to_unsafe
+              lines = proto.lines
+              upvals = cl.upvals
+              uv = upvals.to_unsafe
+              base = cf.base
+              pc = cf.pc
+              stack = @stack
+              next
             end
           end
         end
         results
       ensure
-        while @frames.size > entry_frames
-          retire_frame
-        end
-        close_upvals(entry_base)
+        @fsize = entry_frames if @fsize > entry_frames
+        close_upvals(entry_base) if @open_max >= entry_base
       end
     end
   end
