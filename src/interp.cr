@@ -128,7 +128,7 @@ module Lua
     def call(f : LuaValue, args : Array(LuaValue)) : Array(LuaValue)
       case f
       when LuaFunction
-        f.fn.call(self, args)
+        call_native(f, args)
       when LuaClosure
         run_vm(f, args)
       when LuaTable
@@ -148,6 +148,17 @@ module Lua
       else
         raise_lua("attempt to call a #{Lua.type_name(f)} value")
       end
+    end
+
+    # Call a native (Crystal) function. Non-Lua Crystal exceptions raised
+    # inside cross as Lua errors (catchable by pcall); LuaError passes
+    # through untouched, value intact.
+    def call_native(f : LuaFunction, args : Array(LuaValue)) : Array(LuaValue)
+      f.fn.call(self, args)
+    rescue e : LuaError
+      raise e
+    rescue e : Exception
+      raise LuaError.new("(crystal) #{f.name}: #{e.class}: #{e.message || "error"}")
     end
 
     # --- indexing with metatables ---

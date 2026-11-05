@@ -873,7 +873,7 @@ module Lua
       args = Array(LuaValue).new(argn) { |i| @stack[ra + 1 + i] }
       case fn
       when LuaFunction
-        fn.fn.call(self, args)
+        call_native(fn, args)
       when LuaTable, LuaUserData
         if mm = metafield(fn, "__call")
           call(mm, ([fn] of LuaValue).concat(args))
