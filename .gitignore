@@ -1,0 +1,9 @@
+/lib/
+/.shards/
+/bin/lua5
+/.crystal/
+shard.lock
+/.rake_tasks~
+/tmp/
+/bench/vendor/
+/bench/results/

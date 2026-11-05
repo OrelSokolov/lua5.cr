@@ -1,0 +1,24 @@
+startup overhead: lua5.1=0.0017100.0012780.0010330.0016930.001299s luajit=0.0012360.0011620.0011820.0010400.000925s luajit-joff=0.0012090.0012080.0012400.0010300.000920s
+
+bench              lua5.1    jit-off     luajit |  51/jit off/jit output
+nbody               3.995      1.428      0.241 |   16.6x    5.9x ok
+fannkuch            2.349      0.876      0.240 |    9.8x    3.7x ok
+spectral-norm      11.378      5.388      0.281 |   40.5x   19.2x ok
+binary-trees        1.262      0.363      0.295 |    4.3x    1.2x ok
+nsieve              1.626      0.875      0.449 |    3.6x    2.0x ok
+./run.sh: line 38: warning: command substitution: ignored null byte in input
+./run.sh: line 38: warning: command substitution: ignored null byte in input
+./run.sh: line 38: warning: command substitution: ignored null byte in input
+./run.sh: line 38: warning: command substitution: ignored null byte in input
+./run.sh: line 38: warning: command substitution: ignored null byte in input
+./run.sh: line 38: warning: command substitution: ignored null byte in input
+./run.sh: line 38: warning: command substitution: ignored null byte in input
+./run.sh: line 38: warning: command substitution: ignored null byte in input
+./run.sh: line 38: warning: command substitution: ignored null byte in input
+mandelbrot          6.489      2.904      0.459 |   14.1x    6.3x ok
+series              0.682      0.455      0.326 |    2.1x    1.4x ok
+partialsums         1.496      0.630      0.253 |    5.9x    2.5x ok
+recursive-fib       2.845      1.399      0.372 |    7.6x    3.8x ok
+array3d             5.716      1.995      0.188 |   30.3x   10.6x ok
+fasta               2.267      1.701      0.867 |    2.6x    2.0x ok
+scimark-fft        23.241      8.075      0.848 |   27.4x    9.5x ok

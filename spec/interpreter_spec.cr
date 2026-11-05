@@ -1,0 +1,120 @@
+require "./spec_helper"
+
+describe Lua::Lexer do
+  it "lexes keywords and names" do
+    toks = Lua::Lexer.new("local x = function return end").tokens
+    kinds = toks.map(&.kind)
+    kinds.should contain(Lua::Tk::Local)
+    kinds.should contain(Lua::Tk::Function)
+    kinds.should contain(Lua::Tk::Return)
+    kinds.should contain(Lua::Tk::End)
+  end
+
+  it "lexes numbers" do
+    Lua::Lexer.new("3 3.5 .5 1e3 0x1A").tokens.select(&.kind.num?).map(&.num)
+      .should eq([3.0, 3.5, 0.5, 1000.0, 26.0])
+  end
+
+  it "lexes strings with escapes" do
+    Lua::Lexer.new(%q{"a\tb\65c"}).tokens[0].text.bytes.should eq("a\tbAc".bytes)
+  end
+
+  it "lexes long strings with levels" do
+    Lua::Lexer.new("[==[a]]b]==]").tokens[0].text.should eq("a]]b")
+  end
+
+  it "counts lines" do
+    toks = Lua::Lexer.new("a\nb\nc").tokens.reject(&.kind.eof?)
+    toks.map(&.line).should eq([1, 2, 3])
+  end
+end
+
+describe Lua::Parser do
+  it "parses precedence" do
+    # 2+3*4^2 == 2+(3*(4^2)) == 50
+    lua_eval("2+3*4^2").should eq(50.0)
+    lua_eval("-2^2").should eq(-4.0) # unary minus binds looser than ^
+    lua_eval("2^-2").should eq(0.25)
+  end
+
+  it "rejects ambiguous statement syntax like Lua 5.1" do
+    expect_raises(Lua::SyntaxError, /ambiguous syntax/) do
+      Lua::Interp.new.run("local x = 1\n(x)()")
+    end
+  end
+end
+
+describe Lua::Interp do
+  it "evaluates arithmetic and coercion" do
+    lua_eval("1/0").should eq(Float64::INFINITY)
+    lua_eval("0/0").as(Float64).nan?.should be_true
+    lua_eval("-7 % 3").should eq(2.0)
+    lua_eval(%q{"10" + 5}).should eq(15.0)
+    lua_eval("10 .. 20").should eq("1020")
+  end
+
+  it "formats numbers like %.14g" do
+    lua_eval("tostring(3)").should eq("3")
+    lua_eval("tostring(0.5)").should eq("0.5")
+    lua_eval("tostring(1/0)").should eq("inf")
+    lua_eval("string.format('%.3f', 1.5)").should eq("1.500")
+  end
+
+  it "handles closures sharing upvalues" do
+    lua_run(<<-LUA).should eq([105.0])
+      local n = 0
+      local function inc() n = n + 1 end
+      inc(); inc()
+      local function get() return n end
+      return get() + 103
+    LUA
+  end
+
+  it "keeps proper tail calls flat" do
+    lua_run(<<-LUA).should eq(["done"])
+      local function loop(n)
+        if n == 0 then return "done" end
+        return loop(n - 1)
+      end
+      return loop(1000000)
+    LUA
+  end
+
+  it "yields fresh loop variables per iteration" do
+    lua_run(<<-LUA).map(&.as(Float64)).should eq([1.0, 2.0, 3.0])
+      local fns = {}
+      for i = 1, 3 do fns[i] = function() return i end end
+      return fns[1](), fns[2](), fns[3]()
+    LUA
+  end
+
+  it "supports OOP via metatables" do
+    lua_run(<<-LUA).should eq(["rex barks"])
+      local Animal = {}
+      Animal.__index = Animal
+      function Animal.new(name) return setmetatable({name=name}, Animal) end
+      function Animal:speak() return self.name .. " makes a sound" end
+      local Dog = setmetatable({}, {__index = Animal})
+      Dog.__index = Dog
+      function Dog.new(name) return setmetatable(Animal.new(name), Dog) end
+      function Dog:speak() return self.name .. " barks" end
+      return Dog.new("rex"):speak()
+    LUA
+  end
+
+  it "propagates error values through pcall untouched" do
+    lua_run(<<-LUA).should eq([false, 7.0])
+      local ok, err = pcall(function() error({code = 7}) end)
+      return ok, err.code
+    LUA
+  end
+
+  it "runs string patterns" do
+    lua_eval(%q{("2024-01-15"):match("(%d+)-(%d+)-(%d+)")}).should eq("2024")
+    lua_eval(%q{("  trim  "):match("^%s*(.-)%s*$")}).should eq("trim")
+    lua_eval(%q{("hello hello"):match("(%a+) %1")}).should eq("hello")
+    lua_eval(%q{("(a(b)c) tail"):match("%b()")}).should eq("(a(b)c)")
+    lua_eval(%q{("abc"):gsub("", "-")}).should eq("-a-b-c-")
+    lua_eval(%q{("x=1, y=2"):gsub("(%w+)=(%w+)", "%2=%1")}).should eq("1=x, 2=y")
+  end
+end

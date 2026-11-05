@@ -1,0 +1,12 @@
+name: lua5
+version: 0.1.0
+description: |
+  Pure-Crystal Lua 5.1 interpreter (MoonSharp port). No FFI, no native Lua:
+  the end goal is a luabind for Crystal objects with a shared GC and
+  shared exception model.
+license: MIT
+
+authors:
+  - Orel
+
+crystal: ">= 1.10.0"
