@@ -777,6 +777,18 @@ module Lua
     # Highest stack index currently captured by an open upvalue; lets hot
     # paths skip close_upvals entirely when nothing this deep is captured.
     @open_max = -1
+    # run_frames entry points (frame counts) — one per nested VM re-entry.
+    # coroutine.yield is only legal at depth 1 of the running coroutine.
+    @entry_stack = [] of Int32
+    # The CALL/TAILCALL site that raised YieldSignal: frame, abs result
+    # register (-1 for a tail call), CALL C operand, tail-call flag.
+    @yield_call : {Frame, Int32, Int32, Bool}? = nil
+    @suspending = false
+    # Crystal-mediated Lua calls made from inside the current run_frames
+    # session (pcall, comparators, metamethods). yield with this > 0 would
+    # have to resume a Crystal frame — impossible without fibers.
+    @call_depth = 0
+    property current_co : LuaCoroutine? = nil
 
     private def ensure_stack(n : Int32) : Nil
       while @stack.size <= n
@@ -949,7 +961,6 @@ module Lua
     # Execute a closure in the VM. Re-entrant: native functions called from
     # the loop enter here again with their own frame stack segment.
     def run_vm(cl0 : LuaClosure, args : Array(LuaValue)) : Array(LuaValue)
-      entry_frames = @fsize
       entry_base = stack_hi
       base0 = entry_base
       p0 = cl0.proto
@@ -974,8 +985,20 @@ module Lua
         @frames << f0
       end
       @fsize += 1
+      # entry_frames: frame count EXCLUDING the entry frame (the loop
+      # finishes when the frame at index entry_frames returns)
+      run_frames(@fsize - 1, base0)
+    end
+
+    # The dispatch loop over the current frame stack; also the resume
+    # entry for suspended coroutines (their frames continue from where
+    # the yield call interrupted them).
+    def run_frames(entry_frames : Int32, entry_base : Int32) : Array(LuaValue)
       results = Lua::EMPTY_VALS
       done = false
+      @entry_stack << entry_frames
+      d_call = @call_depth
+      @call_depth = 0
 
       begin
       until done
@@ -1257,7 +1280,15 @@ module Lua
                 break # re-fetch frame
               else
                 @line = lines[pc - 1]
-                r = call_value(fn, base + a, argn)
+                r = begin
+                  call_value(fn, base + a, argn)
+                rescue e : YieldSignal
+                  # coroutine.yield: the CALL resumes later with the
+                  # yielded values as its results
+                  frame.pc = pc
+                  @yield_call = {frame, base + a, c, false}
+                  raise e
+                end
                 frame.pc = pc
                 store_results(frame, base + a, c, r)
               end
@@ -1292,7 +1323,14 @@ module Lua
                 ensure_stack(frame.top + argn + 4)
                 break # re-fetch frame
               else
-                r = call_value(fn, base + a, argn)
+                r = begin
+                  call_value(fn, base + a, argn)
+                rescue e : YieldSignal
+                  # tail call to yield: completes as this frame's return
+                  frame.pc = 0
+                  @yield_call = {frame, -1, 0, true}
+                  raise e
+                end
                 if @fsize == entry_frames + 1 || frame_return(frame, r)
                   results = r
                   done = true
@@ -1351,8 +1389,113 @@ module Lua
         end
         results
       ensure
-        @fsize = entry_frames if @fsize > entry_frames
-        close_upvals(entry_base) if @open_max >= entry_base
+        @call_depth = d_call
+        @entry_stack.pop
+        unless @suspending
+          @fsize = entry_frames if @fsize > entry_frames
+          close_upvals(entry_base) if @open_max >= entry_base
+        end
+      end
+    end
+
+    # --- coroutines ---
+
+    # coroutine.yield: unwind to the resume boundary via YieldSignal. Legal
+    # only in the running coroutine's own bytecode — no deeper run_frames
+    # entry (a sort comparator, pcall'ed closure, metamethod) and no
+    # Crystal-mediated call in between (pcall/native chains); Lua 5.1
+    # rejects those the same way.
+    def yield_co(args : Array(LuaValue)) : Array(LuaValue)
+      raise_lua("attempt to yield from outside a coroutine") if @current_co.nil?
+      if @entry_stack.size > 1 || @call_depth > 0
+        raise_lua("attempt to yield across a Crystal call boundary (not supported)")
+      end
+      @suspending = true
+      raise YieldSignal.new(args)
+      [] of LuaValue # unreachable: keeps the return type non-NoReturn
+    end
+
+    # Resume a coroutine: swap its saved stacks in, run its body (first
+    # resume) or continue from the suspended CALL/TAILCALL site, and swap
+    # the caller's state back on the way out. Returns 5.1-style
+    # [true, yields/returns...] / [false, err].
+    def resume_co(co : LuaCoroutine, args : Array(LuaValue)) : Array(LuaValue)
+      # 5.1: bad resumes return [false, msg] like a body error, not raise
+      case co.status
+      when .dead?    then return [false, "cannot resume dead coroutine"] of LuaValue
+      when .running? then return [false, "cannot resume running coroutine"] of LuaValue
+      when .normal?  then return [false, "cannot resume non-suspended coroutine"] of LuaValue
+      end
+
+      s_stack  = @stack
+      s_frames = @frames
+      s_fsize  = @fsize
+      s_entry  = @entry_stack
+      prev_co  = @current_co
+      prev_co.status = LuaCoroutine::Status::Normal if prev_co
+      @stack, @frames, @fsize = co.stack, co.frames, co.fsize
+      @entry_stack = co.entries
+      s_upvals = @open_upvals
+      s_open_max = @open_max
+      @open_upvals = co.open_upvals
+      @open_max = co.open_max
+      @current_co = co
+      co.status = LuaCoroutine::Status::Running
+
+      begin
+        if co.first_resume?
+          co.first_resume = false
+          res = call(co.fn, args)
+          co.status = LuaCoroutine::Status::Dead
+          co.release
+          ([true] of LuaValue).concat(res)
+        else
+          yf, yra, yc, _tail = co.yield_call.not_nil!
+          co.yield_call = nil
+          @suspending = false
+          if yra == -1
+            # the yield was a tail call: its values are the frame's results
+            if @fsize == 1
+              co.status = LuaCoroutine::Status::Dead
+              co.release
+              return ([true] of LuaValue).concat(args)
+            end
+            frame_return(yf, args)
+          else
+            store_results(yf, yra, yc, args)
+          end
+          # the continuing frame is the top one (index @fsize - 1)
+          res = run_frames(@fsize - 1, 0)
+          co.status = LuaCoroutine::Status::Dead
+          co.release
+          ([true] of LuaValue).concat(res)
+        end
+      rescue e : YieldSignal
+        @suspending = false
+        co.status = LuaCoroutine::Status::Suspended
+        co.stack, co.frames, co.fsize = @stack, @frames, @fsize
+        co.entries = @entry_stack
+        co.open_upvals = @open_upvals
+        co.open_max = @open_max
+        co.yield_call = @yield_call
+        @yield_call = nil
+        ([true] of LuaValue).concat(e.values)
+      rescue e : LuaError
+        co.status = LuaCoroutine::Status::Dead
+        co.release
+        [false, e.value] of LuaValue
+      rescue e : Exception
+        # Crystal-level failure inside the coroutine: no silent degradation
+        co.status = LuaCoroutine::Status::Dead
+        co.release
+        raise e
+      ensure
+        @stack, @frames, @fsize = s_stack, s_frames, s_fsize
+        @entry_stack = s_entry
+        @open_upvals = s_upvals
+        @open_max = s_open_max
+        @current_co = prev_co
+        prev_co.status = LuaCoroutine::Status::Running if prev_co && prev_co.status.normal?
       end
     end
   end

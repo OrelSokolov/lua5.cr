@@ -89,7 +89,12 @@ DoD фазы 1: все conformance-файлы зелёные; `return f()`-ре�
   и на стек подчинён дисциплине кадра JIT (см. «JIT», п. 2).
 - Корутины: value-stack на корутину (не Crystal-файберы) — порт семантики
   `resume`/`yield`/wrap, включая yield через метаметоды (в 5.1 запрещён —
-  честная ошибка).
+  честная ошибка). ✅ (2026-11): `LuaCoroutine` со своим стеком/кадрами/
+  реестром open-upvalues (свапается в Interp целиком — общий реестр давал
+  бы коллизии захвата по индексу), `YieldSignal` unwind + `@yield_call`
+  контекст в корутине; yield легален только на глубине 1 без Crystal-кадра
+  в цепочке (`@entry_stack`/`@call_depth`), иначе честная ошибка
+  «across a Crystal call boundary» (pcall ловит её — как PUC 5.1).
 - Интерпретатор не удаляется: он fallback навсегда.
 
 ### Фаза 4 — Interop: полный luabind (порт MoonSharp Interop/) ✅ (2026-11)

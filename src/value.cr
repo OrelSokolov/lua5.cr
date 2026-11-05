@@ -2,7 +2,7 @@
 # Table, Closure, CallbackFunction) onto idiomatic Crystal: values are a
 # plain union of reference types + immediates.
 module Lua
-  alias LuaValue = Nil | Bool | Float64 | String | LuaTable | LuaClosure | LuaFunction | LuaUserData
+  alias LuaValue = Nil | Bool | Float64 | String | LuaTable | LuaClosure | LuaFunction | LuaUserData | LuaCoroutine
 
   EMPTY_VALS = [] of LuaValue
 
@@ -16,6 +16,7 @@ module Lua
     when LuaClosure     then "function"
     when LuaFunction    then "function"
     when LuaUserData    then "userdata"
+    when LuaCoroutine   then "thread"
     else                     "no value"
     end
   end
@@ -28,11 +29,12 @@ module Lua
   # LuaTable has no custom ==, but the union includes value types).
   def self.ref_same(l : LuaValue, r : LuaValue) : Bool
     case l
-    when LuaTable    then r.is_a?(LuaTable) && l.same?(r)
-    when LuaClosure  then r.is_a?(LuaClosure) && l.same?(r)
-    when LuaFunction then r.is_a?(LuaFunction) && l.same?(r)
-    when LuaUserData then r.is_a?(LuaUserData) && l.same?(r)
-    else                  l.nil? && r.nil?
+    when LuaTable      then r.is_a?(LuaTable) && l.same?(r)
+    when LuaClosure    then r.is_a?(LuaClosure) && l.same?(r)
+    when LuaFunction   then r.is_a?(LuaFunction) && l.same?(r)
+    when LuaUserData   then r.is_a?(LuaUserData) && l.same?(r)
+    when LuaCoroutine  then r.is_a?(LuaCoroutine) && l.same?(r)
+    else                    l.nil? && r.nil?
     end
   end
 
@@ -84,11 +86,12 @@ module Lua
 
   def self.repr_addr(v : LuaValue) : String
     case v
-    when LuaTable    then "table: 0x#{v.object_id.to_s(16)}"
-    when LuaClosure  then "function: 0x#{v.object_id.to_s(16)}"
-    when LuaFunction then "function: builtin: 0x#{v.object_id.to_s(16)}"
-    when LuaUserData then "userdata: 0x#{v.object_id.to_s(16)}"
-    else                  v.to_s
+    when LuaTable      then "table: 0x#{v.object_id.to_s(16)}"
+    when LuaClosure    then "function: 0x#{v.object_id.to_s(16)}"
+    when LuaFunction   then "function: builtin: 0x#{v.object_id.to_s(16)}"
+    when LuaUserData   then "userdata: 0x#{v.object_id.to_s(16)}"
+    when LuaCoroutine  then "thread: 0x#{v.object_id.to_s(16)}"
+    else                    v.to_s
     end
   end
 
@@ -344,6 +347,48 @@ module Lua
     getter upvals : Array(UpValue)
 
     def initialize(@proto, @upvals)
+    end
+  end
+
+  # A coroutine: its own value stack + frame buffer, swapped into the
+  # interpreter on resume (PLAN phase 3: value-stack per coroutine, no
+  # Crystal fibers). Suspended state is exactly the saved VM state.
+  class LuaCoroutine
+    enum Status
+      Suspended
+      Running
+      Normal
+      Dead
+    end
+
+    getter fn : LuaValue
+    property status : Status = Status::Suspended
+    property stack : Array(LuaValue)
+    property frames : Array(Frame)
+    property fsize : Int32 = 0
+    property entries = [] of Int32 # run_frames entry stack, saved on suspend
+    # Open-upvalue registry + high-water mark, swapped with the stacks (a
+    # coroutine's captures must not alias the resumer's stack slots).
+    property open_upvals = [] of UpValue
+    property open_max : Int32 = -1
+    # The CALL/TAILCALL site that raised YieldSignal (vm.cr), saved on
+    # suspend: {frame, abs result register (-1: tail call), CALL C, tail?}.
+    property yield_call : {Frame, Int32, Int32, Bool}? = nil
+    property? first_resume = true
+
+    def initialize(@fn)
+      @stack = Array(LuaValue).new(256, nil.as(LuaValue))
+      @frames = [] of Frame
+    end
+
+    # Drop the saved state once dead — the stacks can be large.
+    def release : Nil
+      @stack = Array(LuaValue).new(0, nil.as(LuaValue))
+      @frames = [] of Frame
+      @fsize = 0
+      @entries = [] of Int32
+      @open_upvals = [] of UpValue
+      @open_max = -1
     end
   end
 

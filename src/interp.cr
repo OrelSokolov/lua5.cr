@@ -2,6 +2,18 @@
 # Runtime/. Execution itself lives in vm.cr (bytecode VM); this file keeps
 # the shared runtime operations the VM, stdlib and interop all use.
 module Lua
+  # Raised by coroutine.yield to unwind to the resume boundary, carrying the
+  # yielded values. Never a LuaError, so pcall/err handlers do not catch it;
+  # the CALL/TAILCALL handlers in the VM intercept it (vm.cr) and stash the
+  # suspended context for the next resume.
+  class YieldSignal < Exception
+    getter values : Array(LuaValue)
+
+    def initialize(@values)
+      super("yield")
+    end
+  end
+
   class Interp
     property globals : LuaTable
     getter string_lib : LuaTable
@@ -22,6 +34,7 @@ module Lua
       Stdlib::OsLib.install(self)
       Stdlib::IoLib.install(self)
       Stdlib::PackageLib.install(self)
+      Stdlib::Coroutine.install(self)
     end
 
     # --- entry points ---
@@ -124,29 +137,35 @@ module Lua
 
     # Call any callable value; returns all results. Closures run in the
     # bytecode VM (vm.cr), which handles tail calls without growing the
-    # Crystal stack.
+    # Crystal stack. @call_depth marks the Crystal frame for coroutine
+    # yield-legality checks (see yield_co).
     def call(f : LuaValue, args : Array(LuaValue)) : Array(LuaValue)
-      case f
-      when LuaFunction
-        call_native(f, args)
-      when LuaClosure
-        run_vm(f, args)
-      when LuaTable
-        if mm = metafield(f, "__call")
-          call(mm, ([f] of LuaValue).concat(args))
+      @call_depth += 1
+      begin
+        case f
+        when LuaFunction
+          call_native(f, args)
+        when LuaClosure
+          run_vm(f, args)
+        when LuaTable
+          if mm = metafield(f, "__call")
+            call(mm, ([f] of LuaValue).concat(args))
+          else
+            raise_lua("attempt to call a table value")
+          end
+        when LuaUserData
+          if mm = metafield(f, "__call")
+            call(mm, ([f] of LuaValue).concat(args))
+          else
+            raise_lua("attempt to call a userdata value")
+          end
+        when Nil
+          raise_lua("attempt to call a nil value")
         else
-          raise_lua("attempt to call a table value")
+          raise_lua("attempt to call a #{Lua.type_name(f)} value")
         end
-      when LuaUserData
-        if mm = metafield(f, "__call")
-          call(mm, ([f] of LuaValue).concat(args))
-        else
-          raise_lua("attempt to call a userdata value")
-        end
-      when Nil
-        raise_lua("attempt to call a nil value")
-      else
-        raise_lua("attempt to call a #{Lua.type_name(f)} value")
+      ensure
+        @call_depth -= 1
       end
     end
 
@@ -156,6 +175,8 @@ module Lua
     def call_native(f : LuaFunction, args : Array(LuaValue)) : Array(LuaValue)
       f.fn.call(self, args)
     rescue e : LuaError
+      raise e
+    rescue e : YieldSignal
       raise e
     rescue e : Exception
       raise LuaError.new("(crystal) #{f.name}: #{e.class}: #{e.message || "error"}")

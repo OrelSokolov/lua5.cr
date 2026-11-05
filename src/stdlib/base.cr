@@ -247,18 +247,10 @@ module Lua::Stdlib
       i.globals.raw_set("_VERSION", "Lua 5.1")
 
       # Explicit, loud markers for not-yet-ported libraries (Phase 2/3).
-      i.native("coroutine_not_ported") do |i2, _args|
-        i2.raise_lua("coroutines are not implemented yet (Phase 3, see PLAN.md)")
-      end
       stub = LuaFunction.new("stub", ->(i2 : Interp, _args : Array(LuaValue)) {
         i2.raise_lua("not implemented yet (see PLAN.md)")
         [] of LuaValue
       })
-      coroutine = LuaTable.new
-      %w[create resume yield status wrap].each do |n|
-        coroutine.raw_set(n, stub)
-      end
-      i.globals.raw_set("coroutine", coroutine)
       i.globals.raw_set("require", stub)
       i.globals.raw_set("dofile", stub)
       i.globals.raw_set("load", stub)
