@@ -96,6 +96,14 @@ module Lua
 
   class LuaTable
     property metatable : LuaTable? = nil
+    # Integer keys 1..n live in a flat array (the "array part", as in PUC
+    # Lua); everything else — and integral keys past holes — in the hash.
+    # Slots holding nil are holes: raw_get falls through to the hash part.
+    # The array part covers one contiguous run base..base+n-1 (PUC Lua
+    # always bases it at 1; we also grow from the first integral key, e.g.
+    # 2..N in a sieve — the layout is unobservable).
+    @arr : Array(LuaValue)? = nil
+    @arr_base : Int32 = 1
     @hash = Hash(LuaValue, LuaValue).new
 
     def initialize
@@ -110,14 +118,58 @@ module Lua
       end
     end
 
+    private def arr_get(k : Int32) : LuaValue
+      a = @arr
+      if a && k >= @arr_base && k < @arr_base + a.size
+        a[k - @arr_base]
+      else
+        nil
+      end
+    end
+
+    # Float64 Lua key → Int32 iff integral and in range; nil otherwise.
+    private def int_key(key : Float64) : Int32?
+      return nil if key.nan? || key < -2147483648.0 || key > 2147483647.0
+      t = key.trunc
+      t == key ? t.to_i32 : nil
+    end
+
     def raw_get(key : LuaValue) : LuaValue
       check_key(key)
+      if key.is_a?(Float64) && (k = int_key(key))
+        v = arr_get(k)
+        return v unless v.nil?
+      end
       v = @hash[key]?
       v.nil? ? nil : v
     end
 
     def raw_set(key : LuaValue, val : LuaValue) : Nil
       check_key(key)
+      if key.is_a?(Float64) && (k = int_key(key))
+        if a = @arr
+          if k >= @arr_base && k < @arr_base + a.size
+            a[k - @arr_base] = val # val may be nil: stays as a hole
+            return
+          elsif k == @arr_base + a.size && !val.nil?
+            a << val
+            migrate_from_hash(a)
+            return
+          end
+          if val.nil?
+            @hash.delete(key) # (can only be absent)
+            return
+          end
+        else
+          if !val.nil?
+            a = [val] of LuaValue
+            @arr = a
+            @arr_base = k
+            migrate_from_hash(a)
+            return
+          end
+        end
+      end
       if val.nil?
         @hash.delete(key)
       else
@@ -125,21 +177,68 @@ module Lua
       end
     end
 
-    def has_key?(key : LuaValue) : Bool
-      !key.nil? && @hash.has_key?(key)
+    # Pull consecutive integer keys that were parked in the hash (set before
+    # the array part reached them) into the array part.
+    private def migrate_from_hash(a : Array(LuaValue)) : Nil
+      loop do
+        k = (@arr_base + a.size).to_f64
+        v = @hash[k]?
+        break if v.nil?
+        @hash.delete(k)
+        a << v
+      end
     end
 
-    # #t: 1..n while consecutive keys exist.
+    # Contiguous integer fill (SETLIST): keys start..start+vals.size-1.
+    # nils stay as holes at their positions (skipping them would shift keys).
+    def raw_fill(start : Int32, vals : Array(LuaValue)) : Nil
+      return if vals.empty?
+      if (a = @arr) && start == @arr_base + a.size
+        vals.each { |v| a << v }
+        migrate_from_hash(a)
+      elsif @arr.nil? && start >= 1
+        a = vals.dup
+        @arr = a
+        @arr_base = start
+        migrate_from_hash(a)
+      else
+        vals.each_with_index { |v, i| raw_set((start + i).to_f64, v) }
+      end
+    end
+
+    def has_key?(key : LuaValue) : Bool
+      return false if key.nil?
+      if key.is_a?(Float64) && (k = int_key(key))
+        v = arr_get(k)
+        return true unless v.nil?
+      end
+      @hash.has_key?(key)
+    end
+
+    # #t: 1..n while consecutive non-nil entries exist — same scan as the
+    # old hash-only table, but consulting both parts.
     def raw_length : Int32
       n = 0
-      while @hash.has_key?((n + 1).to_f64)
+      loop do
+        k = n + 1
+        if (a = @arr) && k >= @arr_base && k < @arr_base + a.size
+          break if a[k - @arr_base].nil?
+        else
+          break unless @hash.has_key?(k.to_f64)
+        end
         n += 1
       end
       n
     end
 
     def raw_keys : Array(LuaValue)
-      @hash.keys
+      keys = Array(LuaValue).new((@arr.try(&.size) || 0) + @hash.size)
+      if a = @arr
+        base = @arr_base
+        a.each_with_index { |v, i| keys << (base + i).to_f64 unless v.nil? }
+      end
+      keys.concat(@hash.keys)
+      keys
     end
   end
 

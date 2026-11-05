@@ -6,6 +6,50 @@ def vm_env(vm)
   { "LUA_PATH" => File.join(SUITE, "?.lua;;") }.merge(VMS.fetch(vm)[:env] || {})
 end
 
+# GNU timeout(1) is Linux-only; on macOS fall back to spawn + KILL polling.
+HAS_TIMEOUT = system("command -v timeout >/dev/null 2>&1")
+
+def cpu_model
+  File.readable?("/proc/cpuinfo") ?
+      File.read("/proc/cpuinfo")[/model name\s*:\s*(.+)/, 1].to_s.strip :
+      `sysctl -n machdep.cpu.brand_string 2>/dev/null`.to_s.strip
+rescue StandardError
+  ""
+end
+
+# → [stdout, exit_code, timed_out?] — same contract with or without timeout(1).
+def run_vm(env, timeout, bin, file, param)
+  if HAS_TIMEOUT
+    out, _err, pst = Open3.capture3(env, "timeout", "-k", "5", timeout.to_s,
+                                    *bin, file, param, binmode: true)
+    code = pst.exitstatus
+    [out, code, code == 124]
+  else
+    out_f = Tempfile.new("lua5-bench")
+    err_f = Tempfile.new("lua5-bench")
+    pid = Process.spawn(env, *bin, file, param, out: out_f.path, err: err_f.path)
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
+    timed_out = false
+    status = nil
+    loop do
+      _, status = Process.waitpid2(pid, Process::WNOHANG)
+      break if status
+      if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+        timed_out = true
+        Process.kill("KILL", pid)
+        _, status = Process.waitpid2(pid)
+        break
+      end
+      sleep 0.02
+    end
+    out_f.rewind
+    out = out_f.read
+    out_f.close!
+    err_f.close!
+    [out, status&.exitstatus, timed_out]
+  end
+end
+
 def startup_overhead(vm) # min of 5 empty runs, subtracted from every bench
   cmd = VMS.fetch(vm)[:bin]
   empty = File.join(Dir.tmpdir, "lua5-bench-empty.lua")
@@ -37,12 +81,11 @@ def run_suite(vm, filter = nil)
     times, sha, status = [], nil, "ok"
     reps.times do
       t0 = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-      out, _err, pst = Open3.capture3(vm_env(vm), "timeout", "-k", "5", timeout.to_s,
-                                      *cmd, file, param, binmode: true)
+      out, code, timed_out = run_vm(vm_env(vm), timeout, cmd, file, param)
       dt = Process.clock_gettime(Process::CLOCK_MONOTONIC) - t0
-      if pst.exitstatus == 124
+      if timed_out || code == 124
         status = "timeout"
-      elsif !pst.success?
+      elsif code.nil? || !code.zero?
         status = "err"
       else
         times << [dt - overhead, 0.0].max
@@ -64,7 +107,7 @@ def run_suite(vm, filter = nil)
     "complete" => results.values.any? { |r| r["status"] == "ok" },
     "metadata" => {
       "date"    => Time.now.utc.iso8601,
-      "cpu"     => File.read("/proc/cpuinfo")[/model name\s*:\s*(.+)/, 1].to_s.strip,
+      "cpu"     => cpu_model,
       "reps"    => reps, "timeout" => timeout,
       "rev"     => Dir.chdir(REPO_ROOT) { `git rev-parse --short HEAD 2>/dev/null`.strip },
     },
@@ -81,7 +124,7 @@ def build_clua!
 end
 
 namespace :benchmark do
-  %w[lua jitlua].each do |vm|
+  %w[lua jitlua jitoff].each do |vm|
     desc "Run bench suite on #{VMS.fetch(vm)[:label]} (optional: one bench name)"
     task(vm.to_sym, [:bench]) do |_t, args|
       run_suite(vm, args[:bench])

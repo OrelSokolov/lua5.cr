@@ -1,8 +1,16 @@
 # frozen_string_literal: true
 
+require "tempfile"
+
 # ————— benchmark:report — comparison table from bench/results/ —————
 
-def bold(s) = $stdout.tty? ? "\e[1m#{s}\e[0m" : s
+def bold(s)
+  $stdout.tty? ? "\e[1m#{s}\e[0m" : s
+end
+
+def plain(s)
+  s.gsub(/\e\[\d+m/, "")
+end
 
 # vm → { json:, file: } of its newest results file (timestamped names sort)
 def latest_runs
@@ -14,25 +22,20 @@ end
 desc "Comparison table (bench × interpreter) from bench/results/, latest run per vm"
 namespace :benchmark do
   task :report do
-  require "terminal-table"
-
   runs = latest_runs
   abort "No results in #{RESULTS}/ — run `rake benchmark:lua benchmark:jitlua` first." if runs.empty?
 
-  vms    = %w[lua jitlua clua].select { |v| runs.key?(v) }
+  vms    = %w[lua jitlua jitoff clua].select { |v| runs.key?(v) }
   labels = vms.to_h { |v| [v, VMS.fetch(v)[:label]] }
 
   puts
   puts "Min-of-N wall time, seconds (bold — fastest per bench; ! — output differs from luajit):"
-  table = Terminal::Table.new do |t|
-    cols = ["bench", *vms.map { |v| labels[v] }]
-    cols << "51/jit" if vms.include?("jitlua") && vms.include?("lua")
-    cols << "clua/jit" if vms.include?("jitlua") && vms.include?("clua")
-    t.headings = cols
-    t.align_column(0, :left)
-    (1...cols.size).each { |i| t.align_column(i, :right) }
-
-    BENCHES.map(&:first).each do |name|
+  rows = []
+  header = ["bench", *vms.map { |v| labels[v] }]
+  header << "51/jit" if vms.include?("jitlua") && vms.include?("lua")
+  header << "clua/jit" if vms.include?("jitlua") && vms.include?("clua")
+  rows << header
+  BENCHES.map(&:first).each do |name|
       row = [name]
       mins = vms.map { |v| r = runs[v][:json]["results"][name]; r && r["min"] }
       best = mins.compact.min
@@ -61,15 +64,25 @@ namespace :benchmark do
           row << format("%.1fx", c.fdiv(jit))
         end
       end
-      t.add_row(row)
+      rows << row
     end
+    rows << ["rev", *vms.map { |v| runs[v][:json].dig("metadata", "rev").to_s.then { |r| r.empty? ? "—" : r } }]
 
-    t.add_separator
-    t.add_row(["rev", *vms.map { |v| runs[v][:json].dig("metadata", "rev").to_s.then { |r| r.empty? ? "—" : r } }])
-  end
-  puts table
-  puts
-  vms.each { |v| puts "  #{labels[v]}: #{runs[v][:file]}" }
-  puts
+    # ratio columns may be skipped per-row (missing jit min) — pad to header
+    header_size = header.size
+    rows.each { |r| r << "—" while r.size < header_size }
+
+    # plain-text table: left-align first column, right-align the rest
+    widths = rows.transpose.map { |col| col.map { |c| plain(c).length }.max }
+    rows.each_with_index do |row, i|
+      puts row.each_with_index.map { |c, j|
+        pad = " " * (widths[j] - plain(c).length)
+        j.zero? ? c + pad : pad + c
+      }.join("  ")
+      puts widths.map { |w| "-" * w }.join("  ") if i.zero?
+    end
+    puts
+    vms.each { |v| puts "  #{labels[v]}: #{runs[v][:file]}" }
+    puts
   end
 end

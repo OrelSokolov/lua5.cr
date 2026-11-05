@@ -741,6 +741,7 @@ module Lua
 
   class Interp
     @frames = [] of Frame
+    @frame_pool = [] of Frame
     @stack = Array(LuaValue).new(4096, nil.as(LuaValue))
     @open_upvals = [] of UpValue
 
@@ -805,7 +806,12 @@ module Lua
       end
       top = newbase + {p.max_stack, argn + 1}.max
       ensure_stack(top + argn + 4)
-      nf = Frame.new(fn, newbase, top, vars)
+      nf = @frame_pool.pop? || Frame.new(fn, newbase, top, vars)
+      nf.closure = fn
+      nf.base = newbase
+      nf.top = top
+      nf.varargs = vars
+      nf.pc = 0
       nf.want = want
       @frames << nf
     end
@@ -826,6 +832,12 @@ module Lua
       else
         raise_lua("attempt to call a #{Lua.type_name(fn)} value")
       end
+    end
+
+    # Pop the top frame, keeping it for reuse (calls must not allocate).
+    private def retire_frame : Nil
+      f = @frames.pop
+      @frame_pool << f if @frame_pool.size < 4096
     end
 
     # Place call results at R[ra] according to the CALL C operand.
@@ -857,7 +869,7 @@ module Lua
       stack = @stack
       cf = @frames.size >= 2 ? @frames[@frames.size - 2] : nil
       if cf.nil?
-        @frames.pop
+        retire_frame
         return true
       end
       ra = frame.base
@@ -880,8 +892,35 @@ module Lua
         end
         cf.top = ra + frame.want
       end
-      @frames.pop
+      retire_frame
       false
+    end
+
+    # Return of a Lua frame: results are already in the stack at
+    # base+A..; shift them down to base.. (no intermediate Array alloc).
+    private def frame_return_fast(frame : Frame, a : Int32, nres : Int32) : Nil
+      cf = @frames[@frames.size - 2]
+      base = frame.base
+      stack = @stack
+      if a > 0 && nres > 0
+        i = 0
+        while i < nres
+          stack[base + i] = stack[base + a + i]
+          i += 1
+        end
+      end
+      case frame.want
+      when -1 then cf.top = base + nres
+      when 0  then cf.top = base
+      else
+        i = nres
+        while i < frame.want
+          stack[base + i] = nil
+          i += 1
+        end
+        cf.top = base + frame.want
+      end
+      retire_frame
     end
 
     # Execute a closure in the VM. Re-entrant: native functions called from
@@ -916,85 +955,126 @@ module Lua
           cl = frame.closure
           proto = cl.proto
           code = proto.code
+          cp = code.to_unsafe # code never changes after compile: unchecked reads
           consts = proto.consts
+          kp = consts.to_unsafe # same: consts are frozen after compile
           lines = proto.lines
           upvals = cl.upvals
+          uv = upvals.to_unsafe # upvalue list is fixed at closure creation
           base = frame.base
           pc = frame.pc
           stack = @stack
 
           while true
-            inst = code[pc]
+            # sp refresh per iteration: the stack buffer may have been
+            # reallocated (ensure_stack) by any op that re-entered the VM.
+            sp = stack.to_unsafe
+            inst = cp[pc]
             pc += 1
             op = inst.op
             a = inst.a
             b = inst.b
             c = inst.c
             case op
-            when .move?      then stack[base + a] = stack[base + b]
+            when .move?      then sp[base + a] = sp[base + b]
             when .loadnil?
               i = a
               while i <= a + b
-                stack[base + i] = nil
+                sp[base + i] = nil
                 i += 1
               end
-            when .loadbool?  then stack[base + a] = (b != 0)
-            when .loadk?     then stack[base + a] = consts[b]
+            when .loadbool?  then sp[base + a] = (b != 0)
+            when .loadk?     then sp[base + a] = kp[b]
             when .getglobal?
-              @line = lines[pc - 1]
-              stack[base + a] = getindex(@globals, consts[b].as(String))
+              n = kp[b].as(String)
+              # globals normally have no metatable; keep the general path for
+              # the rare setmetatable(_G, ...) case
+              if @globals.metatable
+                @line = lines[pc - 1]
+                stack[base + a] = getindex(@globals, n)
+              else
+                sp[base + a] = @globals.raw_get(n)
+              end
             when .setglobal?
               @line = lines[pc - 1]
-              setindex(@globals, consts[b].as(String), stack[base + a])
+              setindex(@globals, kp[b].as(String), stack[base + a])
             when .getupval?
-              u = upvals[b]
+              u = uv[b]
               if s = u.stack
-                stack[base + a] = s[u.idx]
+                sp[base + a] = s[u.idx]
               else
-                stack[base + a] = u.value
+                sp[base + a] = u.value
               end
             when .setupval?
-              u = upvals[b]
+              u = uv[b]
               if s = u.stack
-                s[u.idx] = stack[base + a]
+                s[u.idx] = sp[base + a]
               else
-                u.value = stack[base + a]
+                u.value = sp[base + a]
               end
             when .gettable?
-              @line = lines[pc - 1]
-              stack[base + a] = getindex(stack[base + b], stack[base + c])
+              o = sp[base + b]
+              k = sp[base + c]
+              if o.is_a?(LuaTable) && o.metatable.nil?
+                sp[base + a] = o.raw_get(k)
+              else
+                @line = lines[pc - 1]
+                stack[base + a] = getindex(o, k)
+              end
             when .settable?
-              @line = lines[pc - 1]
-              setindex(stack[base + a], stack[base + b], stack[base + c])
+              t = sp[base + a]
+              k = sp[base + b]
+              if t.is_a?(LuaTable) && t.metatable.nil?
+                t.raw_set(k, sp[base + c])
+              else
+                @line = lines[pc - 1]
+                setindex(t, k, stack[base + c])
+              end
             when .self?
-              @line = lines[pc - 1]
-              obj = stack[base + b]
-              stack[base + a + 1] = obj
-              stack[base + a] = getindex(obj, consts[c].as(String))
-            when .newtable?  then stack[base + a] = LuaTable.new
+              obj = sp[base + b]
+              sp[base + a + 1] = obj
+              if obj.is_a?(LuaTable) && obj.metatable.nil?
+                sp[base + a] = obj.raw_get(kp[c].as(String))
+              else
+                @line = lines[pc - 1]
+                stack[base + a] = getindex(obj, kp[c].as(String))
+              end
+            when .newtable?  then sp[base + a] = LuaTable.new
             when .setlist?
               t = stack[base + a].as(LuaTable)
               n = b == -1 ? frame.top - (base + a + 1) : b
-              i = 0
-              while i < n
-                t.raw_set((c + i + 1).to_f64, stack[base + a + 1 + i])
-                i += 1
-              end
+              vals = Array(LuaValue).new(n) { |i| stack[base + a + 1 + i] }
+              t.raw_fill(c + 1, vals)
             when .add?, .sub?, .mul?, .div?, .mod?, .pow?
-              @line = lines[pc - 1]
-              o = case op
-                  when .add? then "+"
-                  when .sub? then "-"
-                  when .mul? then "*"
-                  when .div? then "/"
-                  when .mod? then "%"
-                  else             "^"
+              # fast path: both numbers → no metatable dispatch, no line fetch
+              l = sp[base + b]
+              r = sp[base + c]
+              if l.is_a?(Float64) && r.is_a?(Float64)
+                sp[base + a] =
+                  case op
+                  when .add? then l + r
+                  when .sub? then l - r
+                  when .mul? then l * r
+                  when .div? then l / r
+                  when .mod? then r == 0 ? Float64::NAN : l % r
+                  else             l ** r
                   end
-              stack[base + a] = arith(o, stack[base + b], stack[base + c])
+              else
+                @line = lines[pc - 1]
+                o = case op
+                    when .add? then "+"
+                    when .sub? then "-"
+                    when .mul? then "*"
+                    when .div? then "/"
+                    when .mod? then "%"
+                    else             "^"
+                    end
+                stack[base + a] = arith(o, l, r)
+              end
             when .unm?
               @line = lines[pc - 1]
               stack[base + a] = negate(stack[base + b])
-            when .not?       then stack[base + a] = !Lua.truthy(stack[base + b])
+            when .not?       then sp[base + a] = !Lua.truthy(sp[base + b])
             when .len?
               @line = lines[pc - 1]
               stack[base + a] = lua_len(stack[base + b])
@@ -1014,14 +1094,30 @@ module Lua
               @line = lines[pc - 1]
               stack[base + a] = !lua_eq(stack[base + b], stack[base + c])
             when .lt?
-              @line = lines[pc - 1]
-              stack[base + a] = lua_compare(stack[base + b], stack[base + c], "<")
+              l = sp[base + b]
+              r = sp[base + c]
+              if l.is_a?(Float64) && r.is_a?(Float64)
+                sp[base + a] = l < r
+              elsif l.is_a?(String) && r.is_a?(String)
+                sp[base + a] = (l <=> r) < 0
+              else
+                @line = lines[pc - 1]
+                stack[base + a] = lua_compare(l, r, "<")
+              end
             when .le?
-              @line = lines[pc - 1]
-              stack[base + a] = lua_compare(stack[base + b], stack[base + c], "<=")
+              l = sp[base + b]
+              r = sp[base + c]
+              if l.is_a?(Float64) && r.is_a?(Float64)
+                sp[base + a] = l <= r
+              elsif l.is_a?(String) && r.is_a?(String)
+                sp[base + a] = (l <=> r) <= 0
+              else
+                @line = lines[pc - 1]
+                stack[base + a] = lua_compare(l, r, "<=")
+              end
             when .jmp?  then pc += b
-            when .jmpf? then pc += b unless Lua.truthy(stack[base + a])
-            when .jmpt? then pc += b if Lua.truthy(stack[base + a])
+            when .jmpf? then pc += b unless Lua.truthy(sp[base + a])
+            when .jmpt? then pc += b if Lua.truthy(sp[base + a])
             when .vararg?
               vars = frame.varargs
               if b == -1
@@ -1050,9 +1146,9 @@ module Lua
             when .close? then close_upvals(base + a)
             when .forprep?
               @line = lines[pc - 1]
-              v0 = Lua.tonumber(stack[base + a])
-              v1 = Lua.tonumber(stack[base + a + 1])
-              v2 = Lua.tonumber(stack[base + a + 2])
+              v0 = Lua.tonumber(sp[base + a])
+              v1 = Lua.tonumber(sp[base + a + 1])
+              v2 = Lua.tonumber(sp[base + a + 2])
               raise_lua("'for' initial value must be a number") unless v0
               raise_lua("'for' limit value must be a number") unless v1
               raise_lua("'for' step value must be a number") unless v2
@@ -1060,20 +1156,20 @@ module Lua
               lim = v1.not_nil!
               ste = v2.not_nil!
               raise_lua("'for' step is zero") if ste == 0
-              stack[base + a] = init
-              stack[base + a + 1] = lim
-              stack[base + a + 2] = ste
+              sp[base + a] = init
+              sp[base + a + 1] = lim
+              sp[base + a + 2] = ste
               unless ste > 0 ? init <= lim : init >= lim
                 pc += b
               end
             when .forloop?
-              ctrl = stack[base + a].as(Float64)
-              lim = stack[base + a + 1].as(Float64)
-              ste = stack[base + a + 2].as(Float64)
+              ctrl = sp[base + a].as(Float64)
+              lim = sp[base + a + 1].as(Float64)
+              ste = sp[base + a + 2].as(Float64)
               ctrl += ste
               if ste > 0 ? ctrl <= lim : ctrl >= lim
-                close_upvals(base + a) # freeze this iteration's loop var
-                stack[base + a] = ctrl
+                close_upvals(base + a) unless @open_upvals.empty? # freeze this iteration's loop var
+                sp[base + a] = ctrl
                 pc += b
               end
             when .tforcall?
@@ -1091,7 +1187,6 @@ module Lua
                 pc += b
               end
             when .call?
-              @line = lines[pc - 1]
               fn = stack[base + a]
               argn = b == -1 ? frame.top - (base + a + 1) : b
               if fn.is_a?(LuaClosure)
@@ -1099,6 +1194,7 @@ module Lua
                 push_call(fn, base + a, argn, c)
                 break # re-fetch frame
               else
+                @line = lines[pc - 1]
                 r = call_value(fn, base + a, argn)
                 frame.pc = pc
                 store_results(frame, base + a, c, r)
@@ -1107,7 +1203,7 @@ module Lua
               @line = lines[pc - 1]
               fn = stack[base + a]
               argn = b == -1 ? frame.top - (base + a + 1) : b
-              close_upvals(base)
+              close_upvals(base) unless @open_upvals.empty?
               if fn.is_a?(LuaClosure)
                 # slide fn + args down over the current frame and reuse it
                 i = 0
@@ -1144,21 +1240,22 @@ module Lua
               end
             when .return?
               nres = b == -1 ? frame.top - (base + a) : b
-              res = Array(LuaValue).new(nres) { |j| stack[base + a + j] }
               if @frames.size == entry_frames + 1
-                results = res
+                results = Array(LuaValue).new(nres) { |j| stack[base + a + j] }
                 done = true
                 break
               end
-              close_upvals(base)
-              frame_return(frame, res)
+              close_upvals(base) unless @open_upvals.empty?
+              frame_return_fast(frame, a, nres)
               break # re-fetch caller frame
             end
           end
         end
         results
       ensure
-        @frames.delete_at(entry_frames..) if @frames.size > entry_frames
+        while @frames.size > entry_frames
+          retire_frame
+        end
         close_upvals(entry_base)
       end
     end

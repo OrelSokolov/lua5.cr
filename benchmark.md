@@ -72,6 +72,12 @@ JIT: наш VM — тоже интерпретатор, и сравнение «
 - В горячем цикле — **ноль I/O** (`print` только checksum в конце).
 - `math.randomseed(42)` в начале каждого скрипта, если random используется.
 
+На macOS (нет `timeout(1)` и `/proc`) harness сам переключается на
+spawn + KILL по дедлайну и `sysctl` для CPU-строки; референсы собираются
+локально в `bench/vendor` (`lua-5.1.5` из tarball lua.org, LuaJIT —
+`make install PREFIX=bench/vendor/luajit`, для сборки нужен
+`MACOSX_DEPLOYMENT_TARGET=$(sw_vers -productVersion)`).
+
 ---
 
 ## Набор бенчмарков

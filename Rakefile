@@ -19,6 +19,7 @@ require "json"
 require "open3"
 require "digest"
 require "tmpdir"
+require "time"
 
 REPO_ROOT = File.expand_path(__dir__)
 BENCH_DIR = File.join(REPO_ROOT, "bench")
@@ -48,6 +49,10 @@ VMS = {
   "lua"    => { label: "lua5.1", bin: [File.join(VENDOR, "lua-5.1.5", "src", "lua")] },
   "jitlua" => { label: "luajit",
                 bin: [File.join(VENDOR, "luajit", "bin", "luajit")],
+                env: { "LD_LIBRARY_PATH" => File.join(VENDOR, "luajit", "lib") } },
+  "jitoff" => { label: "luajit-joff", # LuaJIT interpreter-only: the fair
+                # "interpreter vs interpreter" baseline (see benchmark.md)
+                bin: [File.join(VENDOR, "luajit", "bin", "luajit"), "-joff"],
                 env: { "LD_LIBRARY_PATH" => File.join(VENDOR, "luajit", "lib") } },
   "clua"   => { label: "clua", bin: [CLUA_BIN] },
 }.freeze
