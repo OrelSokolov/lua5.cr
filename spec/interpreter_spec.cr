@@ -37,8 +37,14 @@ describe Lua::Parser do
     lua_eval("2^-2").should eq(0.25)
   end
 
-  it "rejects ambiguous statement syntax like Lua 5.1" do
+  it "rejects ambiguous call-vs-statement syntax like Lua 5.1" do
+    # '(' args on a new line after a callable expression: ambiguous
     expect_raises(Lua::SyntaxError, /ambiguous syntax/) do
+      Lua::Interp.new.run("local f = print\nf\n(1)")
+    end
+    # a statement STARTING with '(' after a complete statement is fine
+    # (fails at runtime, not parse time — like PUC 5.1)
+    expect_raises(Lua::LuaError, /attempt to call/) do
       Lua::Interp.new.run("local x = 1\n(x)()")
     end
   end
@@ -116,5 +122,40 @@ describe Lua::Interp do
     lua_eval(%q{("(a(b)c) tail"):match("%b()")}).should eq("(a(b)c)")
     lua_eval(%q{("abc"):gsub("", "-")}).should eq("-a-b-c-")
     lua_eval(%q{("x=1, y=2"):gsub("(%w+)=(%w+)", "%2=%1")}).should eq("1=x, 2=y")
+  end
+end
+
+describe "debug library" do
+  it "getlocal/setlocal read and write frame locals" do
+    lua_run(<<-LUA).should eq(["OK"])
+      local function g(a, b)
+        local x = 5
+        local function probe()
+          assert(debug.getlocal(2, 1) == "a")
+          assert(select(2, debug.getlocal(2, 3)) == 5)
+          assert(debug.setlocal(2, 3, 6) == "x")
+        end
+        probe()
+        assert(x == 6)
+        return "OK"
+      end
+      return g(1, 2)
+    LUA
+  end
+
+  it "getlocal falls back to (*temporary) in the live window" do
+    lua_run(<<-LUA).should eq([true, 1.0, true])
+      local res = {}
+      local function f(a, b)
+        local n1, v1 = debug.getlocal(2, 3)
+        res[1] = (n1 == "(*temporary)")
+        res[2] = v1
+        res[3] = (debug.getlocal(2, 4) == nil)
+        return 0
+      end
+      local function g(a, b) return (a + 1) + f() end
+      g(0, 0)
+      return res[1], res[2], res[3]
+    LUA
   end
 end

@@ -16,7 +16,8 @@ ARGV[1..].each_with_index { |a, i| argt.raw_set((i + 1).to_f64, a) }
 interp.globals.raw_set("arg", argt)
 
 begin
-  interp.run(File.read(path), path)
+  # 5.1: file chunks are named "@path" (short_src/error positions)
+  interp.run(File.read(path), "@#{path}")
 rescue e : Lua::LuaError
   STDERR.puts "lua5: #{e.message}"
   exit 1

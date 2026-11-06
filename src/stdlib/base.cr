@@ -15,11 +15,13 @@ module Lua::Stdlib
 
       i.native("tostring") do |i2, args|
         v = args[0]?
-        [i2.lua_tostring(v)] of LuaValue
+        i2.arg_error(1, "tostring", "value expected") if args.empty?
+        [i2.tostring_value(v)] of LuaValue
       end
 
       i.native("tonumber") do |i2, args|
         v = args[0]?
+        i2.arg_error(1, "tonumber", "value expected") if args.empty?
         base = args[1]?
         if base.nil?
           if v.is_a?(Float64) || v.is_a?(String)
@@ -54,13 +56,25 @@ module Lua::Stdlib
           idx = 0
         else
           found = keys.index { |x| i2.lua_eq(x, k) }
-          i2.raise_lua("invalid key to 'next'") if found.nil?
-          idx = found.not_nil! + 1
+          if found.nil?
+            # erased current key? resume from the recorded position (the
+            # following key now occupies that slot after removal; >= size
+            # just means the traversal is done)
+            if !t.next_hint_key.nil? && i2.lua_eq(t.next_hint_key, k) && t.next_hint_idx >= 0
+              idx = t.next_hint_idx
+            else
+              i2.raise_lua("invalid key to 'next'")
+            end
+          else
+            idx = found.not_nil! + 1
+          end
         end
         while idx < keys.size
           key = keys[idx]
           val = t.raw_get(key)
           unless val.nil?
+            t.next_hint_key = key
+            t.next_hint_idx = idx
             return [key, val] of LuaValue
           end
           idx += 1
@@ -112,8 +126,10 @@ module Lua::Stdlib
       i.native("unpack") do |i2, args|
         t = i2.table!(args, 0, "unpack")
         len = t.raw_length
-        from = args.size > 1 ? i2.num!(args, 1, "unpack").to_i : 1
-        to = args.size > 2 ? i2.num!(args, 2, "unpack").to_i : len
+        from = args.size > 1 && !args[1].nil? ? i2.num!(args, 1, "unpack").to_i : 1
+        # 5.1 luaL_optnumber: an explicitly passed nil j still defaults
+        # to the table length
+        to = args.size > 2 && !args[2].nil? ? i2.num!(args, 2, "unpack").to_i : len
         res = [] of LuaValue
         x = from
         while x <= to
@@ -129,16 +145,22 @@ module Lua::Stdlib
           args
         else
           msg = args[1]?
-          raise LuaError.new(msg.nil? ? "assertion failed!" : msg)
+          # 5.1 luaB_assert: luaL_error → position-prefixed message
+          if msg.is_a?(String)
+            raise LuaError.new("#{Lua.short_src(i2.cur_chunkname)}:#{i2.err_line(1)}: #{msg}")
+          elsif msg.nil?
+            raise LuaError.new("#{Lua.short_src(i2.cur_chunkname)}:#{i2.err_line(1)}: assertion failed!")
+          else
+            i2.arg_error(2, "assert", "string expected")
+          end
         end
       end
 
       i.native("error") do |i2, args|
         v = args[0]?
-        i2.arg_error(1, "error", "value expected") if args.empty?
         level = args.size > 1 ? (Lua.tonumber(args[1]) || 1) : 1.0
         if v.is_a?(String) && level > 0
-          raise LuaError.new("#{i2.chunkname}:#{i2.line}: #{v}")
+          raise LuaError.new("#{Lua.short_src(i2.cur_chunkname)}:#{i2.err_line(level.to_i)}: #{v}")
         else
           raise LuaError.new(v)
         end
@@ -146,10 +168,6 @@ module Lua::Stdlib
 
       i.native("pcall") do |i2, args|
         f = args[0]?
-        unless f.is_a?(LuaClosure) || f.is_a?(LuaFunction) || f.is_a?(LuaTable) || f.is_a?(LuaUserData)
-          i2.arg_error(1, "pcall", "value expected") if f.nil?
-          i2.raise_lua("attempt to call a #{Lua.type_name(f)} value")
-        end
         rest = args.size > 1 ? args[1..] : ([] of LuaValue)
         begin
           r = i2.call(f, rest)
@@ -162,12 +180,32 @@ module Lua::Stdlib
       i.native("xpcall") do |i2, args|
         f = args[0]?
         h = args[1]?
+        save = i2.err_handler
+        i2.err_handler = h
         begin
           r = i2.call(f, [] of LuaValue)
           ([true] of LuaValue).concat(r)
         rescue e : LuaError
-          hr = i2.call(h, [e.value])
-          ([false] of LuaValue).concat(hr)
+          # message handlers normally run at the raise point (run_frames
+          # rescue); errors raised by natives under xpcall surface here, so
+          # this is the innermost handler spot for them
+          unless e.msgh_done?
+            e.msgh_done = true
+            i2.err_handler = nil
+            begin
+              e.value = i2.call(h, [e.value] of LuaValue)[0]?
+            rescue e2 : LuaError
+              # handler itself failed: LUA_ERRERR — xpcall returns it as
+              # the error value (5.1 luaD_pcall catches LUA_ERRERR)
+              e2.msgh_done = true
+              e.value = "error in error handling"
+            ensure
+              i2.err_handler = save
+            end
+          end
+          [false, e.value] of LuaValue
+        ensure
+          i2.err_handler = save
         end
       end
 
@@ -190,8 +228,10 @@ module Lua::Stdlib
         mt = case v
              when LuaTable    then v.metatable
              when LuaUserData then v.metatable
-             when String      then i2.string_meta
-             else                  nil
+             when String      then i2.string_meta.metatable || i2.string_meta
+             else
+               # debug.setmetatable may have given this type a metatable
+               i2.type_mts[Lua.type_name(v)]?
              end
         if mt
           prot = mt.raw_get("__metatable")
@@ -231,7 +271,7 @@ module Lua::Stdlib
         i2.arg_error(1, "loadstring", "string expected") unless s.is_a?(String) || s.is_a?(Float64)
         src = s.is_a?(String) ? s : Lua.fmt_num(s)
         name = args.size > 1 ? (args[1]?) : nil
-        chunkname = name.is_a?(String) ? name : src[0, 20]
+        chunkname = name.is_a?(String) ? name : src
         begin
           [i2.compile(src, chunkname)] of LuaValue
         rescue e : SyntaxError
@@ -239,21 +279,133 @@ module Lua::Stdlib
         end
       end
 
-      i.native("collectgarbage") do |_i2, _args|
+      # load(chunkreader [, chunkname]): pieces from repeated calls to f
+      i.native("load") do |i2, args|
+        f = args[0]?
+        unless f.is_a?(LuaClosure) || f.is_a?(LuaFunction) || (f.is_a?(LuaTable) && i2.metafield(f, "__call"))
+          i2.arg_error(1, "load", "function expected")
+        end
+        buf = IO::Memory.new
+        loop do
+          r = i2.call(f, [] of LuaValue)
+          piece = r[0]?
+          break if piece.nil?
+          unless piece.is_a?(String)
+            i2.raise_lua("bad argument #1 to 'load' (reader must return a string)")
+          end
+          break if piece.empty?
+          buf << piece
+        end
+        name = args.size > 1 ? (args[1]?) : nil
+        chunkname = name.is_a?(String) ? name : "=(load)"
+        begin
+          [i2.compile(buf.to_s, chunkname)] of LuaValue
+        rescue e : SyntaxError
+          [nil, e.message.not_nil!] of LuaValue
+        end
+      end
+
+      i.native("loadfile") do |i2, args|
+        fname = args[0]?
+        src = if fname.is_a?(String)
+                begin
+                  File.read(fname)
+                rescue e
+                  next [nil, "cannot open #{fname}: No such file or directory"] of LuaValue
+                end
+              else
+                i2.raise_lua("loadfile: reading stdin is not supported")
+              end
+        begin
+          [i2.compile(src, "@#{fname.as(String)}")] of LuaValue
+        rescue e : SyntaxError
+          [nil, e.message.not_nil!] of LuaValue
+        end
+      end
+
+      i.native("dofile") do |i2, args|
+        fname = args[0]?
+        i2.raise_lua("dofile: file name expected") unless fname.is_a?(String)
+        f = i2.call(i2.globals.raw_get("loadfile"), [fname] of LuaValue)
+        cl = f[0]?
+        i2.raise_lua(f[1]?.to_s) unless cl.is_a?(LuaClosure)
+        i2.call(cl, [] of LuaValue)
+      end
+
+      # 5.1 luaB_collectgarbage: option names checked by luaL_option; ours is
+      # mostly a stub, but "collect" also finalizes unreachable files (5.1
+      # closes dropped file handles through __gc) and an unknown option
+      # must still raise.
+      i.native("collectgarbage") do |i2, args|
+        opt = args[0]?
+        unless opt.nil? || (opt.is_a?(String) && {"collect", "count", "step", "setpause", "setstepmul"}.includes?(opt))
+          i2.raise_lua("invalid option '#{i2.lua_tostring(opt)}' to 'collectgarbage'")
+        end
+        i2.gc_close_files if opt.nil? || opt == "collect"
         [0.0] of LuaValue
       end
 
       i.globals.raw_set("_G", i.globals)
       i.globals.raw_set("_VERSION", "Lua 5.1")
 
-      # Explicit, loud markers for not-yet-ported libraries (Phase 2/3).
-      stub = LuaFunction.new("stub", ->(i2 : Interp, _args : Array(LuaValue)) {
-        i2.raise_lua("not implemented yet (see PLAN.md)")
-        [] of LuaValue
-      })
-      i.globals.raw_set("require", stub)
-      i.globals.raw_set("dofile", stub)
-      i.globals.raw_set("load", stub)
+      # 5.1 function environments (luaB_setfenv/luaB_getfenv)
+      i.native("setfenv") do |i2, args|
+        t = args[1]?
+        i2.arg_error(2, "setfenv", "table expected") unless t.is_a?(LuaTable)
+        env = t.as(LuaTable)
+        case v = args[0]?
+        when Float64
+          level = v.to_i
+          if level == 0
+            # thread-global env: default for newly compiled chunks
+            i2.default_env = env == i2.globals ? nil : env
+            [i2.globals] of LuaValue
+          elsif cl = i2.caller_closure(level)
+            cl.env = env
+            [cl] of LuaValue
+          else
+            i2.raise_lua("setfenv: invalid level")
+          end
+        when LuaClosure
+          v.env = env
+          [v] of LuaValue
+        else
+          i2.raise_lua("setfenv cannot change environment of given object")
+        end
+      end
+
+      # 5.1 newproxy: bare userdata, optionally with a fresh metatable, or
+      # sharing another proxy's metatable
+      i.native("newproxy") do |i2, args|
+        case a = args[0]?
+        when Nil
+          [LuaUserData.new(ProxyMarker.new)] of LuaValue
+        when Bool
+          u = LuaUserData.new(ProxyMarker.new)
+          u.metatable = LuaTable.new if a
+          [u] of LuaValue
+        when LuaUserData
+          u = LuaUserData.new(ProxyMarker.new)
+          u.metatable = a.metatable
+          [u] of LuaValue
+        else
+          i2.arg_error(1, "newproxy", "nil, boolean or userdata expected")
+        end
+      end
+
+      i.native("getfenv") do |i2, args|
+        case v = args[0]?
+        when nil, Float64
+          level = v.is_a?(Float64) ? v.to_i : 1
+          env = level == 0 ? i2.default_env : i2.caller_closure(level).try &.env
+          [env || i2.globals] of LuaValue
+        when LuaClosure
+          [v.env || i2.globals] of LuaValue
+        else
+          # C functions always run in the global environment
+          [i2.default_env || i2.globals] of LuaValue
+        end
+      end
     end
   end
 end

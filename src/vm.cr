@@ -12,7 +12,7 @@ module Lua
     # instead of memcmp (PUC Lua's short-string interning, compile-time).
     @strings = Hash(String, String).new
 
-    def initialize(@chunkname : String)
+    def initialize(@chunkname : String, @src : String = "")
       @line = 0
     end
 
@@ -28,8 +28,10 @@ module Lua
       getter name : String
       getter scope : Scope
       getter reg : Int32
+      # Matching debug entry in Proto#loc_vars; end_pc patched at scope close.
+      getter dbg : LocVar
 
-      def initialize(@name, @scope, @reg)
+      def initialize(@name, @scope, @reg, @dbg)
       end
     end
 
@@ -50,6 +52,8 @@ module Lua
       property freereg : Int32 = 1
       property loops = [] of LoopInfo
       property n_captures : Int32 = 0
+      # true when the body mentions `...` (clears the implicit `arg`)
+      property? uses_vararg = false
 
       def initialize(@parent, @proto)
       end
@@ -67,6 +71,8 @@ module Lua
     def compile_main(block : AST::Block) : Proto
       p = Proto.new(@chunkname)
       p.vararg = true
+      p.linedefined = 0
+      p.src = @src
       fs = FuncState.new(nil, p)
       @fs = fs
       block_scope(block)
@@ -121,6 +127,8 @@ module Lua
       f = fs
       s = f.scopes.pop
       emit(Op::CLOSE, s.start_reg) if s.captured?
+      # Close the debug live ranges of the dropped locals (5.1 leaveblock).
+      f.locals.each { |l| l.dbg.end_pc = f.proto.code.size if l.reg >= s.start_reg }
       f.locals.reject! { |l| l.reg >= s.start_reg }
       f.freereg = s.start_reg
     end
@@ -134,7 +142,13 @@ module Lua
     # --- variable resolution ---
 
     private def add_local(name : String, reg : Int32) : Nil
-      fs.locals << LocalVar.new(name, fs.scopes.last, reg)
+      p = fs.proto
+      if fs.locals.size >= 200
+        syntax_err("function at line #{p.linedefined} has more than 200 local variables")
+      end
+      lv = LocVar.new(name, reg, p.code.size, p.code.size)
+      p.loc_vars << lv
+      fs.locals << LocalVar.new(name, fs.scopes.last, reg, lv)
     end
 
     # Resolve `name` as an upvalue of `f`, recursing through enclosing
@@ -156,6 +170,9 @@ module Lua
     private def add_upval(f : FuncState, name : String, from_stack : Bool, index : Int32) : Int32
       f.proto.upvals.each_with_index do |u, i|
         return i if u.name == name
+      end
+      if f.proto.upvals.size >= 60
+        syntax_err("function at line #{f.proto.linedefined} has more than 60 upvalues")
       end
       f.proto.upvals << UpvalDesc.new(name, from_stack, index)
       f.proto.upvals.size - 1
@@ -216,18 +233,29 @@ module Lua
         base = f.freereg
         n = s.targets.size
         compile_explist(s.exps, base, n)
-        s.targets.each_with_index do |t, i|
-          case t
-          when AST::NameE then assign_name(t.name, base + i)
-          when AST::IndexE
+        # pre-evaluate every index target's table/key before any store: a
+        # simple-variable assignment earlier in the list must not change
+        # how later index targets resolve (5.1 restassign)
+        tgt = [] of {Int32, Int32}
+        s.targets.each do |t|
+          if t.is_a?(AST::IndexE)
             r = f.freereg
             use_reg(r)
             @line = t.line
             expr(t.obj, r)
             use_reg(r + 1)
             expr(t.key, r + 1)
-            emit(Op::SETTABLE, r, r + 1, base + i)
-            f.freereg = r
+            tgt << {r, r + 1}
+          else
+            tgt << {-1, -1}
+          end
+        end
+        s.targets.each_with_index do |t, i|
+          case t
+          when AST::NameE then assign_name(t.name, base + i)
+          when AST::IndexE
+            r, kr = tgt[i]
+            emit(Op::SETTABLE, r, kr, base + i)
           else
             syntax_err("internal: bad assignment target")
           end
@@ -328,6 +356,9 @@ module Lua
         r = f.freereg
         nvars = s.names.size
         compile_explist(s.exps, r, 3)
+        # 5.1 luaK_fixline: the loop-control instruction is attributed to the
+        # line of the iterator explist's last expression, not `end`
+        for_line = @line
         use_reg(r + 3 + nvars - 1)
         push_scope
         s.names.each_with_index do |n, i|
@@ -340,6 +371,9 @@ module Lua
         block_scope(s.block)
         patch_to_here(first)
         tf = emit(Op::TFORCALL, r, 0, nvars)
+        # the loop-control instruction runs "at" the `for` line (5.1
+        # luaK_fixline), not at the end of the body where it is emitted
+        f.proto.lines[tf] = for_line
         patch(tf, body_start)
         exit_pos = maybe_close_loop(f, r)
         f.loops.last.breaks.each { |br| patch(br, exit_pos) }
@@ -400,7 +434,9 @@ module Lua
         assign_name(target.name, r)
         f.freereg = r
       when AST::IndexE
-        @line = target.line
+        # FuncStat line: IndexE itself carries no line, and compile_func
+        # above has already clobbered @line with the body's
+        @line = s.line
         keys = [] of AST::Expr
         o = target.as(AST::Expr)
         while o.is_a?(AST::IndexE)
@@ -511,6 +547,9 @@ module Lua
       p = Proto.new(@chunkname)
       p.num_params = e.params.size
       p.vararg = e.vararg
+      p.linedefined = e.line
+      p.lastlinedefined = e.end_line
+      p.src = @src
       nfs = FuncState.new(parent, p)
       nfs.freereg = 1
       save = @fs
@@ -521,8 +560,19 @@ module Lua
         add_local(prm, 1 + i)
       end
       use_reg(e.params.size)
+      if e.vararg
+        # 5.1 LUA_COMPAT_VARARG: implicit `arg` local right after the
+        # params — but NOT if the body uses `...` (NEEDSARG is cleared)
+        p.needs_arg = true
+        add_local("arg", 1 + e.params.size)
+        use_reg(1 + e.params.size)
+      end
       block_scope(e.body)
+      p.needs_arg = false if nfs.uses_vararg?
       pop_scope
+      # 5.1 endfunc: the implicit RETURN is attributed to the `end` line
+      # (activelines[lastlinedefined] must be set)
+      @line = e.end_line
       emit(Op::RETURN, 0, 0)
       @fs = save
       parent.proto.protos << p
@@ -541,8 +591,10 @@ module Lua
       @line = e.line
       # Expressions that write a run of registers at dst.. need dst to be
       # at the top of the register window; compile via a temp + MOVE when
-      # the caller reused an older register.
-      if dst < fs.freereg && (multi_expr?(e) || e.is_a?(AST::TableE) || e.is_a?(AST::BinopE))
+      # the caller reused an older register. A single-value call at
+      # dst == freereg-1 is safe in place (the PUC layout), and BinopE
+      # handles a reused dst itself (operands go to a temp).
+      if dst < fs.freereg && ((multi_expr?(e) && (nres == -1 || dst < fs.freereg - 1)) || e.is_a?(AST::TableE))
         r = fs.freereg
         save = r
         expr(e, r, nres == -1 ? 1 : nres)
@@ -560,6 +612,7 @@ module Lua
       when AST::ParenE  then expr(e.e, dst, nres == -1 ? 1 : nres)
       when AST::VarargE
         syntax_err("illegal use of '...'") unless fs.proto.vararg?
+        fs.uses_vararg = true
         emit(Op::VARARG, dst, nres)
         fs.freereg = dst + 1
       when AST::NameE   then compile_name(e.name, dst)
@@ -636,8 +689,11 @@ module Lua
         emit(Op::MOVE, dst, r) unless dst == r
       when "==", "~=", "<", "<=", ">", ">="
         f = fs
-        r = f.freereg
-        use_reg(r)
+        save = f.freereg
+        # operands in place at dst when dst is the top free register
+        # (statement level, the PUC luaK layout); a temp above the live
+        # window when dst reuses an older register
+        r = dst >= save - 1 ? dst : save
         expr(e.lhs, r)
         use_reg(r + 1)
         expr(e.rhs, r + 1)
@@ -649,7 +705,7 @@ module Lua
         when "<=" then emit(Op::LE, dst, r, r + 1)
         when ">=" then emit(Op::LE, dst, r + 1, r)
         end
-        f.freereg = r
+        f.freereg = {save, dst + 1}.max
       else
         # arithmetic, constant-folded when both sides are numeric literals
         if e.lhs.is_a?(AST::NumE) && e.rhs.is_a?(AST::NumE)
@@ -668,8 +724,8 @@ module Lua
           return
         end
         f = fs
-        r = f.freereg
-        use_reg(r)
+        save = f.freereg
+        r = dst >= save - 1 ? dst : save
         expr(e.lhs, r)
         use_reg(r + 1)
         expr(e.rhs, r + 1)
@@ -683,7 +739,7 @@ module Lua
              else          syntax_err("internal: unknown arith op #{e.op}")
              end
         emit(op, dst, r, r + 1)
-        f.freereg = r
+        f.freereg = {save, dst + 1}.max
       end
     end
 
@@ -742,10 +798,15 @@ module Lua
               offset = flush_list(dst, narr, offset)
               narr = 0
             end
+            # flushed array regs are dead: compile the multi-value field
+            # directly at dst+1 (bypasses expr's temp+MOVE guard, which
+            # would collapse it to one value)
+            f.freereg = dst + 1
             expr(v, dst + 1, -1)
             emit(Op::SETLIST, dst, -1, offset)
           else
             narr += 1
+            f.freereg = dst + narr # stored/freed array regs are dead too
             expr(v, dst + narr)
             if narr >= 50
               offset = flush_list(dst, narr, offset)
@@ -767,6 +828,9 @@ module Lua
   # --- execution (port of MoonSharp Execution/Vm / lua's lvm.c) ---
 
   class Interp
+    # 5.1 LUAI_MAXSTACK: cap on the value stack; recursion past it raises
+    # "stack overflow" instead of growing without bound
+    MAX_STACK_SLOTS = 250_000
     # Call frames in a grow-only buffer with a logical size: call/return
     # never touches the Array (no push/pop churn) and slots above @fsize
     # are the reuse pool.
@@ -791,6 +855,11 @@ module Lua
     property current_co : LuaCoroutine? = nil
 
     private def ensure_stack(n : Int32) : Nil
+      if n >= MAX_STACK_SLOTS
+        # 5.1 LUAI_MAXSTACK: dynamic growth is capped; going past the cap
+        # raises "stack overflow" (position info added by raise_lua)
+        raise_lua("stack overflow")
+      end
       while @stack.size <= n
         @stack << nil.as(LuaValue)
       end
@@ -847,6 +916,14 @@ module Lua
       u
     end
 
+    # 5.1 LUA_COMPAT_VARARG: the implicit `arg` table {n = #extras, ...}
+    private def make_arg_table(vars : Array(LuaValue)) : LuaTable
+      t = LuaTable.new
+      t.raw_set("n", vars.size.to_f64)
+      vars.each_with_index { |v, k| t.raw_set((k + 1).to_f64, v) }
+      t
+    end
+
     # Push a frame for a Lua-to-Lua call. The closure is already at
     # stack[newbase] and its arguments at newbase+1.. (in place — no copy).
     private def push_call(fn : LuaClosure, newbase : Int32, argn : Int32, want : Int32) : Nil
@@ -861,6 +938,10 @@ module Lua
       vars = Lua::EMPTY_VALS
       if p.vararg? && argn > np
         vars = Array(LuaValue).new(argn - np) { |j| stack[newbase + 1 + np + j] }
+      end
+      if p.vararg?
+        # 5.1 compat: `arg' table — or plain nil when the body uses `...`
+        stack[newbase + 1 + np] = p.needs_arg? ? make_arg_table(vars) : nil
       end
       top = newbase + {p.max_stack, argn + 1}.max
       ensure_stack(top + argn + 4)
@@ -880,8 +961,8 @@ module Lua
     end
 
     # Call a non-closure value from the VM (native / __call table), used by
-    # CALL and TAILCALL.
-    private def call_value(fn : LuaValue, ra : Int32, argn : Int32) : Array(LuaValue)
+    # CALL and TAILCALL. vreg: the function's register, for error naming.
+    private def call_value(fn : LuaValue, ra : Int32, argn : Int32, vreg : Int32 = -1) : Array(LuaValue)
       args = Array(LuaValue).new(argn) { |i| @stack[ra + 1 + i] }
       case fn
       when LuaFunction
@@ -890,10 +971,10 @@ module Lua
         if mm = metafield(fn, "__call")
           call(mm, ([fn] of LuaValue).concat(args))
         else
-          raise_lua("attempt to call a #{Lua.type_name(fn)} value")
+          typeerr("call", fn, vreg)
         end
       else
-        raise_lua("attempt to call a #{Lua.type_name(fn)} value")
+        typeerr("call", fn, vreg)
       end
     end
 
@@ -1037,17 +1118,18 @@ module Lua
             when .loadk?     then sp[base + a] = kp[b]
             when .getglobal?
               n = kp[b].as(String)
-              # globals normally have no metatable; keep the general path for
-              # the rare setmetatable(_G, ...) case
-              if @globals.metatable
+              # 5.1 environments: closures may carry their own env table
+              # (setfenv); the metatable slow path stays for the rare
+              # setmetatable(_G, ...) case
+              if (g = cl.env) || @globals.metatable
                 @line = lines[pc - 1]
-                stack[base + a] = getindex(@globals, n)
+                stack[base + a] = getindex(g || @globals, n)
               else
                 sp[base + a] = @globals.raw_get(n)
               end
             when .setglobal?
               @line = lines[pc - 1]
-              setindex(@globals, kp[b].as(String), stack[base + a])
+              setindex(cl.env || @globals, kp[b].as(String), stack[base + a])
             when .getupval?
               u = uv[b]
               if s = u.stack
@@ -1069,7 +1151,8 @@ module Lua
                 sp[base + a] = o.raw_get(k)
               else
                 @line = lines[pc - 1]
-                stack[base + a] = getindex(o, k)
+                @vi_pc = pc - 1
+                stack[base + a] = getindex(o, k, b)
               end
             when .settable?
               t = sp[base + a]
@@ -1078,7 +1161,8 @@ module Lua
                 t.raw_set(k, sp[base + c])
               else
                 @line = lines[pc - 1]
-                setindex(t, k, stack[base + c])
+                @vi_pc = pc - 1
+                setindex(t, k, stack[base + c], a)
               end
             when .self?
               obj = sp[base + b]
@@ -1087,7 +1171,8 @@ module Lua
                 sp[base + a] = obj.raw_get(kp[c].as(String))
               else
                 @line = lines[pc - 1]
-                stack[base + a] = getindex(obj, kp[c].as(String))
+                @vi_pc = pc - 1
+                stack[base + a] = getindex(obj, kp[c].as(String), b)
               end
             when .newtable?  then sp[base + a] = LuaTable.new
             when .setlist?
@@ -1111,6 +1196,7 @@ module Lua
                   end
               else
                 @line = lines[pc - 1]
+                @vi_pc = pc - 1
                 o = case op
                     when .add? then "+"
                     when .sub? then "-"
@@ -1119,21 +1205,24 @@ module Lua
                     when .mod? then "%"
                     else             "^"
                     end
-                stack[base + a] = arith(o, l, r)
+                stack[base + a] = arith(o, l, r, b, c)
               end
             when .unm?
               @line = lines[pc - 1]
-              stack[base + a] = negate(stack[base + b])
+              @vi_pc = pc - 1
+              stack[base + a] = negate(stack[base + b], b)
             when .not?       then sp[base + a] = !Lua.truthy(sp[base + b])
             when .len?
               @line = lines[pc - 1]
-              stack[base + a] = lua_len(stack[base + b])
+              @vi_pc = pc - 1
+              stack[base + a] = lua_len(stack[base + b], b)
             when .concat?
               @line = lines[pc - 1]
+              @vi_pc = pc - 1
               v = stack[base + b]
               i = b - 1
               while i >= a
-                v = lua_concat(stack[base + i], v)
+                v = lua_concat(stack[base + i], v, i, i + 1)
                 i -= 1
               end
               stack[base + a] = v
@@ -1149,9 +1238,10 @@ module Lua
               if l.is_a?(Float64) && r.is_a?(Float64)
                 sp[base + a] = l < r
               elsif l.is_a?(String) && r.is_a?(String)
-                sp[base + a] = (l <=> r) < 0
+                sp[base + a] = Lua.strcmp(l, r) < 0
               else
                 @line = lines[pc - 1]
+                @vi_pc = pc - 1
                 stack[base + a] = lua_compare(l, r, "<")
               end
             when .le?
@@ -1160,9 +1250,10 @@ module Lua
               if l.is_a?(Float64) && r.is_a?(Float64)
                 sp[base + a] = l <= r
               elsif l.is_a?(String) && r.is_a?(String)
-                sp[base + a] = (l <=> r) <= 0
+                sp[base + a] = Lua.strcmp(l, r) <= 0
               else
                 @line = lines[pc - 1]
+                @vi_pc = pc - 1
                 stack[base + a] = lua_compare(l, r, "<=")
               end
             when .jmp?  then pc += b
@@ -1192,7 +1283,9 @@ module Lua
               pr.upvals.each do |d|
                 ups << (d.from_stack? ? capture(base + d.index) : upvals[d.index])
               end
-              stack[base + a] = LuaClosure.new(pr, ups)
+              nc = LuaClosure.new(pr, ups)
+              nc.env = cl.env # 5.1: closures inherit the enclosing env
+              stack[base + a] = nc
             when .close? then close_upvals(base + a)
             when .forprep?
               @line = lines[pc - 1]
@@ -1280,12 +1373,13 @@ module Lua
                 break # re-fetch frame
               else
                 @line = lines[pc - 1]
+                @vi_pc = pc - 1
+                frame.pc = pc # call position while the native runs (getinfo)
                 r = begin
-                  call_value(fn, base + a, argn)
+                  call_value(fn, base + a, argn, a)
                 rescue e : YieldSignal
                   # coroutine.yield: the CALL resumes later with the
                   # yielded values as its results
-                  frame.pc = pc
                   @yield_call = {frame, base + a, c, false}
                   raise e
                 end
@@ -1316,6 +1410,9 @@ module Lua
                 if p.vararg? && argn > np2
                   vars = Array(LuaValue).new(argn - np2) { |j| stack[base + 1 + np2 + j] }
                 end
+                if p.vararg?
+                  stack[base + 1 + np2] = p.needs_arg? ? make_arg_table(vars) : nil
+                end
                 frame.closure = fn
                 frame.varargs = vars
                 frame.pc = 0
@@ -1323,11 +1420,13 @@ module Lua
                 ensure_stack(frame.top + argn + 4)
                 break # re-fetch frame
               else
+                @line = lines[pc - 1]
+                @vi_pc = pc - 1
+                frame.pc = pc # call position while the native runs
                 r = begin
-                  call_value(fn, base + a, argn)
+                  call_value(fn, base + a, argn, a)
                 rescue e : YieldSignal
                   # tail call to yield: completes as this frame's return
-                  frame.pc = 0
                   @yield_call = {frame, -1, 0, true}
                   raise e
                 end
@@ -1388,6 +1487,27 @@ module Lua
           end
         end
         results
+      rescue e : LuaError
+        # 5.1 luaD_errormsg: an xpcall message handler runs here, before any
+        # unwinding, so debug.traceback sees the frames that raised. A
+        # handler that itself errors aborts with "error in error handling".
+        if (h = @err_handler) && !e.msgh_done?
+          e.msgh_done = true
+          # one shot: an error raised by the handler itself must not
+          # re-enter it (recursion); it becomes "error in error handling"
+          save = @err_handler
+          @err_handler = nil
+          begin
+            e.value = call(h, [e.value] of LuaValue)[0]?
+          rescue e2 : LuaError
+            err = LuaError.new("error in error handling")
+            err.msgh_done = true
+            raise err
+          ensure
+            @err_handler = save
+          end
+        end
+        raise e
       ensure
         @call_depth = d_call
         @entry_stack.pop
@@ -1464,8 +1584,10 @@ module Lua
           else
             store_results(yf, yra, yc, args)
           end
-          # the continuing frame is the top one (index @fsize - 1)
-          res = run_frames(@fsize - 1, 0)
+          # run to the next yield or the end of the coroutine BODY (frame 0):
+          # frames above (e.g. the function the yield happened in) must
+          # return into the body, not end the resume
+          res = run_frames(0, @frames[0].base)
           co.status = LuaCoroutine::Status::Dead
           co.release
           ([true] of LuaValue).concat(res)

@@ -3,7 +3,11 @@
 # min_expand/matchbalance/start_capture/end_capture/match_capture).
 # Byte-oriented: positions are 0-based indices into Bytes.
 module Lua::Pattern
-  class PatternError < Exception
+  # Raised as a Lua error (not wrapped as a Crystal failure at the boundary)
+  class PatternError < LuaError
+    def initialize(msg : String)
+      super(msg)
+    end
   end
 
   struct Cap
@@ -47,8 +51,9 @@ module Lua::Pattern
       MatchResult.new(res, caps)
     end
 
-    def whole_capture(s : Bytes, cap : Cap) : String
-      cap.position? ? cap.start.to_s : String.new(s[cap.start, cap.len])
+    def whole_capture(s : Bytes, cap : Cap) : String | Float64
+      # position captures "()" are NUMBERS in 5.1
+      cap.position? ? cap.start.to_f64 : String.new(s[cap.start, cap.len])
     end
 
     # --- the matcher (port of lstrlib match()) ---
@@ -95,7 +100,9 @@ module Lua::Pattern
             end
           else
             d = @p[p + 1]?
-            if d && d >= 0x31 && d <= 0x39 # '1'..'9' backreference
+            if d == 0x30 # '0' — not a valid capture reference in patterns
+              raise PatternError.new("invalid capture index")
+            elsif d && d >= 0x31 && d <= 0x39 # '1'..'9' backreference
               r = match_capture(s, d - 0x30)
               return nil if r.nil?
               s = r.not_nil!
@@ -168,23 +175,22 @@ module Lua::Pattern
 
     private def match_class(c : UInt8, cl : UInt8) : Bool
       res =
-        case cl
-        when 0x61 then alpha?(c)      # a
-        when 0x63 then cntrl?(c)      # c
-        when 0x64 then digit?(c)      # d
-        when 0x6C then lower?(c)      # l
-        when 0x70 then punct?(c)      # p
-        when 0x73 then space?(c)      # s
-        when 0x75 then upper?(c)      # u
-        when 0x77 then alpha?(c) || digit?(c) # w
-        when 0x78 then xdigit?(c)     # x
-        else          return cl == c
+        case cl | 0x20 # ASCII tolower: 'S' shares 's's predicate
+        when 0x61 then alpha?(c)                 # a/A
+        when 0x63 then cntrl?(c)                 # c/C
+        when 0x64 then digit?(c)                 # d/D
+        when 0x6C then lower?(c)                 # l/L
+        when 0x70 then punct?(c)                 # p/P
+        when 0x73 then space?(c)                 # s/S
+        when 0x75 then upper?(c)                 # u/U
+        when 0x77 then alpha?(c) || digit?(c)    # w/W
+        when 0x78 then xdigit?(c)                # x/X
+        when 0x7A then c == 0_u8                 # z/Z (5.1: the zero byte)
+        else          cl == c
         end
-      if upper?(cl)
-        !res
-      else
-        res
-      end
+      # an uppercase non-class letter (e.g. %Z) negates the literal char
+      # match — quirky but exact lstrlib behavior
+      upper?(cl) ? !res : res
     end
 
     private def match_bracket(c : UInt8, p : Int32, ec : Int32) : Bool

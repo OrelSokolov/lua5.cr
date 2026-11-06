@@ -26,6 +26,7 @@ module Lua
       @s = @src.to_slice
       @pos = 0
       @line = 1
+      @eol_tail = false
     end
 
     def tokens : Array(Token)
@@ -49,15 +50,27 @@ module Lua
       p < @s.size ? @s[p].to_i : -1
     end
 
+    # @eol_tail: the byte being consumed is the second half of a line end
+    # already counted (the \n of \r\n, or the \r of \n\r).
+    @eol_tail : Bool = false
+
     private def adv : Int32
       ch = @s[@pos].to_i
       @pos += 1
-      @line += 1 if ch == 0x0A
+      if @eol_tail
+        @eol_tail = false
+      elsif ch == 0x0A || ch == 0x0D
+        # llex.c inclinenumber: \n, \r, \r\n and \n\r each count as ONE
+        # line — pair detection looks FORWARD from the counted byte
+        @line += 1
+        nxt = @pos < @s.size ? @s[@pos].to_i : -1
+        @eol_tail = (ch == 0x0A && nxt == 0x0D) || (ch == 0x0D && nxt == 0x0A)
+      end
       ch
     end
 
     private def err(msg, line = @line)
-      raise SyntaxError.new(line, "#{@chunkname}:#{line}: #{msg}")
+      raise SyntaxError.new(line, "#{Lua.short_src(@chunkname)}:#{line}: #{msg}")
     end
 
     private def skip_shebang
@@ -76,10 +89,11 @@ module Lua
           adv
         elsif ch == 0x2D && c(1) == 0x2D # "--"
           adv; adv
-          if c == 0x5B && (lvl = long_open_level)
-            read_long_string(lvl, @line)
+          if c == 0x5B && (tstart = @pos) && (lvl = long_open_level)
+            read_long_string(lvl, @line, tstart)
           else
-            until eof? || @s[@pos] == 0x0A
+            # comment runs to end of line (\n, \r or a \r\n / \n\r pair)
+            until eof? || @s[@pos] == 0x0A || @s[@pos] == 0x0D
               adv
             end
           end
@@ -103,14 +117,18 @@ module Lua
       end
     end
 
-    private def read_long_string(lvl : Int32, opener_line : Int32) : Token
-      # Skip one newline right after the opener.
+    private def read_long_string(lvl : Int32, opener_line : Int32, tstart : Int32) : Token
+      # Skip one newline right after the opener (\n, \r, \r\n or \n\r —
+      # each counts as ONE line, like 5.1 inclinenumber).
       if c == 0x0D && c(1) == 0x0A
         adv; adv
-      elsif c == 0x0A
+      elsif c == 0x0A && c(1) == 0x0D
+        adv; adv
+      elsif c == 0x0A || c == 0x0D
         adv
       end
       start = @pos
+      content = IO::Memory.new
       loop do
         ch = c
         if ch == -1
@@ -123,12 +141,21 @@ module Lua
             i += 1
           end
           if c(i) == 0x5D && l == lvl
-            content = @s[start, @pos - start]
+            content.write(@s[start, @pos - start])
             (l + 2).times { adv }
-            return Token.new(Tk::Str, opener_line, String.new(content))
+            raw = String.new(@s[tstart, @pos - tstart])
+            return Token.new(Tk::Str, opener_line, String.new(content.to_slice), 0.0, raw)
           else
             adv
           end
+        elsif ch == 0x0D || ch == 0x0A
+          # interior line ends normalize to '\n' (5.1 read_long_string:
+          # "save(ls, '\n'); inclinenumber(ls)")
+          content.write(@s[start, @pos - start])
+          adv
+          adv if (ch == 0x0D && c == 0x0A) || (ch == 0x0A && c == 0x0D)
+          content.write_byte(0x0A)
+          start = @pos
         else
           adv
         end
@@ -200,8 +227,9 @@ module Lua
       when 0x22, 0x27
         read_string(ch, line)
       when 0x5B # '['
+        tstart = @pos
         if (lvl = long_open_level)
-          read_long_string(lvl, line)
+          read_long_string(lvl, line, tstart)
         else
           sym(Tk::LBracket, "[", line)
         end
@@ -211,7 +239,9 @@ module Lua
         elsif digit?(ch)
           read_number(line)
         else
-          err("unexpected symbol near '#{ch.chr}'")
+          # raw byte, not ch.chr: Char interpolation UTF-8-encodes >0x7F
+          # bytes, but Lua strings are byte strings
+          err("unexpected symbol near '#{String.new(Bytes[ch.to_u8])}'")
         end
       end
     end
@@ -282,18 +312,26 @@ module Lua
         end
         text = String.new(@s[start, @pos - start])
         n = text.to_f64?
-        err("malformed number near '#{text}'") if n.nil?
-        val = n.not_nil!
+        if n.nil?
+          # Crystal rejects out-of-range doubles; strtod (and Lua) accept
+          # them as +inf. Our scan guarantees the syntax, so nil = overflow
+          # (a stray "1.2.3" fails the check below and stays malformed).
+          err("malformed number near '#{text}'") unless text.matches?(/\A\d+\.?\d*([eE][+-]?\d+)?\z/)
+          val = Float64::INFINITY
+        else
+          val = n
+        end
       end
       Token.new(Tk::Num, line, text, val)
     end
 
     private def read_string(quote : Int32, line : Int32) : Token
+      tstart = @pos
       adv
       buf = IO::Memory.new
       loop do
         ch = c
-        if ch == -1 || ch == 0x0A
+        if ch == -1 || ch == 0x0A || ch == 0x0D
           err("unfinished string (starting at line #{line})", line)
         elsif ch == quote
           adv
@@ -305,7 +343,8 @@ module Lua
           buf.write_byte(adv.to_u8)
         end
       end
-      Token.new(Tk::Str, line, String.new(buf.to_slice))
+      raw = String.new(@s[tstart, @pos - tstart])
+      Token.new(Tk::Str, line, String.new(buf.to_slice), 0.0, raw)
     end
 
     private def read_escape(buf : IO::Memory, line : Int32)
@@ -320,7 +359,13 @@ module Lua
       when 0x72 then buf.write_byte(13)
       when 0x74 then buf.write_byte(9)
       when 0x76 then buf.write_byte(11)
-      when 0x5C, 0x22, 0x27, 0x0A then buf.write_byte(e.to_u8)
+      when 0x5C, 0x22, 0x27 then buf.write_byte(e.to_u8)
+      when 0x0A, 0x0D
+        # line continuation: consume the full line end (\r\n / \n\r count as
+        # one) and append a single \n (5.1 read_string "line ends are turned
+        # into \n")
+        adv if c == 0x0D || c == 0x0A
+        buf.write_byte(0x0A)
       when 0x78 # \xHH (LuaJIT extension)
         h1 = hexval(c)
         h2 = hexval(c(1))

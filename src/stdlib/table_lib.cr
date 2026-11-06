@@ -89,6 +89,54 @@ module Lua::Stdlib
         [t.raw_length.to_f64] of LuaValue
       }))
 
+      # 5.1 deprecated: iterate table/array calling f(k, v); a non-nil
+      # return from f stops the iteration and becomes the result
+      tbl.raw_set("foreach", LuaFunction.new("table.foreach", ->(i2 : Interp, args : Array(LuaValue)) {
+        t = i2.table!(args, 0, "foreach")
+        f = args[1]?
+        i2.func!(args, 1, "foreach")
+        result : LuaValue = nil
+        t.raw_keys.each do |k|
+          r = i2.call(f.not_nil!, [k, t.raw_get(k)] of LuaValue)[0]?
+          unless r.nil?
+            result = r
+            break
+          end
+        end
+        [result] of LuaValue
+      }))
+
+      tbl.raw_set("foreachi", LuaFunction.new("table.foreachi", ->(i2 : Interp, args : Array(LuaValue)) {
+        t = i2.table!(args, 0, "foreachi")
+        f = args[1]?
+        i2.func!(args, 1, "foreachi")
+        n = t.raw_length
+        result : LuaValue = nil
+        x = 1
+        while x <= n
+          r = i2.call(f.not_nil!, [x.to_f64, t.raw_get(x.to_f64)] of LuaValue)[0]?
+          unless r.nil?
+            result = r
+            break
+          end
+          x += 1
+        end
+        [result] of LuaValue
+      }))
+
+      # 5.1 deprecated: largest positive NUMERIC key (0 when none);
+      # string keys convertible to numbers don't count
+      tbl.raw_set("maxn", LuaFunction.new("table.maxn", ->(i2 : Interp, args : Array(LuaValue)) {
+        t = i2.table!(args, 0, "maxn")
+        m = 0.0
+        t.raw_keys.each do |k|
+          if k.is_a?(Float64) && !k.nan? && k > m
+            m = k
+          end
+        end
+        [m] of LuaValue
+      }))
+
       i.globals.raw_set("table", tbl)
     end
 

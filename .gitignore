@@ -7,3 +7,6 @@ shard.lock
 /tmp/
 /bench/vendor/
 /bench/results/
+/bin/
+/lua5
+/lua5.dwarf

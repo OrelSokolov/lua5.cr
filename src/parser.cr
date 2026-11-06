@@ -14,9 +14,56 @@ module Lua
     RIGHT_ASSOC = {"..", "^"}
     UNARY_PREC = 8
 
+    # Parse-time emulation of the 5.1 per-function limits (LUAI_MAXVARS=200,
+    # LUAI_MAXUPVALUES=60): our pipeline parses the whole chunk before
+    # compiling, so these must fire during parsing for chunks that never
+    # reach codegen (the errors.lua limit tests build such chunks).
+    class FnScope
+      getter line : Int32
+      getter locals = Set(String).new
+      getter upvals = Set(String).new
+
+      def initialize(@line)
+      end
+    end
+
     def initialize(@toks : Array(Token), @chunkname : String = "chunk")
       @pos = 0
       @last_line = 1
+      @fnscopes = [FnScope.new(0)]
+    end
+
+    # A name reference: if it resolves to a local of an enclosing function,
+    # every function between it and the owner routes it through its upvalue
+    # list (5.1 singlevaraux) — each may not exceed 60 distinct upvalues.
+    private def note_ref(name : String) : Nil
+      scopes = @fnscopes
+      owner = -1
+      i = scopes.size - 1
+      while i >= 0
+        if scopes[i].locals.includes?(name)
+          owner = i
+          break
+        end
+        i -= 1
+      end
+      return if owner < 0 # resolves to a global: no chain
+      i = scopes.size - 1
+      while i > owner
+        s = scopes[i]
+        if s.upvals.add?(name) && s.upvals.size > 60
+          err("function at line #{s.line} has more than 60 upvalues")
+        end
+        i -= 1
+      end
+    end
+
+    private def add_locals(names : Array(String)) : Nil
+      s = @fnscopes.last
+      names.each { |n| s.locals << n }
+      if s.locals.size > 200
+        err("function at line #{s.line} has more than 200 local variables")
+      end
     end
 
     def parse_chunk : AST::Block
@@ -67,7 +114,22 @@ module Lua
     end
 
     private def err(msg)
-      raise SyntaxError.new(cur.line, "#{@chunkname}:#{cur.line}: #{msg}")
+      raise SyntaxError.new(cur.line, "#{Lua.short_src(@chunkname)}:#{cur.line}: #{msg}")
+    end
+
+    # 5.1 LUAI_MAXCCALLS: nesting limit for blocks and expressions ("chunk
+    # has too many syntax levels"); also bounds parser recursion
+    MAX_LEVELS = 200
+    @depth = 0
+
+    private def level_up
+      err("chunk has too many syntax levels") if @depth >= MAX_LEVELS
+      @depth += 1
+      begin
+        yield
+      ensure
+        @depth -= 1
+      end
     end
 
     private def expect_name : String
@@ -87,36 +149,35 @@ module Lua
     end
 
     private def parse_block : AST::Block
-      block = AST::Block.new
-      until block_follow?
-        if check(Tk::Semi)
+      level_up do
+        block = AST::Block.new
+        until block_follow?
+          break if check(Tk::Return) || check(Tk::Break)
+          block.stats << parse_stat
+          accept(Tk::Semi) # 5.1 grammar: stat [';'] — one optional ';'
+        end
+        if check(Tk::Return)
+          line = cur.line
           adv
-          next
+          exps = [] of AST::Expr
+          unless block_follow? || check(Tk::Semi)
+            exps = parse_explist
+          end
+          accept(Tk::Semi)
+          rs = AST::ReturnStat.new
+          rs.exps = exps
+          # proper tail call: exactly one call expression
+          rs.tail = exps.size == 1 && (exps[0].is_a?(AST::CallE) || exps[0].is_a?(AST::MethodCallE))
+          rs.at(line)
+          block.stats << rs
+        elsif check(Tk::Break)
+          line = cur.line
+          adv
+          accept(Tk::Semi)
+          block.stats << AST::BreakStat.new.at(line)
         end
-        break if check(Tk::Return) || check(Tk::Break)
-        block.stats << parse_stat
+        block
       end
-      if check(Tk::Return)
-        line = cur.line
-        adv
-        exps = [] of AST::Expr
-        unless block_follow? || check(Tk::Semi)
-          exps = parse_explist
-        end
-        accept(Tk::Semi)
-        rs = AST::ReturnStat.new
-        rs.exps = exps
-        # proper tail call: exactly one call expression
-        rs.tail = exps.size == 1 && (exps[0].is_a?(AST::CallE) || exps[0].is_a?(AST::MethodCallE))
-        rs.at(line)
-        block.stats << rs
-      elsif check(Tk::Break)
-        line = cur.line
-        adv
-        accept(Tk::Semi)
-        block.stats << AST::BreakStat.new.at(line)
-      end
-      block
     end
 
     # --- statements ---
@@ -153,6 +214,8 @@ module Lua
         if check(Tk::Function)
           adv
           name = expect_name
+          # visible inside its own body (recursion)
+          @fnscopes.last.locals << name
           fn = parse_funcbody
           AST::LocalFuncStat.new(name, fn).at(line)
         else
@@ -164,6 +227,9 @@ module Lua
           if accept(Tk::Assign)
             st.exps = parse_explist
           end
+          # declared only after the initializer list is parsed
+          # (`local x = x` sees the outer x)
+          add_locals(st.names)
           st.at(line)
         end
       else
@@ -220,6 +286,7 @@ module Lua
         limit_e = parse_expr
         step_e = accept(Tk::Comma) ? parse_expr : nil
         expect(Tk::Do)
+        @fnscopes.last.locals << name1
         b = parse_block
         expect(Tk::End)
         AST::NumForStat.new(name1, start_e, limit_e, step_e, b).at(line)
@@ -232,6 +299,7 @@ module Lua
         expect(Tk::In)
         st.exps = parse_explist
         expect(Tk::Do)
+        @fnscopes.last.locals.concat(st.names)
         st.block = parse_block
         expect(Tk::End)
         st.at(line)
@@ -251,18 +319,18 @@ module Lua
           names << expect_name
           fn = parse_funcbody
           fn.params.unshift("self")
-          return AST::FuncStat.new(names_to_target(names), fn).at(line)
+          return AST::FuncStat.new(names_to_target(names, line), fn).at(line)
         end
       end
       fn = parse_funcbody
-      AST::FuncStat.new(names_to_target(names), fn).at(line)
+      AST::FuncStat.new(names_to_target(names, line), fn).at(line)
     end
 
     # a.b.c -> IndexE(IndexE(NameE(a), StrE(b)), StrE(c))
-    private def names_to_target(names : Array(String)) : AST::Expr
-      e = AST::NameE.new(names[0]).at(0).as(AST::Expr)
+    private def names_to_target(names : Array(String), line : Int32) : AST::Expr
+      e = AST::NameE.new(names[0]).at(line).as(AST::Expr)
       names[1..].each do |n|
-        e = AST::IndexE.new(e, AST::StrE.new(n)).at(0)
+        e = AST::IndexE.new(e, AST::StrE.new(n).at(line)).at(line)
       end
       e
     end
@@ -286,8 +354,12 @@ module Lua
         end
       end
       expect(Tk::RParen)
+      @fnscopes.push(FnScope.new(line))
+      @fnscopes.last.locals.concat(f.params)
       f.body = parse_block
+      f.end_line = cur.line # the closing 'end': 5.1 lastlinedefined
       expect(Tk::End)
+      @fnscopes.pop
       f.at(line)
     end
 
@@ -336,27 +408,29 @@ module Lua
     end
 
     private def subexp(limit : Int32) : AST::Expr
-      left : AST::Expr
-      if u = unop?(cur)
-        line = cur.line
-        adv
-        operand = subexp(UNARY_PREC)
-        left = AST::UnopE.new(u, operand).at(line)
-      else
-        left = parse_simple
+      level_up do
+        left : AST::Expr
+        if u = unop?(cur)
+          line = cur.line
+          adv
+          operand = subexp(UNARY_PREC)
+          left = AST::UnopE.new(u, operand).at(line)
+        else
+          left = parse_simple
+        end
+        loop do
+          info = binop?(cur)
+          break if info.nil?
+          op, prec = info
+          break unless prec > limit
+          line = cur.line
+          adv
+          rprec = RIGHT_ASSOC.includes?(op) ? prec - 1 : prec
+          right = subexp(rprec)
+          left = AST::BinopE.new(op, left, right).at(line)
+        end
+        left
       end
-      loop do
-        info = binop?(cur)
-        break if info.nil?
-        op, prec = info
-        break unless prec > limit
-        line = cur.line
-        adv
-        rprec = RIGHT_ASSOC.includes?(op) ? prec - 1 : prec
-        right = subexp(rprec)
-        left = AST::BinopE.new(op, left, right).at(line)
-      end
-      left
     end
 
     private def parse_simple : AST::Expr
@@ -381,13 +455,10 @@ module Lua
     private def parse_primary : AST::Expr
       line = cur.line
       if check(Tk::Name)
-        AST::NameE.new(adv.text).at(line)
+        name = adv.text
+        note_ref(name)
+        AST::NameE.new(name).at(line)
       elsif check(Tk::LParen)
-        # Lua 5.1: '(' on a fresh line is ambiguous with a new statement
-        # (lparser.c: "ambiguous syntax (function call x new statement)")
-        if cur.line != @last_line
-          err("ambiguous syntax (function call x new statement)")
-        end
         adv
         e = parse_expr
         expect(Tk::RParen)
@@ -404,7 +475,7 @@ module Lua
         case cur.kind
         when .dot?
           adv
-          e = AST::IndexE.new(e, AST::StrE.new(expect_name)).at(line)
+          e = AST::IndexE.new(e, AST::StrE.new(expect_name).at(line)).at(line)
         when .l_bracket?
           adv
           k = parse_expr
@@ -426,7 +497,13 @@ module Lua
     end
 
     private def parse_args : Array(AST::Expr)
-      if accept(Tk::LParen)
+      if check(Tk::LParen)
+        # lparser.c funcargs: '(' args on a different line than the called
+        # expression are ambiguous with a new statement — reject like 5.1
+        if cur.line != @last_line
+          err("ambiguous syntax (function call x new statement)")
+        end
+        adv
         exps = check(Tk::RParen) ? [] of AST::Expr : parse_explist
         expect(Tk::RParen)
         exps

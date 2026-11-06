@@ -51,9 +51,47 @@ module Lua
     return nil if t.empty?
     if t.size > 2 && (t.starts_with?("0x") || t.starts_with?("0X"))
       t[2..].to_i64?(16).try &.to_f64
-    else
-      t.to_f64?
+    elsif (n = t.to_f64?)
+      n
+    elsif looks_like_number?(t)
+      # strtod semantics: well-formed but out of range → ±inf
+      t.starts_with?('-') ? Float64::INFINITY * -1 : Float64::INFINITY
     end
+  end
+
+  # Byte-oriented numeric-syntax check ("^-?d+.?d*([eE][+-]?d+)?$"); no
+  # Crystal Regex — it validates UTF-8 and raises on binary strings.
+  private def self.looks_like_number?(t : String) : Bool
+    b = t.to_slice
+    i = 0
+    i += 1 if b[0]? == 0x2D # '-'
+    digits = 0
+    while d = b[i]?
+      break unless 0x30 <= d <= 0x39
+      digits += 1
+      i += 1
+    end
+    return false if digits == 0
+    if b[i]? == 0x2E # '.'
+      i += 1
+      while d = b[i]?
+        break unless 0x30 <= d <= 0x39
+        digits += 1
+        i += 1
+      end
+    end
+    if (e = b[i]?) && (e == 0x65 || e == 0x45) # e E
+      i += 1
+      i += 1 if (s = b[i]?) && (s == 0x2B || s == 0x2D) # + -
+      edigits = 0
+      while d = b[i]?
+        break unless 0x30 <= d <= 0x39
+        edigits += 1
+        i += 1
+      end
+      return false if edigits == 0
+    end
+    i == b.size && digits > 0
   end
 
   # Lua prints numbers with LUAI_NUMFFORMAT ("%.14g").
@@ -68,7 +106,10 @@ module Lua
 
   # Runtime Lua error; `value` is what travels to pcall (string, table, ...).
   class LuaError < Exception
-    getter value : LuaValue
+    # set when an xpcall message handler has already processed this error
+    # (5.1 runs it once, at the raise point, before unwinding)
+    property? msgh_done : Bool = false
+    property value : LuaValue
 
     def initialize(@value : LuaValue, msg : String? = nil)
       super(msg || Lua.err_display(@value))
@@ -82,6 +123,22 @@ module Lua
     else
       Lua.repr_addr(v)
     end
+  end
+
+  # Bytewise string ordering (5.1 luaV_strcmp): Lua strings are byte
+  # arrays; Crystal's String#<=> decodes codepoints and raises on
+  # invalid UTF-8, so comparisons must go through raw bytes.
+  def self.strcmp(a : String, b : String) : Int32
+    ab = a.to_slice
+    bb = b.to_slice
+    n = ab.size < bb.size ? ab.size : bb.size
+    i = 0
+    while i < n
+      d = ab[i].to_i32 - bb[i].to_i32
+      return d < 0 ? -1 : 1 if d != 0
+      i += 1
+    end
+    ab.size <=> bb.size
   end
 
   def self.repr_addr(v : LuaValue) : String
@@ -99,6 +156,11 @@ module Lua
 
   class LuaTable
     property metatable : LuaTable? = nil
+    # pairs-traversal hint: (key, index into raw_keys at return time). Lets
+    # `next` continue after the caller erases the CURRENT key mid-loop —
+    # the documented 5.1 use ("you may erase the key being visited").
+    property next_hint_key : LuaValue = nil
+    property next_hint_idx : Int32 = -1
     # Integer keys 1..n live in a flat array (the "array part", as in PUC
     # Lua); everything else — and integral keys past holes — in the hash.
     # Slots holding nil are holes: raw_get falls through to the hash part.
@@ -108,6 +170,10 @@ module Lua
     @arr : Array(LuaValue)? = nil
     @arr_base : Int32 = 1
     @hash = Hash(LuaValue, LuaValue).new
+    # last computed #t; maintained by raw_set so the append pattern
+    # (table.insert loops, SETLIST) stays amortized O(1) instead of
+    # rescanning from 1 on every raw_length
+    @len_cache : Int32 = 0
 
     def initialize
     end
@@ -138,10 +204,17 @@ module Lua
     end
 
     def raw_get(key : LuaValue) : LuaValue
-      check_key(key)
-      if key.is_a?(Float64) && (k = int_key(key))
-        v = arr_get(k)
-        return v unless v.nil?
+      # nil/NaN keys read as nil (luaH_get returns nilobject); only
+      # ASSIGNMENT rejects them (check in raw_set)
+      if key.is_a?(Float64)
+        if key.nan?
+          return nil
+        elsif (k = int_key(key))
+          v = arr_get(k)
+          return v unless v.nil?
+        end
+      elsif key.nil?
+        return nil
       end
       v = @hash[key]?
       v.nil? ? nil : v
@@ -150,6 +223,7 @@ module Lua
     def raw_set(key : LuaValue, val : LuaValue) : Nil
       check_key(key)
       if key.is_a?(Float64) && (k = int_key(key))
+        @len_cache = k - 1 if val.nil? && k <= @len_cache
         if a = @arr
           if k >= @arr_base && k < @arr_base + a.size
             a[k - @arr_base] = val # val may be nil: stays as a hole
@@ -218,20 +292,25 @@ module Lua
       @hash.has_key?(key)
     end
 
-    # #t: 1..n while consecutive non-nil entries exist — same scan as the
-    # old hash-only table, but consulting both parts.
+    # #t: 1..n while consecutive non-nil entries exist. Scans up from the
+    # cached length; the guard restarts if the cache was over-optimistic.
     def raw_length : Int32
-      n = 0
+      n = @len_cache
+      n = 0 if n > 0 && !slot_filled?(n)
       loop do
-        k = n + 1
-        if (a = @arr) && k >= @arr_base && k < @arr_base + a.size
-          break if a[k - @arr_base].nil?
-        else
-          break unless @hash.has_key?(k.to_f64)
-        end
+        break unless slot_filled?(n + 1)
         n += 1
       end
+      @len_cache = n
       n
+    end
+
+    private def slot_filled?(k : Int32) : Bool
+      if (a = @arr) && k >= @arr_base && k < @arr_base + a.size
+        !a[k - @arr_base].nil?
+      else
+        @hash.has_key?(k.to_f64)
+      end
     end
 
     def raw_keys : Array(LuaValue)
@@ -311,6 +390,18 @@ module Lua
     end
   end
 
+  # Debug info: a local's live range (5.1 LocVar), for debug.getlocal and
+  # variable naming in error messages. `reg` is the 0-based R index.
+  class LocVar
+    getter name : String
+    getter reg : Int32
+    getter start_pc : Int32
+    property end_pc : Int32
+
+    def initialize(@name, @reg, @start_pc, @end_pc)
+    end
+  end
+
   # Compiled function body. `code` holds readable Insts while compiling;
   # `packed` is the execution form — one UInt64 per instruction
   # (op:8 | a:16s | b:20s | c:20s) — half the fetch traffic of the 16-byte
@@ -322,8 +413,21 @@ module Lua
     property consts = [] of LuaValue
     property protos = [] of Proto
     property upvals = [] of UpvalDesc
+    # Debug info (5.1 Proto#locvars): local names for debug.getlocal and
+    # for variable names in runtime error messages.
+    property loc_vars = [] of LocVar
+    # 5.1 linedefined: line of the function keyword (0 for main chunks);
+    # lastlinedefined: line of the closing 'end'
+    property linedefined : Int32 = 0
+    property lastlinedefined : Int32 = 0
+    # Source text the proto was compiled from (all protos of a chunk share
+    # it). Not real bytecode: string.dump returns this and load recompiles.
+    property src : String = ""
     property num_params : Int32 = 0
     property? vararg : Bool = false
+    # 5.1 compat (LUA_COMPAT_VARARG): implicit local `arg` table for
+    # vararg functions; the VM builds it at frame entry.
+    property? needs_arg : Bool = false
     property max_stack : Int32 = 2
     getter chunkname : String
 
@@ -345,6 +449,8 @@ module Lua
   class LuaClosure
     getter proto : Proto
     getter upvals : Array(UpValue)
+    # Function environment (5.1 setfenv/getfenv): nil = interpreter globals.
+    property env : LuaTable? = nil
 
     def initialize(@proto, @upvals)
     end
@@ -421,6 +527,12 @@ module Lua
   # instances can flow into Lua. Also the ivar type for LuaUserData#obj —
   # Crystal forbids Object/Reference as instance variable types.
   module Exposable
+  end
+
+  # Payload for newproxy() userdata — no Crystal-side behavior, only the
+  # Lua-visible userdata shell with its (possibly shared) metatable.
+  class ProxyMarker
+    include Exposable
   end
 
   # Wrapper for a Crystal object exposed to Lua (interop).

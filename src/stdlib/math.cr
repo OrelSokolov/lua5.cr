@@ -3,7 +3,7 @@ module Lua::Stdlib
   module MathLib
     def self.one(tbl : LuaTable, fname : String, &f : Float64 -> Float64)
       tbl.raw_set(fname, LuaFunction.new("math.#{fname}", ->(i2 : Interp, args : Array(LuaValue)) {
-        [f.call(i2.num!(args, 0, "math.#{fname}"))] of LuaValue
+        [f.call(i2.num!(args, 0, fname))] of LuaValue
       }))
     end
 
@@ -32,6 +32,29 @@ module Lua::Stdlib
         [Math.atan2(y, x)] of LuaValue
       }))
 
+      tbl.raw_set("atan2", LuaFunction.new("math.atan2", ->(i2 : Interp, args : Array(LuaValue)) {
+        y = i2.num!(args, 0, "atan2")
+        x = i2.num!(args, 1, "atan2")
+        [Math.atan2(y, x)] of LuaValue
+      }))
+
+      # x = m * 2^e with |m| in [0.5, 1) — 5.1 l_mathop(frexp)
+      tbl.raw_set("frexp", LuaFunction.new("math.frexp", ->(i2 : Interp, args : Array(LuaValue)) {
+        x = i2.num!(args, 0, "frexp")
+        if x == 0 || !x.finite?
+          [x, 0.0] of LuaValue
+        else
+          e = Math.frexp(x)[1].to_f64
+          [x / (2.0 ** e), e] of LuaValue
+        end
+      }))
+
+      tbl.raw_set("ldexp", LuaFunction.new("math.ldexp", ->(i2 : Interp, args : Array(LuaValue)) {
+        m = i2.num!(args, 0, "ldexp")
+        e = i2.num!(args, 1, "ldexp").to_i
+        [m * (2.0 ** e)] of LuaValue
+      }))
+
       tbl.raw_set("log", LuaFunction.new("math.log", ->(i2 : Interp, args : Array(LuaValue)) {
         x = i2.num!(args, 0, "log")
         if args.size > 1
@@ -56,6 +79,9 @@ module Lua::Stdlib
         q = (a / b).trunc
         [a - b * q] of LuaValue
       }))
+
+      # 5.1 deprecated alias
+      tbl.raw_set("mod", tbl.raw_get("fmod"))
 
       tbl.raw_set("modf", LuaFunction.new("math.modf", ->(i2 : Interp, args : Array(LuaValue)) {
         v = i2.num!(args, 0, "modf")

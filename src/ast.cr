@@ -96,6 +96,8 @@ module Lua::AST
     property params = [] of String
     property vararg = false
     property body = Block.new
+    # line of the closing 'end' (5.1 lastlinedefined)
+    property end_line : Int32 = 0
   end
 
   class Entry < Node

@@ -16,18 +16,18 @@ module Lua
     getter text : String
     # Numeric value when kind == Num.
     getter num : Float64
+    # Raw source slice of the token — strings include their quotes /
+    # long-bracket delimiters; 5.1 "near '...'" shows this form.
+    getter raw : String
 
-    def initialize(@kind : Tk, @line : Int32, @text : String = "", @num : Float64 = 0.0)
+    def initialize(@kind : Tk, @line : Int32, @text : String = "", @num : Float64 = 0.0, raw : String? = nil)
+      @raw = raw || @text
     end
 
-    # Lua-style description for "near '...'" messages.
+    # Lua-style description for "near '...'" messages — the raw token text;
+    # the caller adds the quotes (5.1: near 'label', near '<eof>').
     def describe : String
-      case @kind
-      when Tk::Eof    then "<eof>"
-      when Tk::Num    then @text
-      when Tk::Str    then "string"
-      else                 "'#{@text}'"
-      end
+      @kind.eof? ? "<eof>" : @raw
     end
   end
 end

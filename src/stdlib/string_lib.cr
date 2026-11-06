@@ -12,8 +12,9 @@ module Lua::Stdlib
       tbl.raw_set("sub", LuaFunction.new("string.sub", ->(i2 : Interp, args : Array(LuaValue)) {
         s = i2.str!(args, 0, "sub").to_slice
         len = s.size
-        a = posrelat((Lua.tonumber(args[1]?) || 1).to_i, len, true)
-        b = args.size > 1 ? posrelat((Lua.tonumber(args[2]?) || -1).to_i, len, false) : len
+        a = posrelat(idx_arg(args, 1, 1), len, true)
+        b = args.size > 1 ? posrelat(idx_arg(args, 2, -1), len, false) : len
+        b = len if b > len
         if a > b || a > len
           [""] of LuaValue
         else
@@ -51,11 +52,17 @@ module Lua::Stdlib
       tbl.raw_set("byte", LuaFunction.new("string.byte", ->(i2 : Interp, args : Array(LuaValue)) {
         s = i2.str!(args, 0, "byte").to_slice
         len = s.size
-        a = posrelat((Lua.tonumber(args[1]?) || 1).to_i, len, true)
-        b = args.size > 1 ? posrelat((Lua.tonumber(args[2]?) || a).to_i, len, false) : a
+        # 5.1 posrelat: negative counts from the end, saturating at 0 — no
+        # clamping to [1, len]; an empty interval returns no values
+        pi = idx_arg(args, 1, 1)
+        posi = pi < 0 ? {pi + len.to_i64 + 1, 0_i64}.max : pi
+        pe = args.size > 1 ? idx_arg(args, 2, posi) : posi
+        pe = pe < 0 ? {pe + len.to_i64 + 1, 0_i64}.max : pe
+        posi = 1_i64 if posi <= 0
+        pe = len.to_i64 if pe > len
         res = [] of LuaValue
-        x = a
-        while x <= b && x <= len
+        x = posi
+        while x <= pe
           res << s[x - 1].to_f64
           x += 1
         end
@@ -106,6 +113,19 @@ module Lua::Stdlib
           st.next_match(i3)
         })
         [iter] of LuaValue
+      }))
+      # 5.1 deprecated alias
+      tbl.raw_set("gfind", tbl.raw_get("gmatch"))
+
+      # string.dump(f): no real bytecode — returns the proto's source slice,
+      # which load() recompiles to an equivalent chunk (calls.lua roundtrip)
+      tbl.raw_set("dump", LuaFunction.new("string.dump", ->(i2 : Interp, args : Array(LuaValue)) {
+        f = args[0]?
+        if f.is_a?(LuaClosure)
+          [f.proto.src] of LuaValue
+        else
+          i2.arg_error(1, "dump", "function expected")
+        end
       }))
 
       tbl.raw_set("gsub", LuaFunction.new("string.gsub", ->(i2 : Interp, args : Array(LuaValue)) {
@@ -179,18 +199,32 @@ module Lua::Stdlib
     end
 
     # posrelat: translate 1-based (possibly negative) index into [lo, hi].
-    private def self.posrelat(p : Int32, len : Int32, is_start : Bool) : Int32
-      if p >= 0
-        p
+    # Indices are Int64 — Lua uses ptrdiff_t and saturates, not wraps.
+    private def self.idx_arg(args : Array(LuaValue), idx : Int32, default : Int64) : Int64
+      n = Lua.tonumber(args[idx]?)
+      return default unless n
+      if n.nan?
+        default
+      elsif n >= 9.0e18
+        Int64::MAX
+      elsif n <= -9.0e18
+        Int64::MIN
       else
-        len + p + 1
-      end.clamp(is_start ? 1 : 0, len + 1)
+        n.trunc.to_i64
+      end
+    end
+
+    private def self.posrelat(p : Int64, len : Int32, is_start : Bool) : Int64
+      p = p < 0 ? (p < -(len + 1) ? 0_i64 : len.to_i64 + p + 1) : p
+      lo = is_start ? 1_i64 : 0_i64
+      hi = (len + 1).to_i64
+      p < lo ? lo : (p > hi ? hi : p)
     end
 
     private def self.init_arg(i2 : Interp, args : Array(LuaValue), idx : Int32, fname : String, len : Int32) : Int32
-      init = args.size > idx ? (Lua.tonumber(args[idx]) || 1).to_i : 1
+      init = (args.size > idx ? idx_arg(args, idx, 1) : 1_i64)
       init = posrelat(init, len, false) - 1 # 0-based byte offset
-      return init if init >= 0 && init <= len
+      return init.to_i32 if init >= 0 && init <= len
       i2.arg_error(idx + 1, fname, "out of range")
     end
 
@@ -278,8 +312,14 @@ module Lua::Stdlib
               buf << whole
             else
               cap = m.caps[n - 1]?
-              i2.raise_lua("invalid capture index") if cap.nil?
-              if cap.position?
+              if cap.nil?
+                # push_onecapture: %1 with no captures = the whole match
+                if n == 1 && m.caps.empty?
+                  buf << whole
+                else
+                  i2.raise_lua("invalid capture index")
+                end
+              elsif cap.position?
                 buf << cap.start.to_s
               else
                 buf.write(s[cap.start, cap.len])
@@ -292,14 +332,33 @@ module Lua::Stdlib
         end
         return
       when LuaTable
-        val = i2.getindex(repl, whole)
+        # 5.1: the table is indexed by the capture (whole match when the
+        # pattern has none)
+        if m.caps.empty?
+          val = i2.getindex(repl, whole)
+        else
+          cap0 = m.caps.first
+          key = cap0.position? ? cap0.start.to_f64 : String.new(s[cap0.start, cap0.len])
+          val = i2.getindex(repl, key)
+        end
       when LuaClosure, LuaFunction
-        r = i2.call(repl, [whole] of LuaValue)
+        # 5.1: the function gets the captures, or the whole match when
+        # the pattern has none; position captures are numbers
+        if m.caps.empty?
+          r = i2.call(repl, [whole] of LuaValue)
+        else
+          cap_args = Array(LuaValue).new(m.caps.size) do |k|
+            cap = m.caps[k]
+            cap.position? ? cap.start.to_f64 : String.new(s[cap.start, cap.len])
+          end
+          r = i2.call(repl, cap_args)
+        end
         val = r[0]?
       else
         i2.arg_error(3, "gsub", "string/function/table expected")
       end
-      if val.nil?
+      # 5.1: nil OR false as the replacement value keeps the whole match
+      if val.nil? || val == false
         buf << whole
       else
         unless val.is_a?(String) || val.is_a?(Float64)
@@ -425,22 +484,16 @@ module Lua::Stdlib
       n.to_i64
     end
 
+    # 5.1 addquoted: only ", \, \n get a backslash; \0 becomes \000;
+    # every other byte (including non-printables) is emitted raw
     private def self.quote(i2 : Interp, fmt_out : IO::Memory, s : String)
       fmt_out << 0x22.chr
       s.each_byte do |b|
         case b
-        when 0x22 then fmt_out << "\\\""
-        when 0x5C then fmt_out << "\\\\"
-        when 0x0A then fmt_out << "\\n"
-        when 0x0D then fmt_out << "\\r"
-        when 0x00
-          fmt_out << "\\0"
-        else
-          if b < 0x20 || b == 0x7F
-            fmt_out << "\\" << b.to_s.rjust(3, '0')
-          else
-            fmt_out.write_byte(b)
-          end
+        when 0x22, 0x5C, 0x0A then fmt_out << 0x5C.chr << b.chr
+        when 0x0D             then fmt_out << "\\r"
+        when 0x00             then fmt_out << "\\000"
+        else                       fmt_out.write_byte(b)
         end
       end
       fmt_out << 0x22.chr
