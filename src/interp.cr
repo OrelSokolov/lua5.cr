@@ -106,6 +106,56 @@ module Lua
       @fsize > 0 ? @frames[@fsize - 1].closure.proto.chunkname : @chunkname
     end
 
+    # Roots for the Lua-graph mark phase (Lua.gc_full): everything the
+    # interpreter itself holds. Stale VM registers must be cleared
+    # beforehand (gc_clear_stale) — they are not roots.
+    def gc_roots(&) : Nil
+      yield @globals
+      yield @string_meta
+      @type_mts.each_value { |mt| yield mt if mt }
+      yield @io_input
+      yield @io_output
+      yield @err_handler
+      yield @default_env
+      yield @current_co
+      i = 0
+      while i < @fsize
+        fr = @frames[i]
+        yield fr.closure
+        fr.varargs.each { |v| yield v }
+        i += 1
+      end
+      @stack.each { |v| yield v }
+    end
+
+    # PUC protects VM-stack slots only up to each frame's live window
+    # (ci->top / L->top); everything above is junk that must not pin
+    # objects for the conservative Boehm scan. The live window of every
+    # non-top frame is capped by its callee's base, so one clear from
+    # the TOP frame's limit to the stack end covers all junk. With
+    # call_site the limit is the pending CALL's argument window (the
+    # ci->top analog); otherwise the frame's full register window.
+    def gc_clear_stale(call_site : Bool) : Nil
+      return if @fsize == 0
+      fr = @frames[@fsize - 1]
+      limit : Int32
+      if call_site
+        ins = fr.closure.proto.code[{fr.pc - 1, 0}.max]?
+        if ins && ins.op.call?
+          limit = ins.b == -1 ? fr.top : fr.base + ins.a + ins.b + 1
+        else
+          limit = fr.top
+        end
+      else
+        limit = fr.base + fr.closure.proto.max_stack
+      end
+      i = {limit, 0}.max
+      while i < @stack.size
+        @stack[i] = nil
+        i += 1
+      end
+    end
+
     # Line for an error() position: level 1 = where error() was called
     # (the current frame), level 2 = its caller, ...
     def err_line(level : Int32) : Int32

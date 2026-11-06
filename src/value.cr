@@ -1,6 +1,8 @@
 # Lua values and runtime objects. Port of MoonSharp DataTypes/ (DynValue,
 # Table, Closure, CallbackFunction) onto idiomatic Crystal: values are a
 # plain union of reference types + immediates.
+require "weak_ref"
+
 module Lua
   alias LuaValue = Nil | Bool | Float64 | String | LuaTable | LuaClosure | LuaFunction | LuaUserData | LuaCoroutine
 
@@ -154,8 +156,73 @@ module Lua
 
   # --- table ---
 
+  # A weak-table entry cell. The value is held STRONGLY — liveness is
+  # decided by our own precise mark phase over the Lua object graph
+  # (Lua.gc_full), not by the collector: Boehm's conservative machine-
+  # stack scan would pin dead objects forever. Entries whose weak side
+  # is unmarked are dropped by the sweep, releasing the object after.
+  class WCell
+    property v : LuaValue
+
+    def initialize(@v)
+    end
+  end
+
+  # Mark state for the Lua-graph GC (Lua.gc_full): ids of visited
+  # objects plus a worklist (no recursion — graphs can be deep).
+  class GcMark
+    getter seen = Set(UInt64).new
+    @work = [] of LuaValue
+
+    def mark(v : LuaValue) : Nil
+      case v
+      when LuaTable, LuaClosure, LuaCoroutine, LuaUserData, LuaFunction
+        return unless seen.add?(v.object_id)
+        @work << v
+      end
+    end
+
+    def run : Nil
+      until @work.empty?
+        v = @work.pop
+        case v
+        when LuaTable      then v.gc_mark_children(self)
+        when LuaClosure    then v.gc_mark_children(self)
+        when LuaCoroutine  then v.gc_mark_children(self)
+        when LuaUserData   then v.metatable.try { |mt| mark(mt) }
+        end
+      end
+    end
+
+    def marked?(v : LuaValue) : Bool
+      case v
+      when LuaTable, LuaClosure, LuaCoroutine, LuaUserData, LuaFunction
+        seen.includes?(v.object_id)
+      else
+        true # immediates (and strings) are never collected
+      end
+    end
+  end
+
   class LuaTable
-    property metatable : LuaTable? = nil
+    getter metatable : LuaTable? = nil
+    # weak-table state (__mode): when set, entries live in @weak as WeakBox
+    # pairs — collectable sides go through WeakRef, so the Boehm GC reclaims
+    # them and dead boxes read as nil until the collect pass compacts.
+    @weak : Array({WCell, WCell})? = nil
+    @weak_keys = false
+    @weak_vals = false
+
+    def metatable=(mt : LuaTable?)
+      @metatable = mt
+      Lua.refresh_weak(self)
+    end
+
+    # metatable assignment that bypasses weak/finalizer registration
+    # (used for __gc stand-in objects)
+    def metatable_no_reg=(mt : LuaTable?)
+      @metatable = mt
+    end
     # pairs-traversal hint: (key, index into raw_keys at return time). Lets
     # `next` continue after the caller erases the CURRENT key mid-loop —
     # the documented 5.1 use ("you may erase the key being visited").
@@ -204,6 +271,12 @@ module Lua
     end
 
     def raw_get(key : LuaValue) : LuaValue
+      if wi = @weak
+        wi.each do |(kb, vb)|
+          return vb.v if Lua.weak_key_eq(kb.v, key)
+        end
+        return nil
+      end
       # nil/NaN keys read as nil (luaH_get returns nilobject); only
       # ASSIGNMENT rejects them (check in raw_set)
       if key.is_a?(Float64)
@@ -222,6 +295,20 @@ module Lua
 
     def raw_set(key : LuaValue, val : LuaValue) : Nil
       check_key(key)
+      if wi = @weak
+        idx = wi.index { |(kb, _vb)| Lua.weak_key_eq(kb.v, key) }
+        if val.nil?
+          wi.delete_at(idx) if idx
+          return
+        end
+        item = {WCell.new(key), WCell.new(val)}
+        if idx
+          wi[idx] = item
+        else
+          wi << item
+        end
+        return
+      end
       if key.is_a?(Float64) && (k = int_key(key))
         @len_cache = k - 1 if val.nil? && k <= @len_cache
         if a = @arr
@@ -270,6 +357,10 @@ module Lua
     # nils stay as holes at their positions (skipping them would shift keys).
     def raw_fill(start : Int32, vals : Array(LuaValue)) : Nil
       return if vals.empty?
+      if @weak
+        vals.each_with_index { |v, i| raw_set((start + i).to_f64, v) }
+        return
+      end
       if (a = @arr) && start == @arr_base + a.size
         vals.each { |v| a << v }
         migrate_from_hash(a)
@@ -285,6 +376,9 @@ module Lua
 
     def has_key?(key : LuaValue) : Bool
       return false if key.nil?
+      if wi = @weak
+        return wi.any? { |(kb, _vb)| Lua.weak_key_eq(kb.v, key) }
+      end
       if key.is_a?(Float64) && (k = int_key(key))
         v = arr_get(k)
         return true unless v.nil?
@@ -295,6 +389,21 @@ module Lua
     # #t: 1..n while consecutive non-nil entries exist. Scans up from the
     # cached length; the guard restarts if the cache was over-optimistic.
     def raw_length : Int32
+      if wi = @weak
+        # contiguous integer keys 1..n (no cache: entries change at sweep)
+        set = Set(Int32).new
+        wi.each do |(kb, _vb)|
+          k = kb.v
+          if k.is_a?(Float64) && (i = int_key(k)) && i >= 1
+            set << i
+          end
+        end
+        n = 0
+        while set.includes?(n + 1)
+          n += 1
+        end
+        return n
+      end
       n = @len_cache
       n = 0 if n > 0 && !slot_filled?(n)
       loop do
@@ -314,6 +423,11 @@ module Lua
     end
 
     def raw_keys : Array(LuaValue)
+      if wi = @weak
+        keys = [] of LuaValue
+        wi.each { |(kb, _vb)| keys << kb.v }
+        return keys
+      end
       keys = Array(LuaValue).new((@arr.try(&.size) || 0) + @hash.size)
       if a = @arr
         base = @arr_base
@@ -321,6 +435,79 @@ module Lua
       end
       keys.concat(@hash.keys)
       keys
+    end
+
+    # (Re)read __mode from the metatable and move storage between the
+    # strong (array+hash) and weak (WCell pair) representations. Called
+    # on every metatable assignment and from the mark phase (5.1 reads
+    # __mode at GC time). Mode flags only matter at sweep.
+    def refresh_weak : Nil
+      mode = nil
+      if (mt = @metatable) && (m = mt.raw_get("__mode")).is_a?(String)
+        mode = m
+      end
+      wk = !mode.nil? && mode.not_nil!.includes?('k')
+      wv = !mode.nil? && mode.not_nil!.includes?('v')
+      if wk || wv
+        items = [] of {WCell, WCell}
+        if wi = @weak
+          wi.each { |(kb, vb)| items << {kb, vb} }
+        else
+          raw_keys.each do |k|
+            v = raw_get(k)
+            items << {WCell.new(k), WCell.new(v)} unless v.nil?
+          end
+          @hash.clear
+          @arr = nil
+          @len_cache = 0
+        end
+        @weak = items
+      else
+        if wi = @weak
+          @weak = nil # raw_set below must take the strong path
+          wi.each do |(kb, vb)|
+            raw_set(kb.v, vb.v)
+          end
+        end
+        @weak = nil
+      end
+      @weak_keys = wk
+      @weak_vals = wv
+    end
+
+    # sweep (Lua.gc_full): drop entries whose weak side is unmarked.
+    def sweep(m : GcMark) : Nil
+      return unless wi = @weak
+      wi.reject! do |(kb, vb)|
+        (@weak_keys && !m.marked?(kb.v)) || (@weak_vals && !m.marked?(vb.v))
+      end
+    end
+
+    # is this a weak table (used to steer mark traversal)
+    def weak? : Bool
+      !@weak.nil?
+    end
+
+    # mark-phase traversal: strong sides propagate; weak sides do NOT
+    # mark (an entry dies with its weak side even if it is the only
+    # reference — 5.1 has no ephemerons)
+    def gc_mark_children(m : GcMark) : Nil
+      @metatable.try { |mt| m.mark(mt) }
+      if wi = @weak
+        wi.each do |(kb, vb)|
+          m.mark(kb.v) unless @weak_keys
+          m.mark(vb.v) unless @weak_vals
+        end
+        return
+      end
+      if a = @arr
+        a.each { |v| m.mark(v) }
+      end
+      @hash.each { |k, v| m.mark(k); m.mark(v) }
+    end
+
+    def weak_item_count : Int32
+      @weak.try(&.size) || 0
     end
   end
 
@@ -454,6 +641,17 @@ module Lua
 
     def initialize(@proto, @upvals)
     end
+
+    def gc_mark_children(m : GcMark) : Nil
+      @env.try { |e| m.mark(e) }
+      @upvals.each do |u|
+        if s = u.stack
+          m.mark(s[u.idx]? || nil)
+        else
+          m.mark(u.value)
+        end
+      end
+    end
   end
 
   # A coroutine: its own value stack + frame buffer, swapped into the
@@ -469,6 +667,9 @@ module Lua
 
     getter fn : LuaValue
     property status : Status = Status::Suspended
+    # thread environment (debug.setfenv): swapped in as the interpreter's
+    # default env for the duration of each resume
+    property env : LuaTable? = nil
     property stack : Array(LuaValue)
     property frames : Array(Frame)
     property fsize : Int32 = 0
@@ -495,6 +696,19 @@ module Lua
       @entries = [] of Int32
       @open_upvals = [] of UpValue
       @open_max = -1
+    end
+
+    def gc_mark_children(m : GcMark) : Nil
+      m.mark(@fn)
+      @stack.each { |v| m.mark(v) }
+      @frames.first(@fsize).each { |fr| m.mark(fr.closure); fr.varargs.each { |v| m.mark(v) } }
+      @open_upvals.each do |u|
+        if s = u.stack
+          m.mark(s[u.idx]? || nil)
+        else
+          m.mark(u.value)
+        end
+      end
     end
   end
 
@@ -535,12 +749,179 @@ module Lua
     include Exposable
   end
 
-  # Wrapper for a Crystal object exposed to Lua (interop).
+  # Wrapper for Crystal objects exposed to Lua (interop).
   class LuaUserData
-    property obj : Exposable
-    property metatable : LuaTable? = nil
+    getter obj : Exposable
+    getter metatable : LuaTable? = nil
 
     def initialize(@obj : Exposable)
     end
+
+    def metatable=(mt : LuaTable?)
+      @metatable = mt
+      Lua.register_finalizer(self, mt)
+    end
+
+    def metatable_no_reg=(mt : LuaTable?)
+      @metatable = mt
+    end
+  end
+
+  # --- Lua-visible GC ---
+  #
+  # Memory reclamation is Boehm's (Crystal GC). Liveness SEMANTICS —
+  # what 5.1 scripts observe — come from our own precise mark over the
+  # Lua object graph (Lua.gc_full): Boehm's conservative machine-stack
+  # scan pins dead objects in interpreter temporaries, so WeakRef-based
+  # liveness would never settle. Weak-table entries and __gc
+  # registrations are judged by the mark phase; sweeping drops the
+  # entries (letting Boehm reclaim on a later pass) and runs finalizers
+  # with the real object (still strongly registered until then).
+
+  # an object registered for __gc finalization (userdata only, as 5.1;
+  # held STRONGLY — finalizers get the real object and may resurrect)
+  class FinalReg
+    getter obj : LuaValue
+    getter mt : LuaTable
+
+    def initialize(@obj, @mt)
+    end
+  end
+
+  @@weak_tables = [] of WeakRef(LuaTable)
+  @@finalizers = [] of FinalReg
+  @@gc_step_acc = 0
+  @@gc_pause = 200
+  @@gc_stepmul = 200
+  # fake incremental step limit in "bytes" (dosteps in gc.lua)
+  STEP_LIMIT = 200
+  # set once any table turns weak: gates the loop back-edge GC
+  @@weak_seen = false
+
+  def self.weak_seen? : Bool
+    @@weak_seen
+  end
+
+  # any weak table still alive? (drives the loop back-edge GC; dead
+  # registrations are pruned here). Cheap: the list is empty in the
+  # common case.
+  def self.weak_active? : Bool
+    return false if @@weak_tables.empty?
+    @@weak_tables.reject! { |w| w.value.nil? }
+    !@@weak_tables.empty?
+  end
+
+  def self.weak_key_eq(a : LuaValue, b : LuaValue) : Bool
+    if a.is_a?(Float64) && b.is_a?(Float64)
+      a == b
+    elsif a.is_a?(String) && b.is_a?(String)
+      a == b
+    elsif a.is_a?(Bool) && b.is_a?(Bool)
+      a == b
+    else
+      a.class == b.class && ref_same(a, b)
+    end
+  end
+
+  # metatable assignment on a table: migrate weak storage and keep the
+  # weak-table / finalizer registries in sync
+  def self.refresh_weak(t : LuaTable) : Nil
+    mt = t.metatable
+    mode = nil
+    if mt && (m = mt.raw_get("__mode")).is_a?(String)
+      mode = m
+    end
+    if mode && (mode.includes?('k') || mode.includes?('v'))
+      @@weak_seen = true
+      unless @@weak_tables.any? { |w| (t2 = w.value) && t2.same?(t) }
+        @@weak_tables << WeakRef(LuaTable).new(t)
+      end
+    else
+      @@weak_tables.reject! { |w| (t2 = w.value) && t2.same?(t) }
+    end
+    t.refresh_weak
+  end
+
+  # userdata with a metatable is registered for finalization; whether
+  # __gc exists is decided at collect time (5.1 lgc separateudata)
+  def self.register_finalizer(u : LuaUserData, mt : LuaTable?) : Nil
+    @@finalizers.reject! { |f| f.obj.as(LuaUserData).same?(u) }
+    @@finalizers << FinalReg.new(u, mt) if mt
+  end
+
+  def self.register_finalizer(t : LuaTable, mt : LuaTable?) : Nil
+    # 5.1 finalizes userdata only; tables accepted quietly
+  end
+
+  # full mark-and-sweep over the Lua graph (collectgarbage() and the
+  # weak-gated loop back-edges). Expects stale VM registers to be
+  # cleared first (Interp#gc_clear_stale).
+  def self.gc_full(i : Interp) : Nil
+    m = GcMark.new
+    i.gc_roots { |v| m.mark(v) }
+    m.run
+    # prune dead weak-table refs, re-read __mode, sweep entries
+    @@weak_tables.reject! { |w| w.value.nil? }
+    @@weak_tables.each do |w|
+      t = w.value.not_nil!
+      t.refresh_weak
+      t.sweep(m)
+    end
+    # finalizers: dead registrations run __gc with the real object, in
+    # reverse registration order; handler errors are ignored (5.1)
+    dead = @@finalizers.select { |f| !m.marked?(f.obj) }
+    unless dead.empty?
+      @@finalizers.reject! { |f| !m.marked?(f.obj) }
+      dead.reverse_each do |f|
+        hh = f.mt.raw_get("__gc")
+        h = hh
+        if h.is_a?(LuaClosure) || h.is_a?(LuaFunction) || h.is_a?(LuaTable)
+          begin
+            i.call(h, [f.obj] of LuaValue)
+          rescue e : LuaError
+            # 5.1 luaC: errors inside __gc are only warned about
+          end
+        end
+      end
+    end
+  end
+
+  # 5.1 gcinfo/collectgarbage("count"): KB in use and byte remainder,
+  # from the Boehm heap stats (live ~= heap - free)
+  def self.gc_count : {Float64, Float64}
+    s = GC.stats
+    live = (s.heap_size.to_i64 - s.free_bytes.to_i64).clamp(0..).to_f64
+    {(live / 1024).floor, live % 1024}
+  end
+
+  # fake incremental step (Boehm is non-incremental): advance the byte
+  # counter; a "cycle" finishes every STEP_LIMIT bytes
+  def self.gc_step(siz : Int32) : Bool
+    @@gc_step_acc += {siz, 1}.max
+    if @@gc_step_acc >= STEP_LIMIT
+      @@gc_step_acc = 0
+      true
+    else
+      false
+    end
+  end
+
+  def self.gc_set_pause(v : Int32) : Int32
+    old = @@gc_pause
+    @@gc_pause = v
+    old
+  end
+
+  def self.gc_set_stepmul(v : Int32) : Int32
+    old = @@gc_stepmul
+    @@gc_stepmul = v
+    old
+  end
+
+  # spec/debug helper: live weak tables + registrations
+  def self.gc_debug_counts : {Int32, Int32, Int32}
+    wt = @@weak_tables.count { |w| !w.value.nil? }
+    items = @@weak_tables.sum { |w| (t = w.value) ? t.weak_item_count : 0 }
+    {wt, @@finalizers.size, items}
   end
 end

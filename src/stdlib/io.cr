@@ -137,6 +137,8 @@ module Lua
         }))
         methods.raw_set("close", LuaFunction.new("file:close", ->(i2 : Interp, args : Array(LuaValue)) {
           f, _ = file!(i2, args, "close")
+          # 5.1 io_noclose: standard files refuse to close
+          i2.raise_lua("cannot close standard file") if f.std?
           # 5.1 tofile: a closed handle errors instead of closing twice
           i2.raise_lua("attempt to use a closed file") if f.closed?
           f.close
@@ -173,7 +175,8 @@ module Lua
         mt.raw_set("__gc", LuaFunction.new("__gc", ->(i2 : Interp, args : Array(LuaValue)) {
           f = args[0]?
           if f.is_a?(LuaUserData) && (fl = f.obj.as?(LuaFile))
-            fl.close
+            # 5.1 io_noclose: the standard files are never closed
+            fl.close unless fl.std?
             [] of LuaValue
           elsif f.nil?
             i2.raise_lua("bad argument #1 to '__gc' (FILE* expected, got no value)")

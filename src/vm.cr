@@ -848,6 +848,8 @@ module Lua
     # register (-1 for a tail call), CALL C operand, tail-call flag.
     @yield_call : {Frame, Int32, Int32, Bool}? = nil
     @suspending = false
+    # loop back-edge counter for the weak-gated automatic GC
+    @gc_tick = 0
     # Crystal-mediated Lua calls made from inside the current run_frames
     # session (pcall, comparators, metamethods). yield with this > 0 would
     # have to resume a Crystal frame — impossible without fibers.
@@ -1177,7 +1179,8 @@ module Lua
             when .newtable?  then sp[base + a] = LuaTable.new
             when .setlist?
               t = stack[base + a].as(LuaTable)
-              n = b == -1 ? frame.top - (base + a + 1) : b
+              # 0-value multi feeds can leave top at the table slot
+              n = b == -1 ? {frame.top - (base + a + 1), 0}.max : b
               vals = Array(LuaValue).new(n) { |i| stack[base + a + 1 + i] }
               t.raw_fill(c + 1, vals)
             when .add?, .sub?, .mul?, .div?, .mod?, .pow?
@@ -1256,7 +1259,19 @@ module Lua
                 @vi_pc = pc - 1
                 stack[base + a] = lua_compare(l, r, "<=")
               end
-            when .jmp?  then pc += b
+            when .jmp?
+              pc += b
+              # backward jump = loop back-edge: with weak tables around,
+              # drive the Lua-graph GC (PUC's automatic collections) —
+              # clear stale registers and periodically mark/sweep, so
+              # weak entries settle without an explicit collectgarbage
+              if b < 0 && Lua.weak_active?
+                @gc_tick &+= 1
+                if (@gc_tick & 31) == 0
+                  gc_clear_stale(false)
+                  Lua.gc_full(self)
+                end
+              end
             when .jmpf? then pc += b unless Lua.truthy(sp[base + a])
             when .jmpt? then pc += b if Lua.truthy(sp[base + a])
             when .vararg?
@@ -1314,6 +1329,13 @@ module Lua
                 close_upvals(base + a) if @open_max >= base + a # freeze this iteration's loop var
                 sp[base + a] = ctrl
                 pc += b
+                if Lua.weak_active? # loop back-edge GC (see .jmp?)
+                  @gc_tick &+= 1
+                  if (@gc_tick & 31) == 0
+                    gc_clear_stale(false)
+                    Lua.gc_full(self)
+                  end
+                end
               end
             when .tforcall?
               @line = lines[pc - 1]
@@ -1331,7 +1353,7 @@ module Lua
               end
             when .call?
               fn = sp[base + a]
-              argn = b == -1 ? frame.top - (base + a + 1) : b
+              argn = b == -1 ? {frame.top - (base + a + 1), 0}.max : b # 0-value multi feeds: top can sit on the closure slot
               if fn.is_a?(LuaClosure)
                 frame.pc = pc
                 p = fn.proto
@@ -1389,7 +1411,7 @@ module Lua
             when .tailcall?
               @line = lines[pc - 1]
               fn = stack[base + a]
-              argn = b == -1 ? frame.top - (base + a + 1) : b
+              argn = b == -1 ? {frame.top - (base + a + 1), 0}.max : b # 0-value multi feeds: top can sit on the closure slot
               close_upvals(base) if @open_max >= base
               if fn.is_a?(LuaClosure)
                 # slide fn + args down over the current frame and reuse it
@@ -1438,7 +1460,7 @@ module Lua
                 break
               end
             when .return?
-              nres = b == -1 ? frame.top - (base + a) : b
+              nres = b == -1 ? {frame.top - (base + a), 0}.max : b
               if @fsize == entry_frames + 1
                 results = Array(LuaValue).new(nres) { |j| stack[base + a + j] }
                 done = true
@@ -1561,6 +1583,9 @@ module Lua
       @open_max = co.open_max
       @current_co = co
       co.status = LuaCoroutine::Status::Running
+      # thread env (debug.setfenv): the interpreter default for this resume
+      s_env = @default_env
+      @default_env = co.env
 
       begin
         if co.first_resume?
@@ -1616,6 +1641,9 @@ module Lua
         @entry_stack = s_entry
         @open_upvals = s_upvals
         @open_max = s_open_max
+        # the body may have replaced its thread env (setfenv(0)): persist
+        co.env = @default_env if co.env != @default_env
+        @default_env = s_env
         @current_co = prev_co
         prev_co.status = LuaCoroutine::Status::Running if prev_co && prev_co.status.normal?
       end

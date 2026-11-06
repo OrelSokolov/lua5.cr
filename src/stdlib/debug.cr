@@ -40,9 +40,15 @@ module Lua::Stdlib
         case v = args[0]?
         when nil, Float64
           level = v.is_a?(Float64) ? v.to_i : 1
-          env = level == 0 ? i2.default_env : i2.caller_closure(level).try &.env
+          env = if level == 0
+                 (co = i2.current_co) ? co.env : i2.default_env
+               else
+                 i2.caller_closure(level).try &.env
+               end
           [env || i2.globals] of LuaValue
         when Lua::LuaClosure
+          [v.env || i2.globals] of LuaValue
+        when Lua::LuaCoroutine
           [v.env || i2.globals] of LuaValue
         else
           [i2.default_env || i2.globals] of LuaValue
@@ -52,9 +58,12 @@ module Lua::Stdlib
       dbg.raw_set("setfenv", LuaFunction.new("debug.setfenv", ->(i2 : Interp, args : Array(Lua::LuaValue)) {
         f = args[0]?
         env = args[1]?
-        i2.arg_error(1, "setfenv", "function expected") unless f.is_a?(Lua::LuaClosure)
+        i2.arg_error(1, "setfenv", "function expected") unless f.is_a?(LuaClosure) || f.is_a?(LuaCoroutine)
         i2.arg_error(2, "setfenv", "table expected") unless env.is_a?(LuaTable)
-        f.env = env
+        case f
+        when LuaClosure   then f.env = env
+        when LuaCoroutine then f.env = env
+        end
         [f] of LuaValue
       }))
 

@@ -159,3 +159,52 @@ describe "debug library" do
     LUA
   end
 end
+
+describe "Lua-visible GC" do
+  it "clears weak values and weak keys" do
+    lua_run(<<-LUA).should eq([true, true])
+      local x = {}
+      setmetatable(x, {__mode = 'v'})
+      do local t = {} t[1] = {} x.t = t end
+      x.s = "kept"
+      collectgarbage()
+      local a = (x.t == nil and x.s == "kept")
+      local y = {}
+      setmetatable(y, {__mode = 'k'})
+      local keep = {}
+      y[keep] = 1
+      do local tmp = {} y[tmp] = 2 end
+      collectgarbage()
+      local n = 0
+      for k in pairs(y) do n = n + 1 end
+      return a, (n == 1 and y[keep] == 1)
+    LUA
+  end
+
+  it "runs __gc finalizers with the real object" do
+    lua_run(<<-LUA).should eq(["fired", "finalized"])
+      local u = newproxy(true)
+      getmetatable(u).__gc = function(o)
+        assert(type(o) == "userdata")
+        _G.res = "fired"
+        _G.done = "finalized"
+      end
+      u = nil
+      collectgarbage()
+      return _G.res, _G.done
+    LUA
+  end
+
+  it "reports gcinfo and honors collectgarbage options" do
+    lua_run(<<-LUA).should eq([true, true, 200.0])
+      local kb, rem = gcinfo()
+      local a = (type(kb) == "number" and type(rem) == "number")
+      collectgarbage("stop")
+      collectgarbage("restart")
+      collectgarbage()
+      local old = collectgarbage("setpause", 300)
+      collectgarbage("setpause", old)
+      return a, (collectgarbage("step", 1000000) == true), old
+    LUA
+  end
+end

@@ -332,17 +332,46 @@ module Lua::Stdlib
         i2.call(cl, [] of LuaValue)
       end
 
-      # 5.1 luaB_collectgarbage: option names checked by luaL_option; ours is
-      # mostly a stub, but "collect" also finalizes unreachable files (5.1
-      # closes dropped file handles through __gc) and an unknown option
-      # must still raise.
+      # 5.1 luaB_collectgarbage. Memory work is Boehm's (Crystal GC);
+      # "collect" runs the Lua-graph mark/sweep (weak tables, __gc
+      # finalizers) plus a full Boehm collection, "count"/gcinfo report
+      # heap stats, "stop"/"restart" map to GC.disable/enable, and the
+      # incremental options are quiet stubs (a fake step counter) —
+      # scripts keep working, exact step semantics are not emulated.
       i.native("collectgarbage") do |i2, args|
         opt = args[0]?
-        unless opt.nil? || (opt.is_a?(String) && {"collect", "count", "step", "setpause", "setstepmul"}.includes?(opt))
+        unless opt.nil? || (opt.is_a?(String) &&
+                            {"collect", "count", "step", "setpause", "setstepmul", "stop", "restart"}.includes?(opt))
           i2.raise_lua("invalid option '#{i2.lua_tostring(opt)}' to 'collectgarbage'")
         end
-        i2.gc_close_files if opt.nil? || opt == "collect"
-        [0.0] of LuaValue
+        case opt
+        when nil, "collect"
+          i2.gc_clear_stale(true)
+          Lua.gc_full(i2)
+          GC.collect
+          i2.gc_close_files
+          [0.0] of LuaValue
+        when "count"
+          kb, rem = Lua.gc_count
+          [kb, rem] of LuaValue
+        when "step"
+          siz = args.size > 1 && (n = Lua.tonumber(args[1])) ? n.to_i : 0
+          [Lua.gc_step(siz)] of LuaValue
+        when "stop"     then GC.disable; [0.0] of LuaValue
+        when "restart"  then GC.enable; [0.0] of LuaValue
+        when "setpause"
+          v = args.size > 1 && (n = Lua.tonumber(args[1])) ? n.to_i : 200
+          [Lua.gc_set_pause(v).to_f64] of LuaValue
+        else # "setstepmul"
+          v = args.size > 1 && (n = Lua.tonumber(args[1])) ? n.to_i : 200
+          [Lua.gc_set_stepmul(v).to_f64] of LuaValue
+        end
+      end
+
+      # 5.1 gcinfo(): same results as collectgarbage("count")
+      i.native("gcinfo") do |_i2, _args|
+        kb, rem = Lua.gc_count
+        [kb, rem] of LuaValue
       end
 
       i.globals.raw_set("_G", i.globals)
@@ -357,8 +386,15 @@ module Lua::Stdlib
         when Float64
           level = v.to_i
           if level == 0
-            # thread-global env: default for newly compiled chunks
-            i2.default_env = env == i2.globals ? nil : env
+            # thread-global env: inside a coroutine it is the thread's own
+            # env (debug.setfenv(co, t) / setfenv(0, t) there); during a
+            # resume the interpreter default IS the thread env, and
+            # resume_co persists it back to the coroutine
+            if i2.current_co
+              i2.default_env = env == i2.globals ? nil : env
+            else
+              i2.default_env = env == i2.globals ? nil : env
+            end
             [i2.globals] of LuaValue
           elsif cl = i2.caller_closure(level)
             cl.env = env
@@ -397,7 +433,11 @@ module Lua::Stdlib
         case v = args[0]?
         when nil, Float64
           level = v.is_a?(Float64) ? v.to_i : 1
-          env = level == 0 ? i2.default_env : i2.caller_closure(level).try &.env
+          env = if level == 0
+                 (co = i2.current_co) ? co.env : i2.default_env
+               else
+                 i2.caller_closure(level).try &.env
+               end
           [env || i2.globals] of LuaValue
         when LuaClosure
           [v.env || i2.globals] of LuaValue
