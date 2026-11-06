@@ -65,14 +65,33 @@ DoD фазы 1: все conformance-файлы зелёные; `return f()`-ре�
 без переполнения стека; типичный SoC-скрипт с ООП (`setmetatable(t, {__index=...})`)
 выполняется.
 
-### Фаза 2 — добивка 5.1/LuaJIT
-- os.date/time полный, io (минимальный), debug-библиотека (getinfo/traceback
-  по нашим AST-строкам — сюда же `chunkname:line` в ошибках).
-- require/dofile с загрузчиком путей (аналог MoonSharp Loaders).
-- goto/labels (5.2/LuaJIT), целочисленное деление `//`, `\u{XXX}`? — только
-  то, что реально использует LuaJIT в режиме 5.1+ext.
-- Полный прогон lua5.1-tests (lua.org); расхождения — чинятся до перехода
-  к фазе 3.
+### Фаза 2 — добивка 5.1/LuaJIT ✅ (2026-11, кроме известного списка ниже)
+- os.date/time полный, io (минимальный), debug-библиотека полная: getinfo/
+  getlocal/setlocal/getupvalue/setupvalue/traceback (формат db_errorfb с
+  эллипсисом LEVELS1/2), **hooks** — `debug.sethook/gethook` per-state
+  (свапаются с корутиной): события line/call/return/count/"tail return";
+  line-события по правилу traceexec (вход в функцию, обратные прыжки,
+  смена строки), call/return вокруг C-вызовов через виртуальные C-кадры.
+- **Level-walk с C-кадрами**: нативные вызовы регистрируются в
+  native-stack ({fn, fsize, args}) и interleav'ятся с Lua-кадрами по
+  счётчику кадров — `pcall(getfenv, 3)` в db.lua видит C-кадр pcall.
+  Tail calls: кадр переиспользуется (Frame#tail_calls), level-walk даёт
+  виртуальные уровни what="tail" ("=(tail call)", func=nil, getfenv —
+  громкая ошибка). Кадры корутины сохраняются после error-смерти
+  (debug.traceback(co) работает, внутренний уровень — упавший вызов).
+- Кодген сверен с luac 5.1.5: `local a` без инициализатора не эмитит
+  LOADNIL на старте функции (окно регистров nil-заполняется на входе
+  кадра — push_call/run_vm/fast-path, как luaD_precall), в теле цикла —
+  эмитит; FORPREP прыгает на FORLOOP с пре-вычитанием шага; FORLOOP
+  атрибутирован строке `for` (luaK_fixline); неявный RETURN главного
+  чанка — строка последнего токена.
+- goto/labels (5.2/LuaJIT), `//` — не вошли (не использует реальный
+  LuaJIT-код GSC; добавить при необходимости).
+- Известные красные lua5.1-tests (6 из 23, остальное зелёное):
+  calls.lua:250 (lazy reader), gc.lua:107 (step-counting),
+  main.lua + all.lua (порт lua.c CLI: os.execute), big.lua (падает и на
+  эталонном 5.1.5 x64 на line 11; line-361 top-level yield отвергается
+  корректно — проверено эталоном).
 
 ### Фаза 3 — байткод-VM (порт MoonSharp Execution/Vm)
 - Компиляция AST → свой байткод, switch-цикл диспетчеризации. ✅

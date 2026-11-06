@@ -18,6 +18,9 @@ module Lua::AST
 
   class Block < Stat
     property stats = [] of Stat
+    # line of the chunk's last token (the main chunk's implicit RETURN is
+    # attributed there — 5.1 emits it at the parser's current line)
+    property end_line : Int32 = 0
   end
 
   # --- expressions ---

@@ -34,6 +34,30 @@ module Lua
     # "boolean", "nil", "function", "thread", "userdata" fallback)
     property type_mts = Hash(String, LuaTable?).new
 
+    # --- debug hooks (5.1 lua_sethook/luaD_callhook/traceexec) ---
+    # Masks mirror LUA_MASKCALL/RET/LINE/COUNT. @hook_on is the effective
+    # mask (0 while a hook is running — 5.1 allowhook) so the VM dispatch
+    # loop pays one integer test per instruction.
+    HOOK_CALL  = 1
+    HOOK_RET   = 2
+    HOOK_LINE  = 4
+    HOOK_COUNT = 8
+    @hook_fn : LuaValue = nil
+    @hook_mask : Int32 = 0
+    @hook_count : Int32 = 0
+    @hook_countdown : Int32 = 0
+    @hook_on : Int32 = 0
+    @in_hook = false
+    # Frame count at the moment an error began unwinding run_frames — a
+    # dead-with-error coroutine keeps its frames for debug.traceback(co);
+    # this recovers the count the unwinding itself destroys.
+    property err_fsize : Int32 = 0
+    # Running native (C) calls: {fn, frame count at entry, arguments}. The
+    # 5.1 CallInfo stack interleaves C frames with Lua frames; level walks
+    # (getinfo/getlocal/traceback) reconstruct the order through the entry
+    # frame counts. Tuple = no per-call allocation.
+    @native_stack = [] of {LuaValue, Int32, Array(LuaValue)}
+
     def initialize
       @globals = LuaTable.new
       @string_lib = LuaTable.new
@@ -118,6 +142,11 @@ module Lua
       yield @err_handler
       yield @default_env
       yield @current_co
+      yield @hook_fn
+      @native_stack.each do |(fn, _fs, args)|
+        yield fn
+        args.each { |v| yield v }
+      end
       i = 0
       while i < @fsize
         fr = @frames[i]
@@ -285,15 +314,22 @@ module Lua
 
     # Call a native (Crystal) function. Non-Lua Crystal exceptions raised
     # inside cross as Lua errors (catchable by pcall); LuaError passes
-    # through untouched, value intact.
+    # through untouched, value intact. The native registers itself on the
+    # C-frame stack while running (5.1 inc_ci in luaD_precall) so debug
+    # level walks see it.
     def call_native(f : LuaFunction, args : Array(LuaValue)) : Array(LuaValue)
-      f.fn.call(self, args)
-    rescue e : LuaError
-      raise e
-    rescue e : YieldSignal
-      raise e
-    rescue e : Exception
-      raise LuaError.new("(crystal) #{f.name}: #{e.class}: #{e.message || "error"}")
+      @native_stack.push({f, @fsize, args})
+      begin
+        f.fn.call(self, args)
+      rescue e : LuaError
+        raise e
+      rescue e : YieldSignal
+        raise e
+      rescue e : Exception
+        raise LuaError.new("(crystal) #{f.name}: #{e.class}: #{e.message || "error"}")
+      ensure
+        @native_stack.pop
+      end
     end
 
     # --- indexing with metatables ---

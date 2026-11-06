@@ -14,7 +14,7 @@ See **PLAN.md** for the roadmap (phases: MVP → full 5.1/LuaJIT compat →
 bytecode VM → full interop layer → optional JIT) and the MoonSharp module
 mapping.
 
-## Status (Phase 1 — MVP)
+## Status
 
 - Full Lua 5.1 lexer + parser (plus LuaJIT `\x`/`\z` escapes), including the
   `ambiguous syntax` guard Lua itself has.
@@ -24,14 +24,18 @@ mapping.
   `__concat`, `__eq`, `__lt`/`__le` with the 5.1 fallback, `__call`,
   `__tostring`, `__len`, `__unm`, protected metatables).
 - Standard library: base (pcall/xpcall/error levels, select/unpack,
-  next/pairs/ipairs, setmetatable, loadstring…), math, table, os (minimal),
+  next/pairs/ipairs, setmetatable, loadstring…), math, table, os, io,
   and string — including a faithful port of the lstrlib pattern engine
   (classes, quantifiers, `%b`, `%f` frontiers, backrefs, position/empty
   captures, find/match/gmatch/gsub, plain mode) and `string.format`.
-- Interop MVP: `@[LuaMethod]` annotation + `expose Klass` macro + userdata
-  wrappers. Constructors, inheritance and overloads → Phase 4.
-- Coroutines, io/debug libs, require → Phase 2/3 (they fail loudly, not
-  silently).
+- Full **debug library**: getinfo/getlocal/setlocal, upvalue access,
+  traceback (of coroutines too), and **hooks** — `debug.sethook/gethook`
+  with line/call/return/count events, per coroutine; level walks count
+  native (C) frames and lost tail calls (`what="tail"`) like Lua 5.1.
+- Bytecode VM with proper tail calls and coroutines (own stacks, yield
+  semantics of 5.1); weak tables and `__gc` over a precise Lua-graph mark.
+- Interop: `@[LuaMethod]` annotation + `expose Klass` macro + userdata
+  wrappers; constructors, inheritance and overloads included.
 
 ## Usage
 

@@ -71,6 +71,9 @@ module Lua
       unless cur.kind.eof?
         err("unexpected symbol near '#{cur.describe}'")
       end
+      # the main chunk's last token line: luaY_parser emits the implicit
+      # return standing at the end of the chunk
+      b.end_line = (@toks[@pos - 1]?.try(&.line) || 0)
       b
     end
 

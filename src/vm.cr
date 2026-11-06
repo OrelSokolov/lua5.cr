@@ -54,6 +54,9 @@ module Lua
       property n_captures : Int32 = 0
       # true when the body mentions `...` (clears the implicit `arg`)
       property? uses_vararg = false
+      # true when a bare-local LOADNIL landed at pc==0; its line is
+      # re-attributed at func close (see compile_func)
+      property? nil0_patch = false
 
       def initialize(@parent, @proto)
       end
@@ -76,7 +79,13 @@ module Lua
       fs = FuncState.new(nil, p)
       @fs = fs
       block_scope(block)
+      # 5.1 luaY_parser: the implicit RETURN of the main chunk carries the
+      # line of its last token (activelines/line hooks see it)
+      @line = block.end_line if block.end_line > 0
       emit(Op::RETURN, 0, 0)
+      # re-attribute a first-instruction bare-local LOADNIL (see
+      # compile_explist) to the next instruction's line
+      p.lines[0] = p.lines[1] if fs.nil0_patch? && p.code.size > 1
       pack(p)
       p
     end
@@ -345,9 +354,14 @@ module Lua
         body_start = f.proto.code.size
         block_scope(s.block)
         fl = emit(Op::FORLOOP, r)
+        # 5.1 luaK_fixline: the loop-back op is attributed to the `for`
+        # line ("pretend OP_FOR starts the loop") — line hooks expect it
+        f.proto.lines[fl] = s.line
         patch(fl, body_start)
         exit_pos = maybe_close_loop(f, r)
-        patch(fp, exit_pos)
+        # 5.1: FORPREP jumps over the body TO the loop test (FORLOOP);
+        # the first body entry is a backward jump, which line hooks fire
+        patch(fp, fl)
         f.loops.last.breaks.each { |br| patch(br, exit_pos) }
         f.loops.pop
         pop_scope
@@ -518,6 +532,12 @@ module Lua
       if m == 0
         if want > 0
           use_reg(base + want - 1)
+          # 5.1 luaK_nil skips a LOADNIL that would be the function's
+          # very first instruction (the register window starts nil).
+          # We always emit it (windows are not nil-filled at runtime)
+          # but re-attribute its line to the next instruction so the
+          # pc==0 line event matches 5.1's trace.
+          fs.nil0_patch = true if fs.proto.code.empty?
           emit(Op::LOADNIL, base, want - 1)
         end
         return
@@ -574,6 +594,9 @@ module Lua
       # (activelines[lastlinedefined] must be set)
       @line = e.end_line
       emit(Op::RETURN, 0, 0)
+      # re-attribute a first-instruction bare-local LOADNIL (see
+      # compile_explist) to the next instruction's line
+      p.lines[0] = p.lines[1] if nfs.nil0_patch? && p.code.size > 1
       @fs = save
       parent.proto.protos << p
       parent.proto.protos.size - 1
@@ -856,6 +879,64 @@ module Lua
     @call_depth = 0
     property current_co : LuaCoroutine? = nil
 
+    # --- debug hooks (5.1 luaD_callhook / traceexec) ---
+
+    # Run the hook function for `event` ("call"/"return"/"line"/"count"/
+    # "tail return"). Events are suppressed while the hook itself runs
+    # (5.1 allowhook); sethook inside a hook takes effect on return.
+    # virt: a native (C) call the event is about — registered on the
+    # C-frame stack for the event's duration so getinfo(2) sees it.
+    def fire_hook(event : String, line : Int32?, virt : LuaValue? = nil) : Nil
+      h = @hook_fn
+      return if h.nil?
+      if v = virt
+        @native_stack.push({v, @fsize, Lua::EMPTY_VALS})
+      end
+      @in_hook = true
+      @hook_on = 0
+      begin
+        call(h, [event.as(LuaValue), (line ? line.to_f64 : nil).as(LuaValue)])
+      ensure
+        @in_hook = false
+        @hook_on = @hook_mask
+        @native_stack.pop if virt
+      end
+    end
+
+    # Per-instruction trace (5.1 traceexec), called from the dispatch loop
+    # when hooks are active, `pc` being the index of the instruction about
+    # to execute. Line events fire on entering a function, on backward
+    # jumps (loops) and on line changes; the count event fires first.
+    private def hook_step(frame : Frame, pc : Int32, lines : Array(Int32)) : Nil
+      # 5.1 keeps L->savedpc per instruction; our frames only carry it at
+      # call boundaries — publish the current position so getinfo/getlocal
+      # from inside hooks see live locals ("pc is already incremented")
+      frame.pc = pc + 1
+      if (@hook_on & HOOK_COUNT) != 0
+        if (@hook_countdown -= 1) <= 0
+          @hook_countdown = @hook_count
+          fire_hook("count", nil)
+        end
+      end
+      if (@hook_on & HOOK_LINE) != 0
+        old = frame.old_pc
+        if pc == 0 || pc <= old || lines[pc]? != lines[old]?
+          fire_hook("line", lines[pc]? || -1)
+        end
+        frame.old_pc = pc
+      end
+    end
+
+    # The callable a __call dispatch would reach, for hook events about a
+    # native call site (the event names the final function, 5.1 tryfuncTM).
+    private def call_target(fn : LuaValue) : LuaValue?
+      case fn
+      when LuaFunction             then fn
+      when LuaTable, LuaUserData   then metafield(fn, "__call")
+      else                              nil
+      end
+    end
+
     private def ensure_stack(n : Int32) : Nil
       if n >= MAX_STACK_SLOTS
         # 5.1 LUAI_MAXSTACK: dynamic growth is capped; going past the cap
@@ -947,6 +1028,7 @@ module Lua
       end
       top = newbase + {p.max_stack, argn + 1}.max
       ensure_stack(top + argn + 4)
+      stack = @stack
       if @fsize < @frames.size
         nf = @frames[@fsize]
       else
@@ -959,6 +1041,8 @@ module Lua
       nf.varargs = vars
       nf.pc = 0
       nf.want = want
+      nf.tail_calls = 0
+      nf.old_pc = -1
       @fsize += 1
     end
 
@@ -1060,7 +1144,8 @@ module Lua
       if p0.vararg? && args.size > np
         vars = Array(LuaValue).new(args.size - np) { |j| args[np + j] }
       end
-      f0 = Frame.new(cl0, base0, base0 + {p0.max_stack, args.size + 1}.max, vars)
+      top0 = base0 + {p0.max_stack, args.size + 1}.max
+      f0 = Frame.new(cl0, base0, top0, vars)
       f0.want = 0
       if @fsize < @frames.size
         @frames[@fsize] = f0
@@ -1068,6 +1153,11 @@ module Lua
         @frames << f0
       end
       @fsize += 1
+      if (@hook_on & HOOK_CALL) != 0
+        f0.pc = 1 # 5.1: "hooks assume 'pc' is already incremented"
+        fire_hook("call", nil)
+        f0.pc = 0 # execution still starts at the first instruction
+      end
       # entry_frames: frame count EXCLUDING the entry frame (the loop
       # finishes when the frame at index entry_frames returns)
       run_frames(@fsize - 1, base0)
@@ -1099,8 +1189,12 @@ module Lua
           stack = @stack
 
           while true
+            if @hook_on != 0
+              hook_step(frame, pc, lines)
+            end
             # sp refresh per iteration: the stack buffer may have been
-            # reallocated (ensure_stack) by any op that re-entered the VM.
+            # reallocated (ensure_stack) by any op that re-entered the VM
+            # (a hook run counts — refresh happens AFTER hook_step).
             sp = stack.to_unsafe
             w = cp[pc]
             pc += 1
@@ -1314,12 +1408,13 @@ module Lua
               lim = v1.not_nil!
               ste = v2.not_nil!
               raise_lua("'for' step is zero") if ste == 0
-              sp[base + a] = init
+              # 5.1: normalize the controls, pre-subtract the step and
+              # jump to the loop test unconditionally — FORLOOP's first
+              # add restores the initial value
+              sp[base + a] = init - ste
               sp[base + a + 1] = lim
               sp[base + a + 2] = ste
-              unless ste > 0 ? init <= lim : init >= lim
-                pc += b
-              end
+              pc += b
             when .forloop?
               ctrl = sp[base + a].as(Float64)
               lim = sp[base + a + 1].as(Float64)
@@ -1376,7 +1471,13 @@ module Lua
                     nf.varargs = Lua::EMPTY_VALS
                     nf.pc = 0
                     nf.want = c
+                    nf.tail_calls = 0
+                    nf.old_pc = -1
                     @fsize += 1
+                    if (@hook_on & HOOK_CALL) != 0
+                      nf.pc = 1 # 5.1: "hooks assume 'pc' is already incremented"
+                      fire_hook("call", nil)
+                    end
                     frame = nf
                     cl = fn
                     proto = p
@@ -1392,11 +1493,20 @@ module Lua
                   end
                 end
                 push_call(fn, base + a, argn, c)
+                if (@hook_on & HOOK_CALL) != 0
+                  nf = @frames[@fsize - 1]
+                  nf.pc = 1 # "pc already incremented"
+                  fire_hook("call", nil)
+                  nf.pc = 0
+                end
                 break # re-fetch frame
               else
                 @line = lines[pc - 1]
                 @vi_pc = pc - 1
                 frame.pc = pc # call position while the native runs (getinfo)
+                if (vf = call_target(fn)) && (@hook_on & HOOK_CALL) != 0
+                  fire_hook("call", nil, vf)
+                end
                 r = begin
                   call_value(fn, base + a, argn, a)
                 rescue e : YieldSignal
@@ -1406,6 +1516,9 @@ module Lua
                   raise e
                 end
                 frame.pc = pc
+                if vf && (@hook_on & HOOK_RET) != 0
+                  fire_hook("return", nil, vf)
+                end
                 store_results(frame, base + a, c, r)
               end
             when .tailcall?
@@ -1440,17 +1553,33 @@ module Lua
                 frame.pc = 0
                 frame.top = base + {p.max_stack, argn + 1}.max
                 ensure_stack(frame.top + argn + 4)
+                # 5.1 OP_TAILCALL: luaD_precall fires CALL for the callee,
+                # then the frame collapses onto the previous one — each
+                # collapse is a lost tail-call level ("tail return" event).
+                if (@hook_on & HOOK_CALL) != 0
+                  frame.pc = 1 # "pc already incremented"
+                  fire_hook("call", nil)
+                  frame.pc = 0
+                end
+                frame.tail_calls += 1
+                frame.old_pc = -1
                 break # re-fetch frame
               else
                 @line = lines[pc - 1]
                 @vi_pc = pc - 1
                 frame.pc = pc # call position while the native runs
+                if (vf = call_target(fn)) && (@hook_on & HOOK_CALL) != 0
+                  fire_hook("call", nil, vf)
+                end
                 r = begin
                   call_value(fn, base + a, argn, a)
                 rescue e : YieldSignal
                   # tail call to yield: completes as this frame's return
                   @yield_call = {frame, -1, 0, true}
                   raise e
+                end
+                if vf && (@hook_on & HOOK_RET) != 0
+                  fire_hook("return", nil, vf)
                 end
                 if @fsize == entry_frames + 1 || frame_return(frame, r)
                   results = r
@@ -1460,6 +1589,18 @@ module Lua
                 break
               end
             when .return?
+              if (@hook_on & HOOK_RET) != 0
+                # 5.1 callrethooks: RET for the returning function, then
+                # one TAILRET per lost tail call, while the frame is still
+                # up (getinfo(2) names it).
+                frame.pc = pc
+                fire_hook("return", nil)
+                tleft = frame.tail_calls
+                while tleft > 0
+                  tleft -= 1
+                  fire_hook("tail return", nil)
+                end
+              end
               nres = b == -1 ? {frame.top - (base + a), 0}.max : b
               if @fsize == entry_frames + 1
                 results = Array(LuaValue).new(nres) { |j| stack[base + a + j] }
@@ -1510,6 +1651,10 @@ module Lua
         end
         results
       rescue e : LuaError
+        # frame count at the raise, before the ensure below truncates —
+        # a coroutine dying with an error keeps its frames for
+        # debug.traceback(co) and needs the original count
+        @err_fsize = @fsize
         # 5.1 luaD_errormsg: an xpcall message handler runs here, before any
         # unwinding, so debug.traceback sees the frames that raised. A
         # handler that itself errors aborts with "error in error handling".
@@ -1581,6 +1726,15 @@ module Lua
       s_open_max = @open_max
       @open_upvals = co.open_upvals
       @open_max = co.open_max
+      # native calls of the resumed state, not the resumer's
+      s_natives = @native_stack
+      @native_stack = co.native_stack
+      # per-state hooks (5.1 lua_sethook): swap with the stacks
+      s_hook_fn, s_hook_mask, s_hook_count, s_hook_countdown = @hook_fn, @hook_mask, @hook_count, @hook_countdown
+      s_in_hook = @in_hook
+      @hook_fn, @hook_mask, @hook_count, @hook_countdown = co.hook, co.hook_mask, co.hook_count, co.hook_countdown
+      @in_hook = false # a fresh state always allows hooks
+      @hook_on = @hook_mask
       @current_co = co
       co.status = LuaCoroutine::Status::Running
       # thread env (debug.setfenv): the interpreter default for this resume
@@ -1624,12 +1778,25 @@ module Lua
         co.entries = @entry_stack
         co.open_upvals = @open_upvals
         co.open_max = @open_max
+        co.native_stack = @native_stack
+        co.hook, co.hook_mask, co.hook_count, co.hook_countdown = @hook_fn, @hook_mask, @hook_count, @hook_countdown
         co.yield_call = @yield_call
         @yield_call = nil
         ([true] of LuaValue).concat(e.values)
       rescue e : LuaError
         co.status = LuaCoroutine::Status::Dead
-        co.release
+        # 5.1 abandons the ci's of an erroring coroutine: keep the frames
+        # (with the count from the raise) so debug.traceback(co) can still
+        # walk them — the innermost level is the failed call itself
+        co.err_death = true
+        co.stack, co.frames = @stack, @frames
+        co.fsize = @err_fsize
+        co.entries = @entry_stack
+        co.open_upvals = @open_upvals
+        co.open_max = @open_max
+        co.native_stack = @native_stack
+        co.hook, co.hook_mask, co.hook_count, co.hook_countdown = @hook_fn, @hook_mask, @hook_count, @hook_countdown
+        co.yield_call = nil
         [false, e.value] of LuaValue
       rescue e : Exception
         # Crystal-level failure inside the coroutine: no silent degradation
@@ -1641,6 +1808,10 @@ module Lua
         @entry_stack = s_entry
         @open_upvals = s_upvals
         @open_max = s_open_max
+        @native_stack = s_natives
+        @hook_fn, @hook_mask, @hook_count, @hook_countdown = s_hook_fn, s_hook_mask, s_hook_count, s_hook_countdown
+        @in_hook = s_in_hook
+        @hook_on = @in_hook ? 0 : @hook_mask
         # the body may have replaced its thread env (setfenv(0)): persist
         co.env = @default_env if co.env != @default_env
         @default_env = s_env

@@ -678,10 +678,22 @@ module Lua
     # coroutine's captures must not alias the resumer's stack slots).
     property open_upvals = [] of UpValue
     property open_max : Int32 = -1
+    # Running native (C) calls of THIS state — the interpreter's list is
+    # swapped with the stacks on resume (the resumer's natives belong to
+    # the parent state, not to the coroutine's level walks).
+    property native_stack = [] of NativeEntry
     # The CALL/TAILCALL site that raised YieldSignal (vm.cr), saved on
     # suspend: {frame, abs result register (-1: tail call), CALL C, tail?}.
     property yield_call : {Frame, Int32, Int32, Bool}? = nil
     property? first_resume = true
+    # Hooks are per-state (5.1 lua_sethook/getthread): swapped with the
+    # stacks on resume. err_death: frames are kept (not released) after an
+    # error so debug.traceback(co) still walks them, 5.1-style.
+    property hook : LuaValue = nil
+    property hook_mask : Int32 = 0
+    property hook_count : Int32 = 0
+    property hook_countdown : Int32 = 0
+    property? err_death = false
 
     def initialize(@fn)
       @stack = Array(LuaValue).new(256, nil.as(LuaValue))
@@ -696,10 +708,12 @@ module Lua
       @entries = [] of Int32
       @open_upvals = [] of UpValue
       @open_max = -1
+      @native_stack = [] of NativeEntry
     end
 
     def gc_mark_children(m : GcMark) : Nil
       m.mark(@fn)
+      m.mark(@hook)
       @stack.each { |v| m.mark(v) }
       @frames.first(@fsize).each { |fr| m.mark(fr.closure); fr.varargs.each { |v| m.mark(v) } }
       @open_upvals.each do |u|
@@ -722,12 +736,23 @@ module Lua
     property varargs : Array(LuaValue)
     # C operand of the CALL that pushed this frame (-1/0/n).
     property want : Int32 = -1
+    # 5.1 ci->tailcalls: tail calls that reused this frame — each is a
+    # "lost" level reported by debug level walks as what="tail".
+    property tail_calls : Int32 = 0
+    # pc of the last executed instruction, maintained while line hooks run
+    # (5.1 L->savedpc): persists across a coroutine suspension.
+    property old_pc : Int32 = -1
 
     def initialize(@closure, @base, @top, @varargs)
     end
   end
 
   alias NativeFn = Interp, Array(LuaValue) -> Array(LuaValue)
+
+  # A running native (C) call for debug level walks: the function, the Lua
+  # frame count at its entry (interleaving point, 5.1 CallInfo order) and
+  # its arguments (C-frame locals are "(*temporary)").
+  alias NativeEntry = {LuaValue, Int32, Array(LuaValue)}
 
   class LuaFunction
     getter name : String

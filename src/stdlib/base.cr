@@ -396,11 +396,12 @@ module Lua::Stdlib
               i2.default_env = env == i2.globals ? nil : env
             end
             [i2.globals] of LuaValue
-          elsif cl = i2.caller_closure(level)
+          elsif cl = i2.closure_of_level(level)
             cl.env = env
             [cl] of LuaValue
           else
-            i2.raise_lua("setfenv: invalid level")
+            # C function (or non-function value): no settable environment
+            i2.raise_lua("setfenv cannot change environment of given object")
           end
         when LuaClosure
           v.env = env
@@ -436,7 +437,9 @@ module Lua::Stdlib
           env = if level == 0
                  (co = i2.current_co) ? co.env : i2.default_env
                else
-                 i2.caller_closure(level).try &.env
+                 # 5.1 getfunc: level walk — tail levels are a loud error,
+                 # C frames run in the globals
+                 i2.env_of_level(level)
                end
           [env || i2.globals] of LuaValue
         when LuaClosure
