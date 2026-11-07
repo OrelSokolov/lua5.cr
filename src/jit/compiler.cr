@@ -32,6 +32,11 @@ private lib LLVMTgt
   fun a64_mc = LLVMInitializeAArch64TargetMC
   fun a64_asm_p = LLVMInitializeAArch64AsmParser
   fun a64_asm_w = LLVMInitializeAArch64AsmPrinter
+  fun x86_info = LLVMInitializeX86TargetInfo
+  fun x86_target = LLVMInitializeX86Target
+  fun x86_mc = LLVMInitializeX86TargetMC
+  fun x86_asm_p = LLVMInitializeX86AsmParser
+  fun x86_asm_w = LLVMInitializeX86AsmPrinter
 end
 
 module Lua::JIT
@@ -300,12 +305,20 @@ module Lua::JIT
     private def self.target_machine : LLVM::TargetMachine
       @@tm ||= begin
         # target registration normally happens in lljit; a compile that
-        # optimizes before the engine exists must do it itself
+        # optimizes before the engine exists must do it itself. Both native
+        # targets are registered unconditionally — registration is
+        # idempotent, and the X86 backend must be live before the first
+        # compile on an Intel/AMD host (triple comes from the host below).
         LLVMTgt.a64_info
         LLVMTgt.a64_target
         LLVMTgt.a64_mc
         LLVMTgt.a64_asm_p
         LLVMTgt.a64_asm_w
+        LLVMTgt.x86_info
+        LLVMTgt.x86_target
+        LLVMTgt.x86_mc
+        LLVMTgt.x86_asm_p
+        LLVMTgt.x86_asm_w
         triple = LLVM.default_target_triple
         LLVM::Target.from_triple(triple).create_target_machine(
           triple, opt_level: LLVM::CodeGenOptLevel::Aggressive)
