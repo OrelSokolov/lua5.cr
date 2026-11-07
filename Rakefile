@@ -3,6 +3,8 @@
 # Interpreter benchmarks (see benchmark.md). Suite: Mike Pall's
 # LuaJIT-test-cleanup (bench/vendor), timed per process, min-of-N.
 #
+#   rake build:release      # build bin/lua5 (--release --no-debug)
+#   rake build:dev          # build bin/lua5 (dev, debug info)
 #   rake benchmark:lua      # PUC Lua 5.1.5   (bench/vendor)
 #   rake benchmark:jitlua   # LuaJIT 2.1 JIT  (bench/vendor)
 #   rake benchmark:clua     # Crystal interpreter (bin/lua5, built on demand)

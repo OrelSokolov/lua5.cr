@@ -116,18 +116,6 @@ def run_suite(vm, filter = nil)
   puts "wrote #{dir}"
 end
 
-def build_clua!
-  need = !File.executable?(CLUA_BIN) || ENV["REBUILD"] == "1"
-  return unless need
-  FileUtils.mkdir_p(File.dirname(CLUA_BIN))
-  # JIT (LLVM ORC, src/jit): the build needs LLVM. Prefer an explicitly
-  # configured LLVM_CONFIG, else the standard homebrew prefix.
-  llvm_bin = ENV["LLVM_CONFIG"] || "/opt/homebrew/opt/llvm/bin/llvm-config"
-  libdir = File.dirname(`#{llvm_bin} --libdir`.strip)
-  env = { "LLVM_CONFIG" => llvm_bin, "LIBRARY_PATH" => libdir }
-  sh env, "crystal build --release --no-debug src/cli.cr -o #{CLUA_BIN}", chdir: REPO_ROOT
-end
-
 namespace :benchmark do
   %w[lua jitlua jitoff].each do |vm|
     desc "Run bench suite on #{VMS.fetch(vm)[:label]} (optional: one bench name)"
@@ -138,7 +126,8 @@ namespace :benchmark do
 
   desc "Run bench suite on the Crystal interpreter (builds bin/lua5; optional: one bench name)"
   task :clua, [:bench] do |_t, args|
-    build_clua!
+    # Build only when missing or REBUILD=1 — see tasks/build.rake
+    Rake::Task["build:release"].invoke unless File.executable?(CLUA_BIN) && ENV["REBUILD"] != "1"
     run_suite("clua", args[:bench])
   end
 end
