@@ -1528,17 +1528,64 @@ module Lua
               end
             when .tforcall?
               @line = lines[pc - 1]
-              rets = call(stack[base + a], [stack[base + a + 1], stack[base + a + 2]] of LuaValue)
-              first = rets[0]?
-              unless first.nil?
-                close_upvals(base + a + 3) # freeze this iteration's vars
-                i = 0
-                while i < c
-                  stack[base + a + 3 + i] = rets[i]?
-                  i += 1
+              fn = stack[base + a]
+              jit_done = false
+              if fn.is_a?(LuaClosure)
+                # for-in iterators never execute the CALL opcode — without
+                # this bump they never tier up and stay interpreted forever
+                JIT.on_call(fn)
+                p = fn.proto
+                # JIT entry, PUC TFORCALL shape: stage func/state/control at
+                # cb = R[a+3] (overlapping the var window) and call with
+                # base cb — results land on the var slots, R[a..a+2] stay
+                # intact for the next iteration.
+                if (jcp = fn.compiled) && p.num_params == 2 && !p.vararg? &&
+                   base + a + 3 + {p.max_stack, c}.max + 4 < @stack.size &&
+                   !@current_co && @hook_on == 0 && @jit_depth < 512
+                  frame.pc = pc
+                  cb = base + a + 3
+                  stack[cb] = fn
+                  stack[cb + 1] = stack[base + a + 1] # state
+                  stack[cb + 2] = stack[base + a + 2] # control
+                  @jit_depth += 1
+                  prev_hi = @jit_stack_hi
+                  win2 = cb + p.max_stack
+                  @jit_stack_hi = win2 if win2 > prev_hi
+                  begin
+                    n = JIT.invoke(jcp, self, fn, cb, 2, c)
+                  ensure
+                    @jit_depth -= 1
+                    @jit_stack_hi = prev_hi
+                  end
+                  stack = @stack # the callee may have reallocated it
+                  sp = stack.to_unsafe
+                  first = n > 0 ? stack[cb] : nil
+                  unless first.nil?
+                    close_upvals(base + a + 3) # freeze this iteration's vars
+                    i = 0
+                    while i < c
+                      stack[base + a + 3 + i] = i < n ? stack[cb + i] : nil
+                      i += 1
+                    end
+                    stack[base + a + 2] = first
+                    pc += b
+                  end
+                  jit_done = true
                 end
-                stack[base + a + 2] = first
-                pc += b
+              end
+              unless jit_done
+                rets = call(stack[base + a], [stack[base + a + 1], stack[base + a + 2]] of LuaValue)
+                first = rets[0]?
+                unless first.nil?
+                  close_upvals(base + a + 3) # freeze this iteration's vars
+                  i = 0
+                  while i < c
+                    stack[base + a + 3 + i] = rets[i]?
+                    i += 1
+                  end
+                  stack[base + a + 2] = first
+                  pc += b
+                end
               end
             when .call?
               fn = sp[base + a]
