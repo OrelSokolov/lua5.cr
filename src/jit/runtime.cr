@@ -250,11 +250,20 @@ module Lua
           @jit_stack_hi = prev_hi
         end
       else
-        # Callee tier-up from a JIT caller: without this bump an
-        # OSR'd caller would keep its callees one call short of the
-        # threshold forever (the interpreter's FORLOOP bumps the caller
-        # BEFORE the body, so the caller always wins the race).
+        # Callee tier-up from a JIT caller: without this bump an OSR'd
+        # caller would keep its callees one call short of the threshold
+        # forever (the interpreter's FORLOOP bumps the caller BEFORE the
+        # body, so the caller always wins the race).
         JIT.on_call(self, fn) if fn.is_a?(LuaClosure)
+        # Allocation-free numeric builtin call (math.sqrt-style): the
+        # helper-crossing itself is the only cost left — no args/result
+        # arrays, no call_native frame. Non-number arguments and every
+        # other shape take the full slow path with exact error semantics.
+        if fn.is_a?(LuaFunction) && (g = fn.fast1) && argn == 1 &&
+           (x = @stack[base + a + 1].as?(Float64))
+          @stack[base + a] = g.call(x)
+          return 1
+        end
         begin
           jit_slow_call(fn, base, a, argn, want)
         rescue e : LuaError

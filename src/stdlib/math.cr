@@ -2,9 +2,11 @@
 module Lua::Stdlib
   module MathLib
     def self.one(tbl : LuaTable, fname : String, &f : Float64 -> Float64)
-      tbl.raw_set(fname, LuaFunction.new("math.#{fname}", ->(i2 : Interp, args : Array(LuaValue)) {
+      lf = LuaFunction.new("math.#{fname}", ->(i2 : Interp, args : Array(LuaValue)) {
         i2.ret1(f.call(i2.num!(args, 0, fname)))
-      }))
+      })
+      lf.fast1 = f # allocation-free fast path for JIT call sites
+      tbl.raw_set(fname, lf)
     end
 
     def self.install(i : Interp)

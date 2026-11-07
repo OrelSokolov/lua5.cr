@@ -1390,8 +1390,10 @@ module Lua::JIT
       # positions the builder in the HIT block and returns the address of
       # the slot's val field plus the MISS block (caller falls back to the
       # helper there). Home index mirrors LuaTable#slot_idx:
-      # ((addr * 0x9E3779B97F4A7C15) >> 32) & mask; 3 slots probed inline,
-      # misses/empties fall through to `miss`.
+      # Lua.slot_hash(kaddr) & mask (murmur finalizer — a Fibonacci hash
+      # clusters adjacent interned-string addresses); kaddr is a compile-
+      # time constant, so the mix costs nothing in the emitted code;
+      # 3 slots probed inline, misses/empties fall through to `miss`.
       private def str_probe_begin(pc : Int32, tbl : LLVM::Value, kaddr : UInt64,
                                   tag : String) : {LLVM::Value, LLVM::BasicBlock}
         b = @b
@@ -1401,13 +1403,18 @@ module Lua::JIT
         b.cond(b.icmp(LLVM::IntPredicate::NE, smask, @i32.const_int(0)), has, miss)
         b.position_at_end(has)
         sbuf = b.load(@ptr, tbl_fld(tbl, Layout.tbl_slots))
-        home32 = ((kaddr &* 0x9E3779B97F4A7C15_u64) >> 32).to_i32!
+        home32 = (Lua.slot_hash(kaddr) & 0xFFFFFFFF_u64).to_i32!
         kptr = int2ptr(@i64.const_int(kaddr.to_i64!))
         hit = new_block("#{tag}#{pc}hit")
         blocks = [] of LLVM::BasicBlock
         slots = [] of LLVM::Value
         3.times do |t|
-          idx = b.and(b.add(@i32.const_int(home32 + t), smask), smask)
+          # NB: (home32 + t) & smask — NOT (home32 + t + smask) & smask:
+          # adding the mask first shifts the whole window to home-1, and
+          # an empty home-1 slot aborts the linear probe before the key
+          # at home is ever compared (every probe missed since M3.2; the
+          # old clustered hash masked it, the murmur mixer exposed it)
+          idx = b.and(@i32.const_int(home32 &+ t), smask)
           slot = b.gep(@i8, sbuf, b.mul(b.zext(idx, @i64), @i64.const_int(Layout.slot_size)))
           kp = b.load(@ptr, b.gep(@i8, slot, @i64.const_int(Layout.slot_key)))
           not_hit = new_block("#{tag}#{pc}nh#{t}")

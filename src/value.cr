@@ -18,6 +18,25 @@ module Lua
   SHORT_STR_MAX = 40
   @@istrs = Hash(String, String).new
 
+  # Slot-home hash for the flat string-key store: a murmur3-style
+  # finalizer over the key's address. A plain Fibonacci hash
+  # ((addr * K) >> 32) is NOT good enough here: Crystal allocates
+  # interned strings back-to-back (16-byte stride), and middle-bits of
+  # adjacent products land on the same home — the whole key set packs
+  # into one cluster and the JIT's 3-slot inline probe misses forever
+  # (found on nbody: 180M helper calls). The finalizer spreads address
+  # deltas into every bit; used by BOTH LuaTable#slot_idx and the JIT's
+  # compile-time home (the key address is a constant there, so the
+  # mixed home costs nothing in the emitted code).
+  def self.slot_hash(addr : UInt64) : UInt64
+    h = addr
+    h ^= h >> 33
+    h &*= 0xff51afd7ed558ccd_u64
+    h ^= h >> 33
+    h &*= 0xc4ceb9fe1a85ec53_u64
+    h ^ (h >> 33)
+  end
+
   def self.intern(s : String) : String
     return s if s.bytesize > SHORT_STR_MAX
     if c = @@istrs[s]?
@@ -306,10 +325,11 @@ module Lua
     # --- string-key store (see @slots): flat open addressing, linear
     # probing, identity keys. The index function is reproduced verbatim
     # in JIT-compiled probes (jit/compiler.cr) — keep in sync:
-    # ((addr * 0x9E3779B97F4A7C15) >> 32) & mask.
-
+    # Lua.slot_hash(addr) & mask (the murmur finalizer — see its
+    # comment; a Fibonacci hash clusters adjacent string addresses into
+    # one probe chain)
     private def slot_idx(addr : UInt64) : Int32
-      ((addr &* 0x9E3779B97F4A7C15_u64) >> 32 & @smask.to_u64!).to_i32!
+      (Lua.slot_hash(addr) & @smask.to_u64!).to_i32!
     end
 
     # identity probe; returns the slot index or -1
@@ -1103,6 +1123,11 @@ module Lua
   class LuaFunction
     getter name : String
     getter fn : NativeFn
+    # Fast single-argument numeric invoke (math.* style): when set and the
+    # call site passes exactly one Float64, the JIT dispatch answers it
+    # directly — no args/result arrays, no native-stack frame (JIT.md 1.4;
+    # the interpreted path keeps the full call_native machinery).
+    property fast1 : (Float64 -> Float64)? = nil
 
     def initialize(@name, @fn)
     end
