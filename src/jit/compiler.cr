@@ -747,6 +747,33 @@ module Lua::JIT
         f ? (f[pc]? || 0_u8) : 0_u8
       end
 
+      # Speculative table ops (M3.6): a clean FB_TMISS bit at this pc means
+      # the fast-path shape always held so far — emit guards that DEOPT on
+      # any miss instead of falling back to the helper. The deopt edge
+      # terminates (no merge block), so the fast path keeps its provenance
+      # maps: repeated accesses to the same table in a block skip the
+      # tag/metatable guards, and numeric locals stop being reloaded. A
+      # miss deopt records FB_TMISS (jit_deopt) and on_deopt recompiles
+      # with the polymorphic helper-fallback variant (the code below the
+      # `spec` branches).
+      private def spec_clean?(pc : Int32) : Bool
+        (fb_bits(pc) & Lua::FB_TMISS) == 0
+      end
+
+      # A terminated block that deopts at `pc` (guard-failure target of the
+      # speculative table ops). Emits the call directly — call_fp would
+      # kill the provenance maps the fast path still needs.
+      private def deopt_at(pc : Int32, tag : String) : LLVM::BasicBlock
+        blk = new_block("#{tag}#{pc}dopt")
+        prev = current_block
+        @b.position_at_end(blk)
+        st = @b.call(@helper_types[:deopt], @helpers[:deopt],
+          [@interp, @clp, @base, @i32.const_int(pc), @want], "st")
+        @b.ret(st)
+        @b.position_at_end(prev)
+        blk
+      end
+
       # Arithmetic (type feedback, JIT.md §2): a clean feedback byte at
       # this pc means only numbers were ever seen — mono-numeric code
       # with deopt guards (a wrong guess deopts, the interpreter samples
@@ -1188,15 +1215,22 @@ module Lua::JIT
       # non-table object is legal Lua, not a deopt.
       private def emit_gettable(pc : Int32, a : Int32, br : Int32, cr : Int32) : Nil
         b = @b
+        spec = spec_clean?(pc)
         if @nums[br]?
           # R[B] proven numeric — cannot be a table; getindex on a number
-          # (error/metamethod) is the helper's job
+          # (error/metamethod) is the helper's job. Speculative: the shape
+          # can never hold, deopt straight away (drift recompiles polymorphic)
+          if spec
+            st = call_fp(:deopt, [@interp, @clp, @base, @i32.const_int(pc), @want])
+            b.ret(st)
+            return
+          end
           call_fp(:gettable, [@interp, @clp, @base, @i32.const_int(pc),
             @i32.const_int(a), @i32.const_int(br), @i32.const_int(cr), slot(a)])
           br_next(pc)
           return
         end
-        slow = new_block("gtslow#{pc}")
+        slow = spec ? deopt_at(pc, "gt") : new_block("gtslow#{pc}")
         # R[B]: plain table with nil metatable (cached per block — the
         # tag/mt guards run once per register, see @tabs)
         tbl = guard_table(pc, br, "gt", slow)
@@ -1236,6 +1270,7 @@ module Lua::JIT
         b.store(v, slot(a))
         kill(a)
         br_next(pc)
+        return if spec # the miss edge deopts — no merge, provenance survives
         b.position_at_end(slow)
         call_fp(:gettable, [@interp, @clp, @base, @i32.const_int(pc),
           @i32.const_int(a), @i32.const_int(br), @i32.const_int(cr), slot(a)])
@@ -1252,15 +1287,22 @@ module Lua::JIT
       # and metamethods take the helper.
       private def emit_settable(pc : Int32, a : Int32, br : Int32, cr : Int32) : Nil
         b = @b
+        spec = spec_clean?(pc)
         if @nums[a]?
           # R[A] proven numeric — cannot be a table (setindex on a number
-          # raises or fires metamethods — helper)
+          # raises or fires metamethods — helper; speculative: never holds,
+          # deopt and let drift recompile)
+          if spec
+            st = call_fp(:deopt, [@interp, @clp, @base, @i32.const_int(pc), @want])
+            b.ret(st)
+            return
+          end
           call_fp(:settable, [@interp, @clp, @base, @i32.const_int(pc),
             @i32.const_int(a), @i32.const_int(br), @i32.const_int(cr)])
           br_next(pc)
           return
         end
-        slow = new_block("stslow#{pc}")
+        slow = spec ? deopt_at(pc, "st") : new_block("stslow#{pc}")
         # R[A]: plain table with nil metatable (cached per block, @tabs)
         tbl = guard_table(pc, a, "st", slow)
         kf = if v = @nums[br]?
@@ -1297,6 +1339,7 @@ module Lua::JIT
         bufp = b.load(@lv_ptr, tbl_fld(tbl, Layout.tbl_buf))
         b.store(vv, b.gep(@lv, bufp, b.sub(k32, ab)))
         br_next(pc)
+        return if spec # miss edge deopts — no merge, provenance survives
         b.position_at_end(slow)
         call_fp(:settable, [@interp, @clp, @base, @i32.const_int(pc),
           @i32.const_int(a), @i32.const_int(br), @i32.const_int(cr)])
@@ -1312,7 +1355,8 @@ module Lua::JIT
       private def emit_str_gettable(pc : Int32, a : Int32, br : Int32, cr : Int32,
                                     kaddr : UInt64) : Nil
         b = @b
-        slow = new_block("sgtslow#{pc}")
+        spec = spec_clean?(pc)
+        slow = spec ? deopt_at(pc, "sgt") : new_block("sgtslow#{pc}")
         # R[B]: plain table with nil metatable (cached per block, @tabs)
         tbl = guard_table(pc, br, "sgt", slow)
         valp, miss = str_probe_begin(pc, tbl, kaddr, "sgt")
@@ -1321,7 +1365,8 @@ module Lua::JIT
         kill(a)
         br_next(pc)
         b.position_at_end(miss)
-        b.br(slow)
+        b.br(slow) # the deopt block in spec mode
+        return if spec
         b.position_at_end(slow)
         call_fp(:gettable, [@interp, @clp, @base, @i32.const_int(pc),
           @i32.const_int(a), @i32.const_int(br), @i32.const_int(cr), slot(a)])
@@ -1337,7 +1382,8 @@ module Lua::JIT
       private def emit_str_settable(pc : Int32, a : Int32, br : Int32, cr : Int32,
                                     kaddr : UInt64) : Nil
         b = @b
-        slow = new_block("sstslow#{pc}")
+        spec = spec_clean?(pc)
+        slow = spec ? deopt_at(pc, "sst") : new_block("sstslow#{pc}")
         # R[A]: plain table with nil metatable (cached per block, @tabs)
         tbl = guard_table(pc, a, "sst", slow)
         vv = load_slot(cr)
@@ -1349,7 +1395,8 @@ module Lua::JIT
         b.store(vv, valp)
         br_next(pc)
         b.position_at_end(miss)
-        b.br(slow)
+        b.br(slow) # the deopt block in spec mode
+        return if spec
         b.position_at_end(slow)
         call_fp(:settable, [@interp, @clp, @base, @i32.const_int(pc),
           @i32.const_int(a), @i32.const_int(br), @i32.const_int(cr)])
@@ -1370,7 +1417,8 @@ module Lua::JIT
           return
         end
         kaddr = Lua.intern(k).as(Void*).address
-        slow = new_block("slfslow#{pc}")
+        spec = spec_clean?(pc)
+        slow = spec ? deopt_at(pc, "slf") : new_block("slfslow#{pc}")
         obj = load_slot(bb)
         # R[B]: plain table with nil metatable (cached per block, @tabs)
         tbl = guard_table(pc, bb, "slf", slow)
@@ -1381,7 +1429,8 @@ module Lua::JIT
         kill(a + 1)
         br_next(pc)
         b.position_at_end(miss)
-        b.br(slow)
+        b.br(slow) # the deopt block in spec mode
+        return if spec
         b.position_at_end(slow)
         call_fp(:self, [@interp, @clp, @base, @i32.const_int(pc),
           @i32.const_int(a), @i32.const_int(bb), @i32.const_int(kidx), slot(a)])

@@ -906,6 +906,12 @@ module Lua
   # with deopt guards; set bits make it emit the polymorphic shape.
   FB_STR = 1_u8 # string operands (arith coercion, string compares)
   FB_OTH = 2_u8 # any other non-number shape (metamethods, mixed compares)
+  # Table-op shapes (GETTABLE/SETTABLE/SELF) outside the speculated fast
+  # path (non-table object, metatable, non-number/non-integral key, out-of-
+  # bounds, string-probe miss): recorded by jit_deopt itself — a deopt on a
+  # table op IS the sample. The next compile emits the polymorphic
+  # helper-fallback variant at this pc (same as pre-M3.6 code).
+  FB_TMISS = 4_u8
 
   class Proto
     property code = [] of Inst

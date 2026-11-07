@@ -176,6 +176,13 @@ fun jit_weakcheck(interp : Void*) : Int32
 end
 
 module Lua
+  # Opcodes whose mono-numeric guard failure records an operand-shape
+  # feedback bit in jit_deopt (mirrors the interpreter slow-path sampling
+  # that runs a moment later on the very same instruction).
+  OPC_ARITH = [Op::ADD, Op::SUB, Op::MUL, Op::DIV, Op::MOD, Op::POW,
+               Op::UNM].map(&.value)
+  OPC_CMP = [Op::EQ, Op::NEQ, Op::LT, Op::LE].map(&.value)
+
   class Interp
     # LuaError raised somewhere under a JIT invocation; re-raised by the
     # Crystal boundary (JIT.invoke), never unwound through machine frames.
@@ -468,11 +475,37 @@ module Lua
     # a duplicate.
     def jit_deopt(cl : LuaClosure, base : Int32, pc : Int32, want : Int32) : Int32
       p = cl.proto
+      # A deopt IS the feedback sample (M3.6): record the shape the guards
+      # rejected at this pc so the next compile specializes for it. Table
+      # ops record FB_TMISS (polymorphic helper fallback); mono-numeric
+      # arith/unm/cmp record the operand shape exactly as the interpreter
+      # slow path would a moment later (it re-runs this very instruction).
+      if (w = p.packed[pc]?) && (opc = (w & 0xFF).to_u8!)
+        if opc == Op::GETTABLE.value || opc == Op::SETTABLE.value ||
+           opc == Op::SELF.value
+          p.fb_record(pc, Lua::FB_TMISS)
+        elsif Lua::OPC_ARITH.includes?(opc) || Lua::OPC_CMP.includes?(opc)
+          br = ((w >> 24).to_i64! << 44 >> 44).to_i32!
+          cr = ((w >> 44).to_i64! << 44 >> 44).to_i32!
+          l = @stack[base + br]?
+          r = @stack[base + cr]?
+          str = Lua::OPC_ARITH.includes?(opc) ?
+              (l.is_a?(String) || r.is_a?(String)) :
+              (l.is_a?(String) && r.is_a?(String))
+          p.fb_record(pc, str ? Lua::FB_STR : Lua::FB_OTH)
+        end
+      end
       if @fsize > 0 && (tf = @frames[@fsize - 1]) && tf.closure.same?(cl) && tf.base == base
         # OSR continuation: keep the frame — the machine-code caller
-        # (osr_run in vm.cr) completes its return when we hand control back
+        # (osr_run in vm.cr) completes its return when we hand control back.
+        # Drift-recompile BEFORE the interpreted continuation: with fresh
+        # machine code installed the frame may re-OSR at its next back-edge
+        # (osr_blocked cleared), so a once-called frame (main chunk) does
+        # not crawl in the interpreter for the rest of the loop after a
+        # single speculative miss. Without a recompile the block stays —
+        # re-entering the same code would deopt-loop forever.
         tf.pc = pc
-        tf.osr_blocked = true
+        tf.osr_blocked = !JIT.recompile_widened(self, cl)
         vals = run_frames(@fsize - 1, base)
         @fsize += 1 # run_frames' ensure retired the entry frame; restore it
         # the JIT entry contract wants results at stack[base..]
@@ -481,7 +514,6 @@ module Lua
           @stack[base + i] = vals[i]
           i += 1
         end
-        JIT.on_deopt(self, cl)
         return vals.size
       end
       ensure_stack(base + p.max_stack + 4)
