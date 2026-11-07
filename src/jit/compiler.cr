@@ -148,6 +148,10 @@ module Lua::JIT
     # compiled (see compile)
     @@osr_heads = Set(Int32).new
     @@preds = [] of Int32
+    # numeric-for loop regions (FORLOOP pc -> {head, A}) for loop phis
+    @@forloops = Hash(Int32, {Int32, Int32}).new
+    # true when the proto being compiled has no CLOSURE opcode (see compile)
+    class_getter? no_upvs = false
     # Keep-alives: ORC code and its context must outlive the closures
     # pointing into it; the Crystal GC would free them otherwise.
     @@keep = [] of LLVM::Orc::ThreadSafeContext
@@ -207,6 +211,48 @@ module Lua::JIT
       heads.each { |hpc| edge.call(hpc) }
       @@preds = preds
 
+      # Numeric-for loop regions for loop-carried SSA (phi) values:
+      # FORLOOP pc -> {head pc, control base A}. The FORPREP must jump to
+      # the FORLOOP (codegen invariant) — that edge bypasses the head, so
+      # the phi pattern is two-level (see emit_forloop/emit_forprep).
+      # INNERMOST loops only: a phi in the head block dominates its uses
+      # only while no other loop head sits inside the body — an OSR entry
+      # into a nested loop head bypasses this head, and the phi register
+      # would read garbage there (module verification rejects the
+      # dominance violation; the outer loop then keeps its slot loads).
+      forloops = Hash(Int32, {Int32, Int32}).new
+      prep_at = Hash(Int32, Int32).new # FORLOOP pc -> FORPREP's A
+      back_tgts = Set(Int32).new
+      p.packed.each_with_index do |w, pc|
+        op = (w & 0xFF).to_u8!.unsafe_as(Op)
+        off = ((w >> 24).to_i64! << 44 >> 44).to_i32!
+        case op
+        when .jmp?, .jmpf?, .jmpt?, .forloop?
+          back_tgts << (pc + 1 + off) if off < 0
+        end
+      end
+      p.packed.each_with_index do |w, pc|
+        op = (w & 0xFF).to_u8!.unsafe_as(Op)
+        a = ((w >> 8).to_i64! << 48 >> 48).to_i32!
+        off = ((w >> 24).to_i64! << 44 >> 44).to_i32!
+        case op
+        when .forprep? then prep_at[pc + 1 + off] = a
+        when .forloop?
+          if off < 0 && prep_at[pc]? == a
+            head = pc + 1 + off
+            inner = back_tgts.any? { |t| t > head && t < pc }
+            forloops[pc] = {head, a} unless inner
+          end
+        end
+      end
+      @@forloops = forloops
+
+      # Upvalue-free protos: no CLOSURE opcode anywhere means nothing can
+      # ever capture this frame's slots, so the FORLOOP back-edge
+      # close_upvals check (open_max >= base+A) is dead — only the weak
+      # gate remains (JIT.md 1.3 invariants).
+      @@no_upvs = !p.packed.any? { |w| (w & 0xFF).to_u8! == Op::CLOSURE.value }
+
       @@sym += 1
       sym = "lua5jit#{@@sym}"
       ctx = LLVM::Context.new
@@ -220,9 +266,13 @@ module Lua::JIT
       mod.target = tm.triple
       mod.data_layout = tm.data_layout
       gen(cl, ctx, mod, sym)
-      mod.verify
       if d = ENV["LUA5_JIT_DUMP"]?
         File.write("#{d}/#{@@sym}-pre.ll", mod.to_s)
+      end
+      begin
+        mod.verify
+      rescue e : Exception
+        raise CompileBail.new("verify: #{e.message}")
       end
       optimize!(mod)
       if d = ENV["LUA5_JIT_DUMP"]?
@@ -345,7 +395,8 @@ module Lua::JIT
                      @helpers : Hash(Symbol, LLVM::Function),
                      @helper_types : Hash(Symbol, LLVM::Type), @blocks,
                      entry : LLVM::BasicBlock, stack0 : LLVM::Value,
-                     osr_heads : Set(Int32), @preds : Array(Int32))
+                     osr_heads : Set(Int32), @preds : Array(Int32),
+                     @forloops : Hash(Int32, {Int32, Int32}))
         @b = @ctx.new_builder
         @i8 = @ctx.int8
         @i32 = @ctx.int32
@@ -365,6 +416,30 @@ module Lua::JIT
         @want = want
         @code = @cl.proto.packed
         @consts = @cl.proto.consts
+        # Loop-carried SSA (phi) values for numeric-for controls, by block:
+        # FORLOOP pc -> {ctrl, limit, step} phis; head pc -> same. The
+        # head phis carry values into the body, the FORLOOP phis merge the
+        # FORPREP entry values with the back-edge values (see
+        # emit_forprep/emit_forloop/br_next).
+        @phi_fl = Hash(Int32, {LLVM::Value, LLVM::Value, LLVM::Value}).new
+        @phi_head = Hash(Int32, {LLVM::Value, LLVM::Value, LLVM::Value}).new
+        # head pc -> {FORLOOP pc, A} (reverse of @forloops)
+        @for_by_head = Hash(Int32, {Int32, Int32}).new
+        @forloops.each do |flpc, ha|
+          @for_by_head[ha[0]] = {flpc, ha[1]}
+        end
+        # OSR for-head load blocks (see the switch below)
+        @osr_ldr = Hash(Int32, {LLVM::BasicBlock, LLVM::Value, LLVM::Value, LLVM::Value}).new
+        # Create ALL for-loop phis up front (FORPREP is emitted before its
+        # FORLOOP block, so phis must exist before any block is filled).
+        # Blocks are still empty — the phis land first, as LLVM requires.
+        @forloops.each do |flpc, ha|
+          head, a = ha
+          b.position_at_end(@blocks[head])
+          @phi_head[head] = new_phi3("lh#{head}r#{a}")
+          b.position_at_end(@blocks[flpc])
+          @phi_fl[flpc] = new_phi3("lf#{flpc}r#{a}")
+        end
 
         b.position_at_end(entry)
         @scratch = b.alloca(@lv, "scratch")
@@ -380,7 +455,30 @@ module Lua::JIT
         if osr_heads.empty?
           b.br(@blocks[0])
         else
-          cases = osr_heads.map { |hpc| {@i32.const_int(hpc), @blocks[hpc]} }
+          # For-loop heads that are OSR targets route through a small
+          # load block: the raw f64 loads feed the head phis (the
+          # interpreter's FORLOOP guarantees the tags on entry).
+          cases = osr_heads.map do |hpc|
+            if (fa = @for_by_head[hpc]?) && (a = fa[1])
+              ldb = new_block("osrf#{hpc}")
+              b.position_at_end(ldb)
+              cv = load_num_raw(a)
+              lv = load_num_raw(a + 1)
+              sv = load_num_raw(a + 2)
+              b.br(@blocks[hpc])
+              @osr_ldr[hpc] = {ldb, cv, lv, sv}
+              # feed the head phis on the OSR entry edge
+              if (hp = @phi_head[hpc]?)
+                phi_add(hp[0], cv, ldb)
+                phi_add(hp[1], lv, ldb)
+                phi_add(hp[2], sv, ldb)
+              end
+              {@i32.const_int(hpc), ldb}
+            else
+              {@i32.const_int(hpc), @blocks[hpc]}
+            end
+          end
+          b.position_at_end(entry)
           b.switch(f.params[6], @blocks[0], cases)
         end
       end
@@ -392,6 +490,13 @@ module Lua::JIT
           @b.position_at_end(@blocks[pc])
           # numeric SSA survives linear chains; reset where control merges
           kill_all if (@preds[pc]? || 0) > 1
+          if (fa = @for_by_head[pc]?) && (a = fa[1])
+            # loop head: the phis (created up front in initialize) are the
+            # live ctrl/limit/step values for the body; OSR entry loads
+            # were wired when the switch was built
+            hp = @phi_head[pc].not_nil!
+            @nums[a], @nums[a + 1], @nums[a + 2] = hp
+          end
           emit(pc)
           pc += 1
         end
@@ -474,12 +579,17 @@ module Lua::JIT
           br_next(pc)
         when .jmp?
           backedge(pc, bb)
+          wire_forloop_edge(dest(pc, bb))
           b.br(@blocks[dest(pc, bb)])
         when .jmpf?
           backedge(pc, bb)
+          wire_forloop_edge(pc + 1)
+          wire_forloop_edge(dest(pc, bb))
           b.cond(truthy(a), @blocks[pc + 1], @blocks[dest(pc, bb)])
         when .jmpt?
           backedge(pc, bb)
+          wire_forloop_edge(pc + 1)
+          wire_forloop_edge(dest(pc, bb))
           b.cond(truthy(a), @blocks[dest(pc, bb)], @blocks[pc + 1])
         when .getupval?
           call_fp(:getupval, [@clp, @i32.const_int(bb), @scratch])
@@ -631,6 +741,12 @@ module Lua::JIT
         @nums[a + 1] = v1
         store_num(slot(a + 2), v2)
         @nums[a + 2] = v2
+        # feed the FORLOOP-merge phis on the loop-entry edge
+        if (flpc = dest(pc, off); phis = @phi_fl[flpc]?)
+          phi_add(phis[0], s0, cont)
+          phi_add(phis[1], v1, cont)
+          phi_add(phis[2], v2, cont)
+        end
         b.br(@blocks[dest(pc, off)])
       end
 
@@ -641,9 +757,16 @@ module Lua::JIT
       # route to the helper, the common case skips the call entirely.
       private def emit_forloop(pc : Int32, a : Int32, off : Int32) : Nil
         b = @b
-        ctrl0 = load_num_raw(a)
-        lim = load_num_raw(a + 1)
-        ste = load_num_raw(a + 2)
+        # loop-carried SSA: the FORLOOP-block phis merge the FORPREP entry
+        # values with the head phis arriving through the body end (both
+        # edges are wired elsewhere) — the per-iteration slot reloads of
+        # ctrl/limit/step disappear; slots still receive every store
+        # (deopt-anywhere invariant untouched)
+        ctrl0, lim, ste = if (phis = @phi_fl[pc]?)
+                            phis
+                          else
+                            {load_num_raw(a), load_num_raw(a + 1), load_num_raw(a + 2)}
+                          end
         ctrl = b.fadd(ctrl0, ste)
         pos = b.fcmp(LLVM::RealPredicate::OGT, ste, @f64.const_double(0.0))
         t_pos = b.fcmp(LLVM::RealPredicate::OLE, ctrl, lim)
@@ -654,9 +777,12 @@ module Lua::JIT
         b.cond(cond_v, body, exit_b)
         b.position_at_end(body)
         # INLINE_EDGE=0 restores the M2.1 behavior: always take the helper
-        # path (upvalue freezing + weak check live in jit_loopedge)
+        # path (upvalue freezing + weak check live in jit_loopedge).
+        # Upvalue-free protos drop the open_max load: nothing can capture
+        # this frame's slots, the back-edge close_upvals is dead.
         need = if Compiler::INLINE_EDGE
-                b.or(weak_seen(b), b.icmp(LLVM::IntPredicate::SGE,
+                w = weak_seen(b)
+                Compiler.no_upvs? ? w : b.or(w, b.icmp(LLVM::IntPredicate::SGE,
                   b.load(@i32, tbl_fld(@interp, Layout.i_open_max)),
                   b.add(@base, @i32.const_int(a))))
               else
@@ -675,6 +801,13 @@ module Lua::JIT
         b.position_at_end(go)
         store_num(slot(a), ctrl)
         @nums[a] = ctrl
+        # back-edge: the head phis take the incremented control (limit and
+        # step are loop-invariant — their FORLOOP phis flow straight back)
+        if (head = dest(pc, off); hphis = @phi_head[head]?)
+          phi_add(hphis[0], ctrl, go)
+          phi_add(hphis[1], lim, go)
+          phi_add(hphis[2], ste, go)
+        end
         b.br(@blocks[dest(pc, off)])
         b.position_at_end(exit_b)
         br_next(pc)
@@ -1108,6 +1241,24 @@ module Lua::JIT
         @b.insert_block
       end
 
+      # empty f64 phi trio at the current insert point (block must be
+      # empty or the phos precede all instructions — both hold here)
+      private def new_phi3(name : String) : {LLVM::Value, LLVM::Value, LLVM::Value}
+        p0 = LLVM::Value.new LibLLVM.build_phi(@b, @f64, "#{name}c")
+        p1 = LLVM::Value.new LibLLVM.build_phi(@b, @f64, "#{name}l")
+        p2 = LLVM::Value.new LibLLVM.build_phi(@b, @f64, "#{name}s")
+        {p0, p1, p2}
+      end
+
+      # add one incoming edge to a phi
+      private def phi_add(phi : LLVM::Value, v : LLVM::Value, blk : LLVM::BasicBlock) : Nil
+        vals = uninitialized LibLLVM::ValueRef[1]
+        blks = uninitialized LibLLVM::BasicBlockRef[1]
+        vals[0] = v.to_unsafe
+        blks[0] = blk.to_unsafe
+        LibLLVM.add_incoming(phi, vals.to_unsafe, blks.to_unsafe, 1)
+      end
+
       private def new_block(name : String) : LLVM::BasicBlock
         f = @blocks[0].parent.not_nil!
         f.basic_blocks.append(name)
@@ -1115,9 +1266,26 @@ module Lua::JIT
 
       private def br_next(pc : Int32) : Nil
         if pc + 1 < @blocks.size
+          wire_forloop_edge(pc + 1)
           @b.br(@blocks[pc + 1])
         else
           @b.ret(@i32.const_int(0))
+        end
+      end
+
+      # Any branch edge into a FORLOOP pc-block must feed its merge phis:
+      # the values arriving from inside the loop are the head phis (the
+      # body cannot write the for-controls). Called for every jump /
+      # fallthrough target — forward jumps onto a FORLOOP (loop bodies
+      # with while/if tails) are common. Missing incomings would fail
+      # module verification (the closure then stays interpreted).
+      private def wire_forloop_edge(tgt : Int32) : Nil
+        if (ha = @forloops[tgt]?) && (hphis = @phi_head[ha[0]]?) &&
+           (flphis = @phi_fl[tgt]?)
+          here = current_block
+          phi_add(flphis[0], hphis[0], here)
+          phi_add(flphis[1], hphis[1], here)
+          phi_add(flphis[2], hphis[2], here)
         end
       end
 
@@ -1318,7 +1486,7 @@ module Lua::JIT
         helper_types[key] = LLVM::Type.function(sig[0], sig[1])
       end
 
-      Gen.new(cl, ctx, f, helpers, helper_types, blocks, entry, f.params[1], @@osr_heads, @@preds).run
+      Gen.new(cl, ctx, f, helpers, helper_types, blocks, entry, f.params[1], @@osr_heads, @@preds, @@forloops).run
     end
   end
 end
