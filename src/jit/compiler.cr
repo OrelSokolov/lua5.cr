@@ -260,7 +260,9 @@ module Lua::JIT
 
       @@sym += 1
       sym = "lua5jit#{@@sym}"
-      ctx = LLVM::Context.new
+      # See module_context: LLVM 21+ and older LLVM differ in how a module's
+      # context can be wrapped for ORC.
+      ctx, ts_ctx = module_context
       mod = ctx.new_module(sym)
       # Host layout/triple from the start: a bare context has no DataLayout,
       # so LLVM would size { i32, i64 } as 12 bytes (i64 payload at +4) —
@@ -285,7 +287,6 @@ module Lua::JIT
       end
 
       engine = lljit
-      ts_ctx = LLVM::Orc::ThreadSafeContext.new(ctx)
       ts_mod = LLVM::Orc::ThreadSafeModule.new(mod, ts_ctx)
       engine.add_llvm_ir_module(engine.main_jit_dylib, ts_mod)
       @@keep << ts_ctx
@@ -293,6 +294,23 @@ module Lua::JIT
     rescue e : CompileBail
       trace("bail: #{cl.proto.chunkname} #{e.message}")
       nil
+    end
+
+    # Context the module is generated in, paired with the ThreadSafeContext
+    # ORC will receive it in. Wrapping an existing Context needs the
+    # LLVMOrcCreateNewThreadSafeContextFromLLVMContext C entry point (LLVM
+    # 21+; the Crystal bindings stub ThreadSafeContext#new(Context) with
+    # NotImplementedError on older LLVM). There the ThreadSafeContext must
+    # own its context up front — so create it first and hand out the
+    # context it owns.
+    private def self.module_context : {LLVM::Context, LLVM::Orc::ThreadSafeContext}
+      {% if LibLLVM.has_method?(:orc_create_new_thread_safe_context_from_llvm_context) %}
+      ctx = LLVM::Context.new
+      {ctx, LLVM::Orc::ThreadSafeContext.new(ctx)}
+      {% else %}
+      ts_ctx = LLVM::Orc::ThreadSafeContext.new
+      {ts_ctx.context, ts_ctx}
+      {% end %}
     end
 
     def self.trace(msg : String) : Nil
