@@ -8,6 +8,26 @@ module Lua
 
   EMPTY_VALS = [] of LuaValue
 
+  # --- string interning (PUC luaS_newlstr analog) ---
+  # Short strings (<= SHORT_STR_MAX bytes) get one canonical instance per
+  # distinct content. LuaTable keeps string keys in an identity-hashed
+  # store: a lookup is an object_id hash + pointer compare, no siphash
+  # over the bytes and no memcmp (the dominant cost of field access).
+  # Long strings stay by-value (stored in the union hash, compared by
+  # bytes) — as in PUC, where only short strings are interned.
+  SHORT_STR_MAX = 40
+  @@istrs = Hash(String, String).new
+
+  def self.intern(s : String) : String
+    return s if s.bytesize > SHORT_STR_MAX
+    if c = @@istrs[s]?
+      c
+    else
+      @@istrs[s] = s
+      s
+    end
+  end
+
   def self.type_name(v : LuaValue) : String
     case v
     when Nil            then "nil"
@@ -228,21 +248,43 @@ module Lua
     # the documented 5.1 use ("you may erase the key being visited").
     property next_hint_key : LuaValue = nil
     property next_hint_idx : Int32 = -1
-    # Integer keys 1..n live in a flat array (the "array part", as in PUC
-    # Lua); everything else — and integral keys past holes — in the hash.
+    # Integer keys 1..n live in a flat raw buffer (the "array part", as in
+    # PUC Lua); everything else — and integral keys past holes — in the hash.
     # Slots holding nil are holes: raw_get falls through to the hash part.
     # The array part covers one contiguous run base..base+n-1 (PUC Lua
     # always bases it at 1; we also grow from the first integral key, e.g.
-    # 2..N in a sieve — the layout is unobservable).
-    @arr : Array(LuaValue)? = nil
+    # 2..N in a sieve — the layout is unobservable). A hand-managed buffer
+    # instead of Array(LuaValue): unchecked indexed access (no bounds
+    # checks on the interpreter's hot path) and fixed field offsets the
+    # JIT can inline against (probe_layout).
+    @buf : Pointer(LuaValue) = Pointer(LuaValue).null
     @arr_base : Int32 = 1
+    @arr_len : Int32 = 0
+    @arr_cap : Int32 = 0
     @hash = Hash(LuaValue, LuaValue).new
+    # String-key store: identity-hashed over canonical (interned) keys —
+    # the fast path of field access (PUC luaH_getstr). Inserts canonicalize
+    # through Lua.intern; reads that identity-miss retry once with the
+    # canonical instance (a by-value equal key may have entered through a
+    # non-interned producer). All other key types live in @hash.
+    @strs : Hash(String, LuaValue)? = nil
     # last computed #t; maintained by raw_set so the append pattern
     # (table.insert loops, SETLIST) stays amortized O(1) instead of
     # rescanning from 1 on every raw_length
     @len_cache : Int32 = 0
 
     def initialize
+    end
+
+    # JIT layout probe (jit/compiler.cr Layout): byte offsets of the fields
+    # the inlined numeric GETTABLE/SETTABLE fast path reads off the object
+    # pointer. Layout is fixed per build; probed once per process.
+    def probe_offsets : {mt: Int32, buf: Int32, base: Int32, len: Int32}
+      p = self.as(Void*).address
+      {mt:  (pointerof(@metatable).address - p).to_i32!,
+       buf: (pointerof(@buf).address - p).to_i32!,
+       base: (pointerof(@arr_base).address - p).to_i32!,
+       len: (pointerof(@arr_len).address - p).to_i32!}
     end
 
     def check_key(key : LuaValue)
@@ -255,12 +297,27 @@ module Lua
     end
 
     private def arr_get(k : Int32) : LuaValue
-      a = @arr
-      if a && k >= @arr_base && k < @arr_base + a.size
-        a[k - @arr_base]
+      if k >= @arr_base && k < @arr_base + @arr_len
+        @buf[k - @arr_base]
       else
         nil
       end
+    end
+
+    # grow the raw buffer to hold at least `min` slots; new slots are
+    # nil-filled (unions must never hold garbage tags — the GC scans them)
+    private def buf_grow(min : Int32) : Nil
+      return if min <= @arr_cap
+      nc = {@arr_cap * 2, min, 8}.max
+      nb = Pointer(LuaValue).malloc(nc)
+      @buf.copy_to(nb, @arr_len)
+      i = @arr_len
+      while i < nc
+        nb[i] = nil.as(LuaValue)
+        i += 1
+      end
+      @buf = nb
+      @arr_cap = nc
     end
 
     # Float64 Lua key → Int32 iff integral and in range; nil otherwise.
@@ -288,6 +345,26 @@ module Lua
         end
       elsif key.nil?
         return nil
+      elsif key.is_a?(String)
+        # long strings are not interned (PUC semantics): by-value store
+        if key.bytesize > Lua::SHORT_STR_MAX
+          v = @hash[key]?
+          return v.nil? ? nil : v
+        end
+        if s = @strs
+          if (v = s[key]?) != nil
+            return v.nil? ? nil : v
+          end
+          # miss: a by-value equal key may be stored under its canonical
+          # instance (a producer bypassed the intern choke points)
+          c = Lua.intern(key)
+          if !c.same?(key)
+            if (v = s[c]?) != nil
+              return v.nil? ? nil : v
+            end
+          end
+        end
+        return nil
       end
       v = @hash[key]?
       v.nil? ? nil : v
@@ -309,15 +386,53 @@ module Lua
         end
         return
       end
+      if key.is_a?(String)
+        # long strings stay by-value (not interned — see @strs comment)
+        if key.bytesize > Lua::SHORT_STR_MAX
+          if val.nil?
+            @hash.delete(key)
+          else
+            @hash[key] = val
+          end
+          return
+        end
+        s = @strs
+        if s.nil?
+          # identity store: canonicalize the FIRST time a string key lands
+          s = Hash(String, LuaValue).new.compare_by_identity
+          @strs = s
+          # pull by-value string keys already parked in @hash (rare: only
+          # between the array/hash split and the first string-key insert)
+          @hash.keys.each do |hk|
+            if hk.is_a?(String) && !(hv = @hash[hk]?).nil?
+              s[Lua.intern(hk)] = hv
+              @hash.delete(hk)
+            end
+          end
+        end
+        if val.nil?
+          s.delete(key)
+          c = Lua.intern(key)
+          s.delete(c) unless c.same?(key)
+          return
+        end
+        unless s.has_key?(key)
+          key = Lua.intern(key) # inserts are canonical (see @strs comment)
+        end
+        s[key] = val
+        return
+      end
       if key.is_a?(Float64) && (k = int_key(key))
         @len_cache = k - 1 if val.nil? && k <= @len_cache
-        if a = @arr
-          if k >= @arr_base && k < @arr_base + a.size
-            a[k - @arr_base] = val # val may be nil: stays as a hole
+        if @arr_len > 0
+          if k >= @arr_base && k < @arr_base + @arr_len
+            @buf[k - @arr_base] = val # val may be nil: stays as a hole
             return
-          elsif k == @arr_base + a.size && !val.nil?
-            a << val
-            migrate_from_hash(a)
+          elsif k == @arr_base + @arr_len && !val.nil?
+            buf_grow(@arr_len + 1)
+            @buf[@arr_len] = val
+            @arr_len += 1
+            migrate_from_hash
             return
           end
           if val.nil?
@@ -326,10 +441,11 @@ module Lua
           end
         else
           if !val.nil?
-            a = [val] of LuaValue
-            @arr = a
+            buf_grow(1)
+            @buf[0] = val
+            @arr_len = 1
             @arr_base = k
-            migrate_from_hash(a)
+            migrate_from_hash
             return
           end
         end
@@ -343,13 +459,15 @@ module Lua
 
     # Pull consecutive integer keys that were parked in the hash (set before
     # the array part reached them) into the array part.
-    private def migrate_from_hash(a : Array(LuaValue)) : Nil
+    private def migrate_from_hash : Nil
       loop do
-        k = (@arr_base + a.size).to_f64
+        k = (@arr_base + @arr_len).to_f64
         v = @hash[k]?
         break if v.nil?
         @hash.delete(k)
-        a << v
+        buf_grow(@arr_len + 1)
+        @buf[@arr_len] = v
+        @arr_len += 1
       end
     end
 
@@ -361,14 +479,16 @@ module Lua
         vals.each_with_index { |v, i| raw_set((start + i).to_f64, v) }
         return
       end
-      if (a = @arr) && start == @arr_base + a.size
-        vals.each { |v| a << v }
-        migrate_from_hash(a)
-      elsif @arr.nil? && start >= 1
-        a = vals.dup
-        @arr = a
+      if @arr_len > 0 && start == @arr_base + @arr_len
+        buf_grow(@arr_len + vals.size)
+        vals.each { |v| @buf[@arr_len] = v; @arr_len += 1 }
+        migrate_from_hash
+      elsif @arr_len == 0 && start >= 1
+        buf_grow(vals.size)
+        vals.each_with_index { |v, i| @buf[i] = v }
+        @arr_len = vals.size
         @arr_base = start
-        migrate_from_hash(a)
+        migrate_from_hash
       else
         vals.each_with_index { |v, i| raw_set((start + i).to_f64, v) }
       end
@@ -382,6 +502,15 @@ module Lua
       if key.is_a?(Float64) && (k = int_key(key))
         v = arr_get(k)
         return true unless v.nil?
+      elsif key.is_a?(String)
+        if key.bytesize <= Lua::SHORT_STR_MAX
+          if s = @strs
+            return true if s.has_key?(key)
+            c = Lua.intern(key)
+            return true if !c.same?(key) && s.has_key?(c)
+          end
+          return false
+        end
       end
       @hash.has_key?(key)
     end
@@ -415,8 +544,8 @@ module Lua
     end
 
     private def slot_filled?(k : Int32) : Bool
-      if (a = @arr) && k >= @arr_base && k < @arr_base + a.size
-        !a[k - @arr_base].nil?
+      if k >= @arr_base && k < @arr_base + @arr_len
+        !@buf[k - @arr_base].nil?
       else
         @hash.has_key?(k.to_f64)
       end
@@ -428,11 +557,9 @@ module Lua
         wi.each { |(kb, _vb)| keys << kb.v }
         return keys
       end
-      keys = Array(LuaValue).new((@arr.try(&.size) || 0) + @hash.size)
-      if a = @arr
-        base = @arr_base
-        a.each_with_index { |v, i| keys << (base + i).to_f64 unless v.nil? }
-      end
+      keys = Array(LuaValue).new(@arr_len + @hash.size)
+      @arr_len.times { |i| keys << (@arr_base + i).to_f64 unless @buf[i].nil? }
+      @strs.try &.each_key { |k| keys << k }
       keys.concat(@hash.keys)
       keys
     end
@@ -458,7 +585,8 @@ module Lua
             items << {WCell.new(k), WCell.new(v)} unless v.nil?
           end
           @hash.clear
-          @arr = nil
+          @strs = nil
+          @arr_len = 0 # keep @buf/@arr_cap for reuse; slots past len are never read
           @len_cache = 0
         end
         @weak = items
@@ -500,9 +628,8 @@ module Lua
         end
         return
       end
-      if a = @arr
-        a.each { |v| m.mark(v) }
-      end
+      @arr_len.times { |i| m.mark(@buf[i]) }
+      @strs.try &.each_value { |v| m.mark(v) }
       @hash.each { |k, v| m.mark(k); m.mark(v) }
     end
 

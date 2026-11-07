@@ -39,4 +39,45 @@ describe "JIT hotness" do
     r[1].should eq(89.0)
     r[2].should eq(true)
   end
+
+  # M3: inlined numeric GETTABLE/SETTABLE array-part fast path. nil stores
+  # must keep #t correct (len_cache), non-fast shapes (strings, holes,
+  # metamethods, non-integral keys) take the helper and stay exact.
+  it "inlined table fast path keeps semantics" do
+    r = lua_run(<<-LUA)
+      local function warm(f) for i = 1, #{Lua::JIT::THRESHOLD + 100} do f(i) end end
+      local t, s = {}, 0
+      warm(function(i) t[i] = i end)          -- appends (helper path)
+      warm(function(i) s = s + t[i] end)      -- in-bounds reads (fast path)
+      warm(function(i) t[i] = i * 2 end)      -- in-bounds writes (fast path)
+      local nils = 0
+      warm(function(i) if t[3] == nil then nils = nils + 1 end end)
+      t[3] = nil                               -- nil store: len_cache update
+      warm(function(i) t[5] = i + 0.5 end)     -- non-integral? no: value; key is integral
+      local r = {}
+      r[1] = #t
+      r[2] = (t[2.5] == nil)                   -- non-integral key -> hash part
+      r[3] = (t[1001] == nil)                  -- out of array range
+      r[4] = (t["2"] == nil)                   -- string key miss (2.0 ~= "2")
+      local mt = setmetatable({}, {__index = function(_, k) return k * 10 end})
+      warm(function(i) s = s + mt[i] end)      -- metatable -> helper path
+      r[5] = mt[7]
+      local h = {[1] = "a"}                     -- single-entry array part
+      warm(function(i) if h[1] ~= "a" then error("h1") end end)
+      r[6] = h[1]
+      t[3] = nil
+      local u = {} for i = 1, 10 do u[i] = i end u[3] = nil
+      warm(function(i) t[u[2]] = 5 end)
+      r[7] = #u
+      return s > 0, unpack(r)
+    LUA
+    r[0].should be_true
+    r[1].should eq(2.0) # #t after t[3]=nil (first border)
+    r[2].should be_true
+    r[3].should be_true
+    r[4].should be_true
+    r[5].should eq(70.0)
+    r[6].should eq("a")
+    r[7].should eq(2.0)
+  end
 end

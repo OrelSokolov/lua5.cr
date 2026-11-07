@@ -7,10 +7,6 @@
 module Lua
   class Compiler
     @fs : FuncState? = nil
-    # String pool: identical string constants across protos share one
-    # instance, so runtime hash lookups hit String#=='s same? fast path
-    # instead of memcmp (PUC Lua's short-string interning, compile-time).
-    @strings = Hash(String, String).new
 
     def initialize(@chunkname : String, @src : String = "")
       @line = 0
@@ -189,12 +185,10 @@ module Lua
 
     private def konst(v : LuaValue) : Int32
       if v.is_a?(String)
-        pooled = @strings[v]?
-        if pooled.nil?
-          @strings[v] = v
-        else
-          v = pooled
-        end
+        # global canonical instance (Lua.intern): constants across chunks
+        # share one object, so identity-hash table lookups with constant
+        # keys hit on the first probe
+        v = Lua.intern(v)
       end
       p = fs.proto
       p.consts.each_with_index do |k, i|

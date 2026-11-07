@@ -42,6 +42,13 @@ module Lua::JIT
     class_getter tag_num : Int32 = -1
     class_getter tag_bool : Int32 = -1
     class_getter tag_str : Int32 = -1
+    class_getter tag_table : Int32 = -1
+    # LuaTable field byte offsets (LuaTable#probe_offsets) for the inlined
+    # GETTABLE/SETTABLE array-part fast path
+    class_getter tbl_mt : Int32 = -1
+    class_getter tbl_buf : Int32 = -1
+    class_getter tbl_base : Int32 = -1
+    class_getter tbl_len : Int32 = -1
 
     @@probed = false
 
@@ -51,10 +58,18 @@ module Lua::JIT
       buf[0] = 1.5
       buf[1] = true
       buf[3] = "x"
+      tbl = LuaTable.new
+      buf[2] = tbl
       tags = buf.as(Pointer(Int32))
       @@tag_num = tags[0]
       @@tag_bool = tags[4]
       @@tag_str = tags[12]
+      @@tag_table = tags[8]
+      o = tbl.probe_offsets
+      @@tbl_mt = o[:mt]
+      @@tbl_buf = o[:buf]
+      @@tbl_base = o[:base]
+      @@tbl_len = o[:len]
       @@probed = true
     end
   end
@@ -67,8 +82,10 @@ module Lua::JIT
   module Compiler
     @@lljit : LLVM::Orc::LLJIT? = nil
     @@sym = 0
-    # OSR entry points of the proto being compiled (see compile)
+    # OSR entry points and block predecessor counts of the proto being
+    # compiled (see compile)
     @@osr_heads = Set(Int32).new
+    @@preds = [] of Int32
     # Keep-alives: ORC code and its context must outlive the closures
     # pointing into it; the Crystal GC would free them otherwise.
     @@keep = [] of LLVM::Orc::ThreadSafeContext
@@ -100,6 +117,33 @@ module Lua::JIT
         end
       end
       @@osr_heads = heads
+
+      # Control-flow predecessors of each pc-block (fallthrough + jump
+      # targets + OSR switch edges). The numeric SSA map survives a linear
+      # single-predecessor chain and must reset where states merge.
+      preds = Array(Int32).new(p.packed.size + 1, 0)
+      edge = ->(t : Int32) { preds[t] += 1 if t < preds.size }
+      p.packed.each_with_index do |w, pc|
+        op = (w & 0xFF).to_u8!.unsafe_as(Op)
+        off = ((w >> 24).to_i64! << 44 >> 44).to_i32!
+        case op
+        when .jmp?        then edge.call(pc + 1 + off)
+        when .jmpf?, .jmpt?
+          edge.call(pc + 1 + off)
+          edge.call(pc + 1)
+        when .forprep?    then edge.call(pc + 1 + off)
+        when .forloop?
+          edge.call(pc + 1 + off)
+          edge.call(pc + 1)
+        when .tailcall?, .tforcall?, .vararg?, .return?
+          # terminal: machine code returns control
+        else
+          edge.call(pc + 1)
+        end
+      end
+      edge.call(0) # function entry
+      heads.each { |hpc| edge.call(hpc) }
+      @@preds = preds
 
       @@sym += 1
       sym = "lua5jit#{@@sym}"
@@ -141,6 +185,7 @@ module Lua::JIT
 
     private class Gen
       getter b : LLVM::Builder
+      getter i8 : LLVM::Type
       getter i32 : LLVM::Type
       getter i64 : LLVM::Type
       getter f64 : LLVM::Type
@@ -160,13 +205,20 @@ module Lua::JIT
       getter cl : LuaClosure
       getter code : Array(UInt64)
       getter consts : Array(LuaValue)
+      # Numeric SSA: register -> f64 SSA value proven to equal the slot's
+      # current content, valid within the current block only (cleared at
+      # block boundaries and around any runtime call). Slots still receive
+      # every store — this only removes redundant loads and tag guards
+      # (the deopt-anywhere invariant is untouched).
+      @nums = Hash(Int32, LLVM::Value).new
 
       def initialize(@cl, @ctx : LLVM::Context, f : LLVM::Function,
                      @helpers : Hash(Symbol, LLVM::Function),
                      @helper_types : Hash(Symbol, LLVM::Type), @blocks,
                      entry : LLVM::BasicBlock, stack0 : LLVM::Value,
-                     osr_heads : Set(Int32))
+                     osr_heads : Set(Int32), @preds : Array(Int32))
         @b = @ctx.new_builder
+        @i8 = @ctx.int8
         @i32 = @ctx.int32
         @i64 = @ctx.int64
         @f64 = @ctx.double
@@ -205,6 +257,8 @@ module Lua::JIT
         pc = 0
         while pc < n
           @b.position_at_end(@blocks[pc])
+          # numeric SSA survives linear chains; reset where control merges
+          @nums.clear if (@preds[pc]? || 0) > 1
           emit(pc)
           pc += 1
         end
@@ -224,13 +278,21 @@ module Lua::JIT
           r = a
           while r <= a + bb
             store_scalar(slot(r), @i32.const_int(0), @i64.const_int(0))
+            @nums.delete(r)
             r += 1
           end
           br_next(pc)
         when .loadbool?
           store_scalar(slot(a), @i32.const_int(Layout.tag_bool), @i64.const_int(bb != 0 ? 1 : 0))
+          @nums.delete(a)
           br_next(pc)
         when .move?
+          # numeric provenance travels with the value
+          if v = @nums[bb]?
+            @nums[a] = v
+          else
+            @nums.delete(a)
+          end
           b.store(load_slot(bb), slot(a))
           br_next(pc)
         when .add?, .sub?, .mul?, .div?, .mod?, .pow?
@@ -241,18 +303,22 @@ module Lua::JIT
                 when .sub? then b.fsub(l, r)
                 when .mul? then b.fmul(l, r)
                 when .div? then b.fdiv(l, r)
-                when .mod? then call_fp(:mod_fn, [l, r])
-                else            call_fp(:pow, [l, r])
+                when .mod? then call_fp_pure(:mod_fn, [l, r])
+                else            call_fp_pure(:pow, [l, r])
                 end
           store_num(slot(a), res)
+          @nums[a] = res
           br_next(pc)
         when .unm?
           v = guard_num(pc, bb)
-          store_num(slot(a), b.fneg(v))
+          res = b.fneg(v)
+          store_num(slot(a), res)
+          @nums[a] = res
           br_next(pc)
         when .not?
           t = truthy(bb)
           store_bool(slot(a), b.not(t))
+          @nums.delete(a)
           br_next(pc)
         when .eq?, .neq?, .lt?, .le?
           l = guard_num(pc, bb)
@@ -264,6 +330,7 @@ module Lua::JIT
               else            b.fcmp(LLVM::RealPredicate::OLE, l, r)
               end
           store_bool(slot(a), t)
+          @nums.delete(a)
           br_next(pc)
         when .jmp?
           backedge(pc, bb)
@@ -288,13 +355,9 @@ module Lua::JIT
           call_fp(:setupval, [@clp, @i32.const_int(bb), slot(a)])
           br_next(pc)
         when .gettable?
-          call_fp(:gettable, [@interp, @clp, @base, @i32.const_int(pc),
-            @i32.const_int(a), @i32.const_int(bb), @i32.const_int(cc), slot(a)])
-          br_next(pc)
+          emit_gettable(pc, a, bb, cc)
         when .settable?
-          call_fp(:settable, [@interp, @clp, @base, @i32.const_int(pc),
-            @i32.const_int(a), @i32.const_int(bb), @i32.const_int(cc)])
-          br_next(pc)
+          emit_settable(pc, a, bb, cc)
         when .self?
           call_fp(:self, [@interp, @clp, @base, @i32.const_int(pc),
             @i32.const_int(a), @i32.const_int(bb), @i32.const_int(cc), slot(a)])
@@ -376,15 +439,19 @@ module Lua::JIT
         case k
         when Float64
           store_num(slot(a), @f64.const_double(k))
+          @nums[a] = @f64.const_double(k)
         when Bool
           store_scalar(slot(a), @i32.const_int(Layout.tag_bool), @i64.const_int(k ? 1 : 0))
+          @nums.delete(a)
         when String
           # proto.consts keeps the string alive (closure -> proto -> consts);
           # Boehm is non-moving, so the object pointer is stable. NOTE: the
           # union payload holds the String OBJECT address, not char*.
           store_scalar(slot(a), @i32.const_int(Layout.tag_str), @i64.const_int(k.as(Void*).address.to_i64!))
+          @nums.delete(a)
         else
           store_scalar(slot(a), @i32.const_int(0), @i64.const_int(0))
+          @nums.delete(a)
         end
         br_next(pc)
       end
@@ -406,9 +473,13 @@ module Lua::JIT
         st = call_fp(:deopt, [@interp, @clp, @base, @i32.const_int(pc), @want])
         b.ret(st)
         b.position_at_end(cont)
-        store_num(slot(a), b.fsub(v0, v2))
+        s0 = b.fsub(v0, v2)
+        store_num(slot(a), s0)
+        @nums[a] = s0
         store_num(slot(a + 1), v1)
+        @nums[a + 1] = v1
         store_num(slot(a + 2), v2)
+        @nums[a + 2] = v2
         b.br(@blocks[dest(pc, off)])
       end
 
@@ -440,6 +511,7 @@ module Lua::JIT
         b.ret(d)
         b.position_at_end(go)
         store_num(slot(a), ctrl)
+        @nums[a] = ctrl
         b.br(@blocks[dest(pc, off)])
         b.position_at_end(exit_b)
         br_next(pc)
@@ -469,6 +541,148 @@ module Lua::JIT
           b.store(b.add(@base, @i32.const_int(a + {want_v, 0}.max)), @cur_top)
         end
         br_next(pc)
+      end
+
+      # GETTABLE A B C: R[A] := R[B][R[C]] — numeric-key fast path. R[B] a
+      # plain table (nil metatable: no metamethods, not weak), R[C] a
+      # number whose integral value lands in the array part and hits a
+      # non-hole slot → one 16-byte load; no runtime call, so numeric
+      # provenance of OTHER registers stays valid on this path. Anything
+      # else (string keys, non-integral keys, hash-part keys, holes,
+      # metamethods, non-tables) takes the helper — a non-number key or
+      # non-table object is legal Lua, not a deopt.
+      private def emit_gettable(pc : Int32, a : Int32, br : Int32, cr : Int32) : Nil
+        b = @b
+        if @nums[br]?
+          # R[B] proven numeric — cannot be a table; getindex on a number
+          # (error/metamethod) is the helper's job
+          call_fp(:gettable, [@interp, @clp, @base, @i32.const_int(pc),
+            @i32.const_int(a), @i32.const_int(br), @i32.const_int(cr), slot(a)])
+          br_next(pc)
+          return
+        end
+        slow = new_block("gtslow#{pc}")
+        vb = load_slot(br)
+        ok = new_block("gt#{pc}tab")
+        b.cond(b.icmp(LLVM::IntPredicate::EQ, b.extract_value(vb, 0),
+          @i32.const_int(Layout.tag_table)), ok, slow)
+        b.position_at_end(ok)
+        tbl = payload_ptr(vb)
+        mt = b.load(@i64, tbl_fld(tbl, Layout.tbl_mt))
+        ok = new_block("gt#{pc}mt")
+        b.cond(b.icmp(LLVM::IntPredicate::EQ, mt, @i64.const_int(0)), ok, slow)
+        b.position_at_end(ok)
+        kf = if v = @nums[cr]?
+               v # provenance guarantees the number tag
+             else
+               vc = load_slot(cr)
+               ok = new_block("gt#{pc}num")
+               b.cond(b.icmp(LLVM::IntPredicate::EQ, b.extract_value(vc, 0),
+                 @i32.const_int(Layout.tag_num)), ok, slow)
+               b.position_at_end(ok)
+               b.bit_cast(b.extract_value(vc, 1), @f64)
+             end
+        # integrality: int32 range first (fptosi of out-of-range/NaN is
+        # poison), then trunc == value
+        inr = b.and(b.fcmp(LLVM::RealPredicate::OGE, kf, @f64.const_double(-2147483648.0)),
+          b.fcmp(LLVM::RealPredicate::OLT, kf, @f64.const_double(2147483648.0)))
+        ok = new_block("gt#{pc}ir")
+        b.cond(inr, ok, slow)
+        b.position_at_end(ok)
+        k32 = fp_to_si(kf, @i32)
+        ok = new_block("gt#{pc}ic")
+        b.cond(b.fcmp(LLVM::RealPredicate::OEQ, si_to_fp(k32, @f64), kf), ok, slow)
+        b.position_at_end(ok)
+        ab = b.load(@i32, tbl_fld(tbl, Layout.tbl_base))
+        al = b.load(@i32, tbl_fld(tbl, Layout.tbl_len))
+        ok = new_block("gt#{pc}b")
+        b.cond(b.and(b.icmp(LLVM::IntPredicate::SGE, k32, ab),
+          b.icmp(LLVM::IntPredicate::SLT, k32, b.add(ab, al))), ok, slow)
+        b.position_at_end(ok)
+        bufp = b.load(@lv_ptr, tbl_fld(tbl, Layout.tbl_buf))
+        v = b.load(@lv, b.gep(@lv, bufp, b.sub(k32, ab)))
+        # nil slot = hole, but the hash part may still hold the key → helper
+        ok = new_block("gt#{pc}hit")
+        b.cond(b.icmp(LLVM::IntPredicate::EQ, b.extract_value(v, 0), @i32.const_int(0)),
+          slow, ok)
+        b.position_at_end(ok)
+        b.store(v, slot(a))
+        br_next(pc)
+        b.position_at_end(slow)
+        call_fp(:gettable, [@interp, @clp, @base, @i32.const_int(pc),
+          @i32.const_int(a), @i32.const_int(br), @i32.const_int(cr), slot(a)])
+        br_next(pc)
+        # merge: the slow path ran arbitrary Lua (provenance void), so the
+        # map cannot be trusted past this instruction
+        @nums.clear
+      end
+
+      # SETTABLE A B C: R[A][R[B]] := R[C] — same fast-path shape as
+      # emit_gettable. In-bounds stores of any value (nil = hole) match
+      # raw_set's array branch; @len_cache needs no update (a hint only —
+      # raw_length re-derives past stale values). Appends, hash-part keys
+      # and metamethods take the helper.
+      private def emit_settable(pc : Int32, a : Int32, br : Int32, cr : Int32) : Nil
+        b = @b
+        if @nums[a]?
+          # R[A] proven numeric — cannot be a table (setindex on a number
+          # raises or fires metamethods — helper)
+          call_fp(:settable, [@interp, @clp, @base, @i32.const_int(pc),
+            @i32.const_int(a), @i32.const_int(br), @i32.const_int(cr)])
+          br_next(pc)
+          return
+        end
+        slow = new_block("stslow#{pc}")
+        vt = load_slot(a)
+        ok = new_block("st#{pc}tab")
+        b.cond(b.icmp(LLVM::IntPredicate::EQ, b.extract_value(vt, 0),
+          @i32.const_int(Layout.tag_table)), ok, slow)
+        b.position_at_end(ok)
+        tbl = payload_ptr(vt)
+        mt = b.load(@i64, tbl_fld(tbl, Layout.tbl_mt))
+        ok = new_block("st#{pc}mt")
+        b.cond(b.icmp(LLVM::IntPredicate::EQ, mt, @i64.const_int(0)), ok, slow)
+        b.position_at_end(ok)
+        kf = if v = @nums[br]?
+               v
+             else
+               vb = load_slot(br)
+               ok = new_block("st#{pc}num")
+               b.cond(b.icmp(LLVM::IntPredicate::EQ, b.extract_value(vb, 0),
+                 @i32.const_int(Layout.tag_num)), ok, slow)
+               b.position_at_end(ok)
+               b.bit_cast(b.extract_value(vb, 1), @f64)
+             end
+        inr = b.and(b.fcmp(LLVM::RealPredicate::OGE, kf, @f64.const_double(-2147483648.0)),
+          b.fcmp(LLVM::RealPredicate::OLT, kf, @f64.const_double(2147483648.0)))
+        ok = new_block("st#{pc}ir")
+        b.cond(inr, ok, slow)
+        b.position_at_end(ok)
+        k32 = fp_to_si(kf, @i32)
+        ok = new_block("st#{pc}ic")
+        b.cond(b.fcmp(LLVM::RealPredicate::OEQ, si_to_fp(k32, @f64), kf), ok, slow)
+        b.position_at_end(ok)
+        ab = b.load(@i32, tbl_fld(tbl, Layout.tbl_base))
+        al = b.load(@i32, tbl_fld(tbl, Layout.tbl_len))
+        ok = new_block("st#{pc}b")
+        b.cond(b.and(b.icmp(LLVM::IntPredicate::SGE, k32, ab),
+          b.icmp(LLVM::IntPredicate::SLT, k32, b.add(ab, al))), ok, slow)
+        b.position_at_end(ok)
+        # nil store must update @len_cache (raw_set: k-1 if k <= cache) —
+        # route it to the helper; nil writes are cold in hot loops
+        vv = load_slot(cr)
+        ok = new_block("st#{pc}nn")
+        b.cond(b.icmp(LLVM::IntPredicate::EQ, b.extract_value(vv, 0), @i32.const_int(0)),
+          slow, ok)
+        b.position_at_end(ok)
+        bufp = b.load(@lv_ptr, tbl_fld(tbl, Layout.tbl_buf))
+        b.store(vv, b.gep(@lv, bufp, b.sub(k32, ab)))
+        br_next(pc)
+        b.position_at_end(slow)
+        call_fp(:settable, [@interp, @clp, @base, @i32.const_int(pc),
+          @i32.const_int(a), @i32.const_int(br), @i32.const_int(cr)])
+        br_next(pc)
+        @nums.clear
       end
 
       # --- building blocks ---
@@ -518,6 +732,25 @@ module Lua::JIT
         @b.load(@lv, slot(r))
       end
 
+      # object pointer (i8*) from a LuaValue payload — reference payloads
+      # hold the object address
+      private def payload_ptr(v : LLVM::Value) : LLVM::Value
+        LLVM::Value.new LibLLVM.build_int2ptr(@b, @b.extract_value(v, 1), @i8.pointer, "")
+      end
+
+      # i8 pointer `off` bytes into the object at `tbl`
+      private def tbl_fld(tbl : LLVM::Value, off : Int32) : LLVM::Value
+        @b.gep(@i8, tbl, @i64.const_int(off))
+      end
+
+      private def fp_to_si(v : LLVM::Value, ty : LLVM::Type) : LLVM::Value
+        LLVM::Value.new LibLLVM.build_fp2si(@b, v, ty, "")
+      end
+
+      private def si_to_fp(v : LLVM::Value, ty : LLVM::Type) : LLVM::Value
+        LLVM::Value.new LibLLVM.build_si2fp(@b, v, ty, "")
+      end
+
       private def store_scalar(dst : LLVM::Value, tag : LLVM::Value, payload : LLVM::Value) : Nil
         b = @b
         b.store(tag, b.gep(@i32, @scratch, @i32.const_int(0)))
@@ -539,8 +772,10 @@ module Lua::JIT
         b.store(b.load(@lv, @scratch), dst)
       end
 
-      # truthiness of register r (nil tag 0 / bool with payload 0)
+      # truthiness of register r (nil tag 0 / bool with payload 0); a
+      # register with numeric provenance is always truthy (0 is truthy)
       def truthy(r : Int32) : LLVM::Value
+        return @ctx.int1.const_int(1) if @nums[r]?
         b = @b
         v = load_slot(r)
         tag = b.extract_value(v, 0)
@@ -551,8 +786,13 @@ module Lua::JIT
       end
 
       # load register r as f64; on a non-number tag deopt at `pc` (the
-      # interpreter runs the rest of the function, results already placed)
+      # interpreter runs the rest of the function, results already placed).
+      # Numeric provenance from earlier in the block skips both the load
+      # and the guard (we wrote the slot ourselves; nothing external ran)
       def guard_num(pc : Int32, r : Int32) : LLVM::Value
+        if v = @nums[r]?
+          return v
+        end
         b = @b
         v = load_slot(r)
         tag = b.extract_value(v, 0)
@@ -564,10 +804,24 @@ module Lua::JIT
         st = call_fp(:deopt, [@interp, @clp, @base, @i32.const_int(pc), @want])
         b.ret(st)
         b.position_at_end(okb)
-        b.bit_cast(b.extract_value(v, 1), @f64)
+        d = b.bit_cast(b.extract_value(v, 1), @f64)
+        @nums[r] = d
+        d
       end
 
       def call_fp(key : Symbol, args : Array(LLVM::Value)) : LLVM::Value
+        name = @helper_types[key].return_type.kind.void? ? "" : "r"
+        r = @b.call(@helper_types[key], @helpers[key], args, name)
+        # runtime helpers may read/write any stack slot (metamethods run
+        # Lua, calls move registers, the stack may reallocate) — numeric
+        # provenance is void past this point
+        @nums.clear
+        r
+      end
+
+      # pure math helpers (no runtime re-entry, no slot writes): provenance
+      # survives (JIT.md 1.4 — only funs that can run Lua invalidate)
+      def call_fp_pure(key : Symbol, args : Array(LLVM::Value)) : LLVM::Value
         name = @helper_types[key].return_type.kind.void? ? "" : "r"
         @b.call(@helper_types[key], @helpers[key], args, name)
       end
@@ -622,7 +876,7 @@ module Lua::JIT
         helper_types[key] = LLVM::Type.function(sig[0], sig[1])
       end
 
-      Gen.new(cl, ctx, f, helpers, helper_types, blocks, entry, f.params[1], @@osr_heads).run
+      Gen.new(cl, ctx, f, helpers, helper_types, blocks, entry, f.params[1], @@osr_heads, @@preds).run
     end
   end
 end
