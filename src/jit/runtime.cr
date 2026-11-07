@@ -165,6 +165,24 @@ module Lua
     # Maintained as max(base+max_stack) around every JIT invocation.
     property jit_stack_hi : Int32 = -1
 
+    # Byte offsets of the fields JIT machine code reads inline (probe once
+    # per process — Crystal class layout is fixed per build). The JIT uses
+    # these to check hook/coroutine/jit_depth state and re-sync the value
+    # stack pointer without a helper call.
+    def jit_probe_offsets : NamedTuple(open_max: Int32, current_co: Int32,
+                                       hook_on: Int32, jit_depth: Int32,
+                                       jit_stack_hi: Int32, jit_stack_buf: Int32,
+                                       jit_stack_cap: Int32)
+      p = self.as(Void*).address
+      {open_max:      (pointerof(@open_max).address - p).to_i32!,
+       current_co:    (pointerof(@current_co).address - p).to_i32!,
+       hook_on:       (pointerof(@hook_on).address - p).to_i32!,
+       jit_depth:     (pointerof(@jit_depth).address - p).to_i32!,
+       jit_stack_hi:  (pointerof(@jit_stack_hi).address - p).to_i32!,
+       jit_stack_buf: (pointerof(@jit_stack_buf).address - p).to_i32!,
+       jit_stack_cap: (pointerof(@jit_stack_cap).address - p).to_i32!}
+    end
+
     def stack : Array(LuaValue)
       @stack
     end

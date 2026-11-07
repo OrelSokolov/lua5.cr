@@ -49,10 +49,37 @@ module Lua::JIT
     class_getter tbl_buf : Int32 = -1
     class_getter tbl_base : Int32 = -1
     class_getter tbl_len : Int32 = -1
+    # flat string-key store (SSlot array): buffer/mask fields of LuaTable
+    # and SSlot size/field offsets for the inlined identity probe
+    class_getter tbl_slots : Int32 = -1
+    class_getter tbl_smask : Int32 = -1
+    class_getter slot_size : Int32 = -1
+    class_getter slot_key : Int32 = -1
+    class_getter slot_val : Int32 = -1
+    # LuaClosure tag + field offsets, Proto field offsets (direct-call fast
+    # path), Interp field offsets (inline hook/coroutine/depth checks and
+    # value-stack re-sync) and the static weak_seen flag address.
+    class_getter tag_closure : Int32 = -1
+    class_getter cl_proto : Int32 = -1
+    class_getter cl_compiled : Int32 = -1
+    # Pointer(Void) type id: @compiled is a 16-byte nilable-pointer union
+    # { i32 tag, ptr payload } — the tag gates the payload load
+    class_getter cl_compiled_tag : Int32 = -1
+    class_getter pr_params : Int32 = -1
+    class_getter pr_vararg : Int32 = -1
+    class_getter pr_maxstack : Int32 = -1
+    class_getter i_open_max : Int32 = -1
+    class_getter i_current_co : Int32 = -1
+    class_getter i_hook_on : Int32 = -1
+    class_getter i_jit_depth : Int32 = -1
+    class_getter i_jit_hi : Int32 = -1
+    class_getter i_stack_buf : Int32 = -1
+    class_getter i_stack_cap : Int32 = -1
+    class_getter weak_seen : UInt64 = 0
 
     @@probed = false
 
-    def self.probe! : Nil
+    def self.probe!(interp : Interp, cl : LuaClosure) : Nil
       return if @@probed
       buf = Pointer(LuaValue).malloc(4)
       buf[0] = 1.5
@@ -65,11 +92,36 @@ module Lua::JIT
       @@tag_bool = tags[4]
       @@tag_str = tags[12]
       @@tag_table = tags[8]
+      # reuse slot 0 for the closure tag (after the numeric tag was read!)
+      buf[0] = cl
+      @@tag_closure = tags[0]
       o = tbl.probe_offsets
       @@tbl_mt = o[:mt]
       @@tbl_buf = o[:buf]
       @@tbl_base = o[:base]
       @@tbl_len = o[:len]
+      @@tbl_slots = o[:slots]
+      @@tbl_smask = o[:smask]
+      @@slot_size = o[:slot_size]
+      @@slot_key = o[:slot_key]
+      @@slot_val = o[:slot_val]
+      c = cl.probe_offsets
+      @@cl_proto = c[:proto]
+      @@cl_compiled = c[:compiled]
+      @@cl_compiled_tag = c[:compiled_tag]
+      pr = cl.proto.probe_offsets
+      @@pr_params = pr[:num_params]
+      @@pr_vararg = pr[:vararg]
+      @@pr_maxstack = pr[:max_stack]
+      i = interp.jit_probe_offsets
+      @@i_open_max = i[:open_max]
+      @@i_current_co = i[:current_co]
+      @@i_hook_on = i[:hook_on]
+      @@i_jit_depth = i[:jit_depth]
+      @@i_jit_hi = i[:jit_stack_hi]
+      @@i_stack_buf = i[:jit_stack_buf]
+      @@i_stack_cap = i[:jit_stack_cap]
+      @@weak_seen = Lua.weak_seen_addr
       @@probed = true
     end
   end
@@ -82,6 +134,16 @@ module Lua::JIT
   module Compiler
     @@lljit : LLVM::Orc::LLJIT? = nil
     @@sym = 0
+    # New-PM pipeline over the generated IR before ORC links it. Without
+    # this the default IRTransformLayer is a no-op: the scratch/cur_stack/
+    # cur_top allocas stay in memory (no mem2reg/GVN/LICM) and every value
+    # reloads from the value stack. Overridable for experiments.
+    PIPELINE = ENV["LUA5_JIT_PIPELINE"]? || "default<O2>"
+    # kill-switches for bisection: direct JIT->JIT calls and inlined
+    # back-edge gates can each be disabled from the environment
+    FAST_CALL = ENV["LUA5_JIT_FASTCALL"]? != "0"
+    INLINE_EDGE = ENV["LUA5_JIT_EDGE"]? != "0"
+    @@tm : LLVM::TargetMachine? = nil
     # OSR entry points and block predecessor counts of the proto being
     # compiled (see compile)
     @@osr_heads = Set(Int32).new
@@ -91,8 +153,8 @@ module Lua::JIT
     @@keep = [] of LLVM::Orc::ThreadSafeContext
 
     # Compile `cl`; returns the machine-code entry or nil (unsupported).
-    def self.compile(cl : LuaClosure) : Pointer(Void)?
-      Layout.probe!
+    def self.compile(interp : Interp, cl : LuaClosure) : Pointer(Void)?
+      Layout.probe!(interp, cl)
       p = cl.proto
       # `arg`-table protos bail: the implicit local is built by push_call at
       # frame entry, which the JIT entry does not do. A bare vararg flag is
@@ -149,8 +211,23 @@ module Lua::JIT
       sym = "lua5jit#{@@sym}"
       ctx = LLVM::Context.new
       mod = ctx.new_module(sym)
+      # Host layout/triple from the start: a bare context has no DataLayout,
+      # so LLVM would size { i32, i64 } as 12 bytes (i64 payload at +4) —
+      # ORC re-stamps the real arm64 layout (16 bytes, payload at +8) at
+      # codegen, and any IR pass run before that would miscompile every
+      # struct-typed load/store into wrong offsets (infinite loops).
+      tm = target_machine
+      mod.target = tm.triple
+      mod.data_layout = tm.data_layout
       gen(cl, ctx, mod, sym)
       mod.verify
+      if d = ENV["LUA5_JIT_DUMP"]?
+        File.write("#{d}/#{@@sym}-pre.ll", mod.to_s)
+      end
+      optimize!(mod)
+      if d = ENV["LUA5_JIT_DUMP"]?
+        File.write("#{d}/#{@@sym}-post.ll", mod.to_s)
+      end
 
       engine = lljit
       ts_ctx = LLVM::Orc::ThreadSafeContext.new(ctx)
@@ -165,6 +242,40 @@ module Lua::JIT
 
     def self.trace(msg : String) : Nil
       STDERR.puts "lua5-jit: #{msg}" if ENV["LUA5_JIT"]? == "trace"
+    end
+
+    # TargetMachine for the host (LLVMRunPasses wants TTI for the
+    # pipeline's vectorizer/inline cost decisions). The ORC session's own
+    # TM is not exposed by the bindings, so keep a separate one.
+    private def self.target_machine : LLVM::TargetMachine
+      @@tm ||= begin
+        # target registration normally happens in lljit; a compile that
+        # optimizes before the engine exists must do it itself
+        LLVMTgt.a64_info
+        LLVMTgt.a64_target
+        LLVMTgt.a64_mc
+        LLVMTgt.a64_asm_p
+        LLVMTgt.a64_asm_w
+        triple = LLVM.default_target_triple
+        LLVM::Target.from_triple(triple).create_target_machine(
+          triple, opt_level: LLVM::CodeGenOptLevel::Aggressive)
+      end
+    end
+
+    # Run the new-PM optimization pipeline over the freshly generated IR.
+    # LLVMGetErrorMessage consumes the error, LLVMDisposeErrorMessage frees
+    # the string.
+    private def self.optimize!(mod : LLVM::Module) : Nil
+      return if PIPELINE.empty? || PIPELINE == "none"
+      LLVM::PassBuilderOptions.new do |opts|
+        err = LibLLVM.run_passes(mod, PIPELINE, target_machine, opts)
+        if err
+          msg = LibLLVM.get_error_message(err)
+          s = String.new(msg)
+          LibLLVM.dispose_error_message(msg)
+          raise CompileBail.new("pipeline '#{PIPELINE}': #{s}")
+        end
+      end
     end
 
     private def self.lljit : LLVM::Orc::LLJIT
@@ -192,6 +303,8 @@ module Lua::JIT
       getter lv : LLVM::Type           # { i32, i64 } = LuaValue
       getter lv_ptr : LLVM::Type
       getter ptr : LLVM::Type
+      getter entry_ty : LLVM::Type     # JIT entry function type (direct calls)
+      getter nil_const : LLVM::Value   # constant { i32 0, i64 0 } (nil slot fill)
       getter interp : LLVM::Value
       getter clp : LLVM::Value
       getter base : LLVM::Value
@@ -211,6 +324,22 @@ module Lua::JIT
       # every store — this only removes redundant loads and tag guards
       # (the deopt-anywhere invariant is untouched).
       @nums = Hash(Int32, LLVM::Value).new
+      # String-key provenance: register -> address of the CANONICAL
+      # (interned) instance of the constant string the register holds
+      # (LOADK/LOADK+MOVE chains). Enables the inlined identity probe for
+      # GETTABLE/SETTABLE. Same lifetime rules as @nums.
+      @skeys = Hash(Int32, UInt64).new
+
+      # invalidate provenance of register r (both maps)
+      private def kill(r : Int32) : Nil
+        @nums.delete(r)
+        @skeys.delete(r)
+      end
+
+      private def kill_all : Nil
+        @nums.clear
+        @skeys.clear
+      end
 
       def initialize(@cl, @ctx : LLVM::Context, f : LLVM::Function,
                      @helpers : Hash(Symbol, LLVM::Function),
@@ -225,6 +354,10 @@ module Lua::JIT
         @lv = @ctx.struct([@i32, @i64])
         @lv_ptr = @lv.pointer
         @ptr = @ctx.void_pointer
+        # entry signature (see gen) — the direct-call fast path needs the
+        # function type explicitly with opaque pointers
+        @entry_ty = LLVM::Type.function([@ptr, @lv_ptr, @ptr, @i32, @i32, @i32, @i32, @i32], @i32)
+        @nil_const = @ctx.const_struct([@i32.const_int(0), @i64.const_int(0)])
         @interp = f.params[0]
         @clp = f.params[2]
         @base = f.params[3]
@@ -258,7 +391,7 @@ module Lua::JIT
         while pc < n
           @b.position_at_end(@blocks[pc])
           # numeric SSA survives linear chains; reset where control merges
-          @nums.clear if (@preds[pc]? || 0) > 1
+          kill_all if (@preds[pc]? || 0) > 1
           emit(pc)
           pc += 1
         end
@@ -278,20 +411,25 @@ module Lua::JIT
           r = a
           while r <= a + bb
             store_scalar(slot(r), @i32.const_int(0), @i64.const_int(0))
-            @nums.delete(r)
+            kill(r)
             r += 1
           end
           br_next(pc)
         when .loadbool?
           store_scalar(slot(a), @i32.const_int(Layout.tag_bool), @i64.const_int(bb != 0 ? 1 : 0))
-          @nums.delete(a)
+          kill(a)
           br_next(pc)
         when .move?
           # numeric provenance travels with the value
           if v = @nums[bb]?
             @nums[a] = v
           else
-            @nums.delete(a)
+            kill(a)
+          end
+          if sk = @skeys[bb]?
+            @skeys[a] = sk
+          else
+            @skeys.delete(a)
           end
           b.store(load_slot(bb), slot(a))
           br_next(pc)
@@ -308,17 +446,19 @@ module Lua::JIT
                 end
           store_num(slot(a), res)
           @nums[a] = res
+          @skeys.delete(a)
           br_next(pc)
         when .unm?
           v = guard_num(pc, bb)
           res = b.fneg(v)
           store_num(slot(a), res)
           @nums[a] = res
+          @skeys.delete(a)
           br_next(pc)
         when .not?
           t = truthy(bb)
           store_bool(slot(a), b.not(t))
-          @nums.delete(a)
+          kill(a)
           br_next(pc)
         when .eq?, .neq?, .lt?, .le?
           l = guard_num(pc, bb)
@@ -330,7 +470,7 @@ module Lua::JIT
               else            b.fcmp(LLVM::RealPredicate::OLE, l, r)
               end
           store_bool(slot(a), t)
-          @nums.delete(a)
+          kill(a)
           br_next(pc)
         when .jmp?
           backedge(pc, bb)
@@ -355,13 +495,19 @@ module Lua::JIT
           call_fp(:setupval, [@clp, @i32.const_int(bb), slot(a)])
           br_next(pc)
         when .gettable?
-          emit_gettable(pc, a, bb, cc)
+          if kaddr = @skeys[cc]?
+            emit_str_gettable(pc, a, bb, cc, kaddr)
+          else
+            emit_gettable(pc, a, bb, cc)
+          end
         when .settable?
-          emit_settable(pc, a, bb, cc)
+          if kaddr = @skeys[bb]?
+            emit_str_settable(pc, a, bb, cc, kaddr)
+          else
+            emit_settable(pc, a, bb, cc)
+          end
         when .self?
-          call_fp(:self, [@interp, @clp, @base, @i32.const_int(pc),
-            @i32.const_int(a), @i32.const_int(bb), @i32.const_int(cc), slot(a)])
-          br_next(pc)
+          emit_str_self(pc, a, bb, cc)
         when .newtable?
           call_fp(:newtable, [slot(a)])
           br_next(pc)
@@ -442,16 +588,21 @@ module Lua::JIT
           @nums[a] = @f64.const_double(k)
         when Bool
           store_scalar(slot(a), @i32.const_int(Layout.tag_bool), @i64.const_int(k ? 1 : 0))
-          @nums.delete(a)
+          kill(a)
         when String
           # proto.consts keeps the string alive (closure -> proto -> consts);
           # Boehm is non-moving, so the object pointer is stable. NOTE: the
-          # union payload holds the String OBJECT address, not char*.
+          # union payload holds the String OBJECT address, not char*. Short
+          # strings also register their canonical (interned) instance for
+          # the inlined string-key probe.
           store_scalar(slot(a), @i32.const_int(Layout.tag_str), @i64.const_int(k.as(Void*).address.to_i64!))
-          @nums.delete(a)
+          kill(a)
+          if k.bytesize <= Lua::SHORT_STR_MAX
+            @skeys[a] = Lua.intern(k).as(Void*).address
+          end
         else
           store_scalar(slot(a), @i32.const_int(0), @i64.const_int(0))
-          @nums.delete(a)
+          kill(a)
         end
         br_next(pc)
       end
@@ -485,9 +636,9 @@ module Lua::JIT
 
       # FORLOOP: R[A..A+2] are numbers by FORPREP's invariant (the
       # interpreter also reads them unchecked). Back-edge freezes loop
-      # upvalues via the helper; weak tables active -> deopt so the
-      # interpreter drives its loop-edge GC (ctrl not yet stored, the
-      # re-run is exact).
+      # upvalues via the helper; the gate is inlined: open upvalues below
+      # the frame's window or any weak table ever seen (monotonic flag)
+      # route to the helper, the common case skips the call entirely.
       private def emit_forloop(pc : Int32, a : Int32, off : Int32) : Nil
         b = @b
         ctrl0 = load_num_raw(a)
@@ -502,9 +653,21 @@ module Lua::JIT
         exit_b = new_block("forexit#{pc}")
         b.cond(cond_v, body, exit_b)
         b.position_at_end(body)
+        # INLINE_EDGE=0 restores the M2.1 behavior: always take the helper
+        # path (upvalue freezing + weak check live in jit_loopedge)
+        need = if Compiler::INLINE_EDGE
+                b.or(weak_seen(b), b.icmp(LLVM::IntPredicate::SGE,
+                  b.load(@i32, tbl_fld(@interp, Layout.i_open_max)),
+                  b.add(@base, @i32.const_int(a))))
+              else
+                @ctx.int1.const_int(1)
+              end
+        slow = new_block("forslow#{pc}")
+        go = new_block("forgo#{pc}")
+        b.cond(need, slow, go)
+        b.position_at_end(slow)
         st = call_fp(:loopedge, [@interp, @base, @i32.const_int(a)])
         weak = new_block("forweak#{pc}")
-        go = new_block("forgo#{pc}")
         b.cond(b.icmp(LLVM::IntPredicate::NE, st, @i32.const_int(0)), weak, go)
         b.position_at_end(weak)
         d = call_fp(:deopt, [@interp, @clp, @base, @i32.const_int(pc), @want])
@@ -524,6 +687,10 @@ module Lua::JIT
       end
 
       private def emit_call(pc : Int32, a : Int32, bcount : Int32, want_v : Int32) : Nil        b = @b
+        if bcount >= 0 && Compiler::FAST_CALL
+          emit_call_fast(pc, a, bcount, want_v)
+          return
+        end
         argn = bcount == -1 ? b.sub(b.load(@i32, @cur_top), b.add(@base, @i32.const_int(a + 1))) : @i32.const_int(bcount)
         newstk = call_fp(:dispatch,
           [@interp, @base, @i32.const_int(a), argn, @i32.const_int(want_v), @status_p])
@@ -537,6 +704,113 @@ module Lua::JIT
         b.position_at_end(cont)
         if want_v == -1
           b.store(b.add(b.add(@base, @i32.const_int(a)), st), @cur_top)
+        else
+          b.store(b.add(@base, @i32.const_int(a + {want_v, 0}.max)), @cur_top)
+        end
+        br_next(pc)
+      end
+
+      # Direct JIT->JIT call: every condition jit_call_dispatch checks
+      # (closure with machine code, arity match, no coroutine/hooks, depth
+      # budget, stack window) becomes cheap inline loads; the helper stays
+      # as the slow path for everything else. Results follow the same
+      # contract: count in the return value, slots at stack[base+a..],
+      # missing fixed results nil-filled here.
+      private def emit_call_fast(pc : Int32, a : Int32, argn : Int32, want_v : Int32) : Nil
+        b = @b
+        slow = new_block("cslow#{pc}")
+        vf = load_slot(a)
+        fast = new_block("cfast#{pc}")
+        b.cond(b.icmp(LLVM::IntPredicate::EQ, b.extract_value(vf, 0),
+          @i32.const_int(Layout.tag_closure)), fast, slow)
+        b.position_at_end(fast)
+        clp2 = payload_ptr(vf)
+        # @compiled is a nilable-pointer union: tag check first, then the
+        # payload next to it is the machine-code entry
+        ctag = b.load(@i32, tbl_fld(clp2, Layout.cl_compiled - 8))
+        ok = b.icmp(LLVM::IntPredicate::EQ, ctag, @i32.const_int(Layout.cl_compiled_tag))
+        cp = b.load(@ptr, tbl_fld(clp2, Layout.cl_compiled))
+        ok = b.and(ok, b.icmp(LLVM::IntPredicate::NE, cp, null_ptr))
+        proto = b.load(@ptr, tbl_fld(clp2, Layout.cl_proto))
+        np = b.load(@i32, tbl_fld(proto, Layout.pr_params))
+        ok = b.and(ok, b.icmp(LLVM::IntPredicate::EQ, np, @i32.const_int(argn)))
+        va = b.load(@i8, tbl_fld(proto, Layout.pr_vararg))
+        ok = b.and(ok, b.icmp(LLVM::IntPredicate::EQ, va, @i8.const_int(0)))
+        co = b.load(@ptr, tbl_fld(@interp, Layout.i_current_co))
+        ok = b.and(ok, b.icmp(LLVM::IntPredicate::EQ, co, null_ptr))
+        ho = b.load(@i32, tbl_fld(@interp, Layout.i_hook_on))
+        ok = b.and(ok, b.icmp(LLVM::IntPredicate::EQ, ho, @i32.const_int(0)))
+        depth = b.load(@i32, tbl_fld(@interp, Layout.i_jit_depth))
+        ok = b.and(ok, b.icmp(LLVM::IntPredicate::SLT, depth, @i32.const_int(512)))
+        ms = b.load(@i32, tbl_fld(proto, Layout.pr_maxstack))
+        ra = b.add(@base, @i32.const_int(a))
+        # ensure_stack(ra + {max_stack, argn+1}.max + argn + 4): the
+        # helper guarantees size > n, so fast requires cap > n
+        need = b.add(ra, b.add(b.select(
+          b.icmp(LLVM::IntPredicate::SGT, ms, @i32.const_int(argn + 1)),
+          ms, @i32.const_int(argn + 1)), @i32.const_int(argn + 4)))
+        cap = b.load(@i32, tbl_fld(@interp, Layout.i_stack_cap))
+        ok = b.and(ok, b.icmp(LLVM::IntPredicate::UGT, cap, need))
+        go = new_block("cgo#{pc}")
+        b.cond(ok, go, slow)
+        b.position_at_end(go)
+        # window bookkeeping, exactly as jit_call_dispatch does
+        b.store(b.add(depth, @i32.const_int(1)), tbl_fld(@interp, Layout.i_jit_depth))
+        old_hi = b.load(@i32, tbl_fld(@interp, Layout.i_jit_hi))
+        win = b.add(ra, ms)
+        hi_b = new_block("chi#{pc}")
+        hi_done = new_block("chid#{pc}")
+        b.cond(b.icmp(LLVM::IntPredicate::SGT, win, old_hi), hi_b, hi_done)
+        b.position_at_end(hi_b)
+        b.store(win, tbl_fld(@interp, Layout.i_jit_hi))
+        b.br(hi_done)
+        b.position_at_end(hi_done)
+        stk = b.load(@lv_ptr, tbl_fld(@interp, Layout.i_stack_buf))
+        cargs = [@interp, stk, clp2, ra, @i32.const_int(argn), @i32.const_int(want_v),
+                 @i32.const_int(0), @i32.const_int(0)] of LLVM::Value
+        st = LLVM::Value.new LibLLVM.build_call2(b, @entry_ty, cp,
+          (cargs.to_unsafe.as(LibLLVM::ValueRef*)), cargs.size, "cst")
+        b.store(depth, tbl_fld(@interp, Layout.i_jit_depth))
+        b.store(old_hi, tbl_fld(@interp, Layout.i_jit_hi))
+        # the callee's nested calls may have reallocated the buffer
+        b.store(b.load(@lv_ptr, tbl_fld(@interp, Layout.i_stack_buf)), @cur_stack)
+        bad = new_block("cbad#{pc}")
+        cont = new_block("ccont#{pc}")
+        b.cond(b.icmp(LLVM::IntPredicate::SLT, st, @i32.const_int(0)), bad, cont)
+        b.position_at_end(bad)
+        b.ret(st)
+        b.position_at_end(cont)
+        if want_v > 0
+          # nil-fill missing fixed results (store_results analog): slot
+          # gets nil when the callee returned fewer than wanted
+          j = 0
+          while j < want_v
+            cur = load_slot(a + j)
+            pick = b.select(b.icmp(LLVM::IntPredicate::SLE, st, @i32.const_int(j)), @nil_const, cur)
+            b.store(pick, slot(a + j))
+            j += 1
+          end
+        end
+        if want_v == -1
+          b.store(b.add(b.add(@base, @i32.const_int(a)), st), @cur_top)
+        else
+          b.store(b.add(@base, @i32.const_int(a + {want_v, 0}.max)), @cur_top)
+        end
+        kill_all
+        br_next(pc)
+        b.position_at_end(slow)
+        newstk = call_fp(:dispatch,
+          [@interp, @base, @i32.const_int(a), @i32.const_int(argn), @i32.const_int(want_v), @status_p])
+        b.store(newstk, @cur_stack)
+        st2 = b.load(@i32, @status_p)
+        bad2 = new_block("callbad#{pc}")
+        cont2 = new_block("callcont#{pc}")
+        b.cond(b.icmp(LLVM::IntPredicate::SLT, st2, @i32.const_int(0)), bad2, cont2)
+        b.position_at_end(bad2)
+        b.ret(st2)
+        b.position_at_end(cont2)
+        if want_v == -1
+          b.store(b.add(b.add(@base, @i32.const_int(a)), st2), @cur_top)
         else
           b.store(b.add(@base, @i32.const_int(a + {want_v, 0}.max)), @cur_top)
         end
@@ -614,7 +888,7 @@ module Lua::JIT
         br_next(pc)
         # merge: the slow path ran arbitrary Lua (provenance void), so the
         # map cannot be trusted past this instruction
-        @nums.clear
+        kill_all
       end
 
       # SETTABLE A B C: R[A][R[B]] := R[C] — same fast-path shape as
@@ -682,10 +956,157 @@ module Lua::JIT
         call_fp(:settable, [@interp, @clp, @base, @i32.const_int(pc),
           @i32.const_int(a), @i32.const_int(br), @i32.const_int(cr)])
         br_next(pc)
-        @nums.clear
+        kill_all
       end
 
-      # --- building blocks ---
+      # GETTABLE with a known constant string key: inlined identity probe
+      # over the flat string-key table (no runtime call — numeric
+      # provenance of other registers survives). Anything but a plain
+      # hit (metatables, non-tables, long strings, probe miss) takes the
+      # helper.
+      private def emit_str_gettable(pc : Int32, a : Int32, br : Int32, cr : Int32,
+                                    kaddr : UInt64) : Nil
+        b = @b
+        slow = new_block("sgtslow#{pc}")
+        vb = load_slot(br)
+        ok = new_block("sgt#{pc}tab")
+        b.cond(b.icmp(LLVM::IntPredicate::EQ, b.extract_value(vb, 0),
+          @i32.const_int(Layout.tag_table)), ok, slow)
+        b.position_at_end(ok)
+        tbl = payload_ptr(vb)
+        mt = b.load(@i64, tbl_fld(tbl, Layout.tbl_mt))
+        ok = new_block("sgt#{pc}mt")
+        b.cond(b.icmp(LLVM::IntPredicate::EQ, mt, @i64.const_int(0)), ok, slow)
+        b.position_at_end(ok)
+        valp, miss = str_probe_begin(pc, tbl, kaddr, "sgt")
+        v = b.load(@lv, valp)
+        b.store(v, slot(a))
+        br_next(pc)
+        b.position_at_end(miss)
+        b.br(slow)
+        b.position_at_end(slow)
+        call_fp(:gettable, [@interp, @clp, @base, @i32.const_int(pc),
+          @i32.const_int(a), @i32.const_int(br), @i32.const_int(cr), slot(a)])
+        br_next(pc)
+        kill_all
+      end
+
+      # SETTABLE with a known constant string key: inlined probe; an
+      # overwrite of an EXISTING slot with a non-nil value is inline (no
+      # runtime call, provenance of other registers survives). Fresh
+      # inserts (no slot), nil stores (delete + backward shift) and any
+      # non-plain-table shape take the helper.
+      private def emit_str_settable(pc : Int32, a : Int32, br : Int32, cr : Int32,
+                                    kaddr : UInt64) : Nil
+        b = @b
+        slow = new_block("sstslow#{pc}")
+        vt = load_slot(a)
+        ok = new_block("sst#{pc}tab")
+        b.cond(b.icmp(LLVM::IntPredicate::EQ, b.extract_value(vt, 0),
+          @i32.const_int(Layout.tag_table)), ok, slow)
+        b.position_at_end(ok)
+        tbl = payload_ptr(vt)
+        mt = b.load(@i64, tbl_fld(tbl, Layout.tbl_mt))
+        ok = new_block("sst#{pc}mt")
+        b.cond(b.icmp(LLVM::IntPredicate::EQ, mt, @i64.const_int(0)), ok, slow)
+        b.position_at_end(ok)
+        vv = load_slot(cr)
+        ok = new_block("sst#{pc}nn")
+        b.cond(b.icmp(LLVM::IntPredicate::NE, b.extract_value(vv, 0),
+          @i32.const_int(0)), ok, slow)
+        b.position_at_end(ok)
+        valp, miss = str_probe_begin(pc, tbl, kaddr, "sst")
+        b.store(vv, valp)
+        br_next(pc)
+        b.position_at_end(miss)
+        b.br(slow)
+        b.position_at_end(slow)
+        call_fp(:settable, [@interp, @clp, @base, @i32.const_int(pc),
+          @i32.const_int(a), @i32.const_int(br), @i32.const_int(cr)])
+        br_next(pc)
+        kill_all
+      end
+
+      # SELF A B K: R[A+1] := R[B]; R[A] := R[B][const K] — method-call
+      # sugar. The constant key goes through the same inlined probe when
+      # short; the helper handles everything else (metamethods, strings…).
+      private def emit_str_self(pc : Int32, a : Int32, bb : Int32, kidx : Int32) : Nil
+        b = @b
+        k = @consts[kidx]?
+        unless k.is_a?(String) && k.bytesize <= Lua::SHORT_STR_MAX
+          call_fp(:self, [@interp, @clp, @base, @i32.const_int(pc),
+            @i32.const_int(a), @i32.const_int(bb), @i32.const_int(kidx), slot(a)])
+          br_next(pc)
+          return
+        end
+        kaddr = Lua.intern(k).as(Void*).address
+        slow = new_block("slfslow#{pc}")
+        obj = load_slot(bb)
+        ok = new_block("slf#{pc}tab")
+        b.cond(b.icmp(LLVM::IntPredicate::EQ, b.extract_value(obj, 0),
+          @i32.const_int(Layout.tag_table)), ok, slow)
+        b.position_at_end(ok)
+        tbl = payload_ptr(obj)
+        mt = b.load(@i64, tbl_fld(tbl, Layout.tbl_mt))
+        ok = new_block("slf#{pc}mt")
+        b.cond(b.icmp(LLVM::IntPredicate::EQ, mt, @i64.const_int(0)), ok, slow)
+        b.position_at_end(ok)
+        valp, miss = str_probe_begin(pc, tbl, kaddr, "slf")
+        b.store(obj, slot(a + 1))
+        b.store(b.load(@lv, valp), slot(a))
+        br_next(pc)
+        b.position_at_end(miss)
+        b.br(slow)
+        b.position_at_end(slow)
+        call_fp(:self, [@interp, @clp, @base, @i32.const_int(pc),
+          @i32.const_int(a), @i32.const_int(bb), @i32.const_int(kidx), slot(a)])
+        br_next(pc)
+        kill_all
+      end
+
+      # Emits the probe for canonical key `kaddr` in table `tbl` (i8*);
+      # positions the builder in the HIT block and returns the address of
+      # the slot's val field plus the MISS block (caller falls back to the
+      # helper there). Home index mirrors LuaTable#slot_idx:
+      # ((addr * 0x9E3779B97F4A7C15) >> 32) & mask; 3 slots probed inline,
+      # misses/empties fall through to `miss`.
+      private def str_probe_begin(pc : Int32, tbl : LLVM::Value, kaddr : UInt64,
+                                  tag : String) : {LLVM::Value, LLVM::BasicBlock}
+        b = @b
+        smask = b.load(@i32, tbl_fld(tbl, Layout.tbl_smask))
+        has = new_block("#{tag}#{pc}has")
+        miss = new_block("#{tag}#{pc}miss")
+        b.cond(b.icmp(LLVM::IntPredicate::NE, smask, @i32.const_int(0)), has, miss)
+        b.position_at_end(has)
+        sbuf = b.load(@ptr, tbl_fld(tbl, Layout.tbl_slots))
+        home32 = ((kaddr &* 0x9E3779B97F4A7C15_u64) >> 32).to_i32!
+        kptr = int2ptr(@i64.const_int(kaddr.to_i64!))
+        hit = new_block("#{tag}#{pc}hit")
+        blocks = [] of LLVM::BasicBlock
+        slots = [] of LLVM::Value
+        3.times do |t|
+          idx = b.and(b.add(@i32.const_int(home32 + t), smask), smask)
+          slot = b.gep(@i8, sbuf, b.mul(b.zext(idx, @i64), @i64.const_int(Layout.slot_size)))
+          kp = b.load(@ptr, b.gep(@i8, slot, @i64.const_int(Layout.slot_key)))
+          not_hit = new_block("#{tag}#{pc}nh#{t}")
+          nxt = t == 2 ? miss : new_block("#{tag}#{pc}n#{t}")
+          here = current_block
+          b.cond(b.icmp(LLVM::IntPredicate::EQ, kp, kptr), hit, not_hit)
+          blocks << here
+          slots << slot
+          b.position_at_end(not_hit)
+          b.cond(b.icmp(LLVM::IntPredicate::EQ, kp, null_ptr), miss, nxt)
+          b.position_at_end(nxt) unless t == 2
+        end
+        b.position_at_end(hit)
+        valp = b.gep(@i8, b.phi(@ptr, blocks, slots), @i64.const_int(Layout.slot_val))
+        {valp, miss}
+      end
+
+      # current basic block of the builder
+      private def current_block : LLVM::BasicBlock
+        @b.insert_block
+      end
 
       private def new_block(name : String) : LLVM::BasicBlock
         f = @blocks[0].parent.not_nil!
@@ -704,18 +1125,30 @@ module Lua::JIT
       # the interpreter's back-edge handlers drive the Lua-graph GC, and a
       # loop can be *waiting* for a weak-table sweep that only gc_full
       # performs (repeat-until compiles to a backward JMPF, so all three
-      # jump ops take this guard).
+      # jump ops take this guard). The weak flag load is inlined: the
+      # static byte is monotonic (never cleared), so flag==0 makes the
+      # helper call unnecessary.
       private def backedge(pc : Int32, off : Int32) : Nil
         return if off >= 0
         b = @b
-        st = call_fp(:weakcheck, [@interp])
-        weak = new_block("jmpweak#{pc}")
+        weak = Compiler::INLINE_EDGE ? weak_seen(b) : @ctx.int1.const_int(1)
+        slow = new_block("jmpweak#{pc}")
         go = new_block("jmpgo#{pc}")
-        b.cond(b.icmp(LLVM::IntPredicate::NE, st, @i32.const_int(0)), weak, go)
-        b.position_at_end(weak)
+        b.cond(weak, slow, go)
+        b.position_at_end(slow)
+        st = call_fp(:weakcheck, [@interp])
+        still = new_block("jmpweak2#{pc}")
+        b.cond(b.icmp(LLVM::IntPredicate::NE, st, @i32.const_int(0)), still, go)
+        b.position_at_end(still)
         d = call_fp(:deopt, [@interp, @clp, @base, @i32.const_int(pc), @want])
         b.ret(d)
         b.position_at_end(go)
+      end
+
+      # load of the static Lua.weak_seen flag as i1 (see Layout.probe!)
+      private def weak_seen(b : LLVM::Builder) : LLVM::Value
+        p = int2ptr(@i64.const_int(Layout.weak_seen.to_i64!))
+        b.icmp(LLVM::IntPredicate::NE, b.load(@i8, p), @i8.const_int(0))
       end
 
       private def dest(pc : Int32, off : Int32) : Int32
@@ -736,6 +1169,15 @@ module Lua::JIT
       # hold the object address
       private def payload_ptr(v : LLVM::Value) : LLVM::Value
         LLVM::Value.new LibLLVM.build_int2ptr(@b, @b.extract_value(v, 1), @i8.pointer, "")
+      end
+
+      # i64 -> raw pointer (call targets, flag addresses)
+      private def int2ptr(v : LLVM::Value) : LLVM::Value
+        LLVM::Value.new LibLLVM.build_int2ptr(@b, v, @ptr, "")
+      end
+
+      private def null_ptr : LLVM::Value
+        int2ptr(@i64.const_int(0))
       end
 
       # i8 pointer `off` bytes into the object at `tbl`
@@ -815,7 +1257,7 @@ module Lua::JIT
         # runtime helpers may read/write any stack slot (metamethods run
         # Lua, calls move registers, the stack may reallocate) — numeric
         # provenance is void past this point
-        @nums.clear
+        kill_all
         r
       end
 

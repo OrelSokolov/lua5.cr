@@ -854,6 +854,13 @@ module Lua
     @frames = [] of Frame
     @fsize = 0
     @stack = Array(LuaValue).new(4096, nil.as(LuaValue))
+    # JIT mirrors of the value stack (the single growth point is
+    # ensure_stack): the current buffer pointer and slot count, so machine
+    # code bounds-checks call windows and re-syncs after nested calls
+    # without probing Crystal's Array layout. Initialized in #initialize
+    # (ivars cannot call methods in field initializers).
+    @jit_stack_buf = Pointer(LuaValue).null
+    @jit_stack_cap = 0
     @open_upvals = [] of UpValue
     # Highest stack index currently captured by an open upvalue; lets hot
     # paths skip close_upvals entirely when nothing this deep is captured.
@@ -943,6 +950,9 @@ module Lua
       while @stack.size <= n
         @stack << nil.as(LuaValue)
       end
+      # keep the JIT mirrors in sync (see @jit_stack_buf)
+      @jit_stack_buf = @stack.to_unsafe
+      @jit_stack_cap = @stack.size
     end
 
     # High-water mark of the value stack: where a fresh run_vm entry may
@@ -1441,7 +1451,7 @@ module Lua
                     Lua.gc_full(self)
                   end
                 end
-                JIT.on_call(cl) # back-edge hotness: OSR tier-up (see osr_run)
+                JIT.on_call(self, cl) # back-edge hotness: OSR tier-up (see osr_run)
                 if osr_ready?(frame, cl)
                   rs = osr_run(frame, cl, proto, base, pc)
                   if rs
@@ -1516,7 +1526,7 @@ module Lua
                     Lua.gc_full(self)
                   end
                 end
-                JIT.on_call(cl) # back-edge hotness: OSR tier-up (see osr_run)
+                JIT.on_call(self, cl) # back-edge hotness: OSR tier-up (see osr_run)
                 if osr_ready?(frame, cl)
                   rs = osr_run(frame, cl, proto, base, pc)
                   if rs
@@ -1533,7 +1543,7 @@ module Lua
               if fn.is_a?(LuaClosure)
                 # for-in iterators never execute the CALL opcode — without
                 # this bump they never tier up and stay interpreted forever
-                JIT.on_call(fn)
+                JIT.on_call(self, fn)
                 p = fn.proto
                 # JIT entry, PUC TFORCALL shape: stage func/state/control at
                 # cb = R[a+3] (overlapping the var window) and call with
@@ -1591,7 +1601,7 @@ module Lua
               fn = sp[base + a]
               argn = b == -1 ? {frame.top - (base + a + 1), 0}.max : b # 0-value multi feeds: top can sit on the closure slot
               if fn.is_a?(LuaClosure)
-                JIT.on_call(fn) # M0 hotness (JIT.md 1.2): bump + threshold check
+                JIT.on_call(self, fn) # M0 hotness (JIT.md 1.2): bump + threshold check
                 frame.pc = pc
                 p = fn.proto
                 # fast path: exact args, no varargs, stack already sized —

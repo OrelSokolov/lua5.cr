@@ -224,6 +224,28 @@ module Lua
     end
   end
 
+  # One slot of LuaTable's string-key store: { String? key, LuaValue val }.
+  # A nil key marks an empty slot; keys are canonical interned instances
+  # compared by identity. Layout is fixed per build — the JIT probes
+  # key/val at runtime-derived offsets (LuaTable#probe_offsets).
+  struct SSlot
+    property key : String? = nil
+    property val : LuaValue = nil
+
+    def initialize
+    end
+
+    # JIT layout probe (jit/compiler.cr Layout): struct size and field
+    # byte offsets, probed once per process
+    def self.field_offsets : {size: Int32, key: Int32, val: Int32}
+      s = SSlot.new
+      base = pointerof(s).address
+      {size: sizeof(SSlot),
+       key:  (pointerof(s.@key).address - base).to_i32!,
+       val:  (pointerof(s.@val).address - base).to_i32!}
+    end
+  end
+
   class LuaTable
     getter metatable : LuaTable? = nil
     # weak-table state (__mode): when set, entries live in @weak as WeakBox
@@ -262,12 +284,17 @@ module Lua
     @arr_len : Int32 = 0
     @arr_cap : Int32 = 0
     @hash = Hash(LuaValue, LuaValue).new
-    # String-key store: identity-hashed over canonical (interned) keys —
-    # the fast path of field access (PUC luaH_getstr). Inserts canonicalize
+    # String-key store: a flat identity-keyed open-addressing table (port
+    # of luaH's string part) over canonical (interned) keys — the fast
+    # path of field access (PUC luaH_getstr). Fixed SSlot layout the JIT
+    # can inline a probe against (probe_offsets); inserts canonicalize
     # through Lua.intern; reads that identity-miss retry once with the
     # canonical instance (a by-value equal key may have entered through a
-    # non-interned producer). All other key types live in @hash.
-    @strs : Hash(String, LuaValue)? = nil
+    # non-interned producer). Long strings (> SHORT_STR_MAX) stay
+    # by-value in @hash. All other key types live in @hash.
+    @slots : Pointer(SSlot) = Pointer(SSlot).null
+    @smask : Int32 = 0 # slots-1 (power-of-two); 0 = table not allocated
+    @scount : Int32 = 0
     # last computed #t; maintained by raw_set so the append pattern
     # (table.insert loops, SETLIST) stays amortized O(1) instead of
     # rescanning from 1 on every raw_length
@@ -276,15 +303,150 @@ module Lua
     def initialize
     end
 
-    # JIT layout probe (jit/compiler.cr Layout): byte offsets of the fields
-    # the inlined numeric GETTABLE/SETTABLE fast path reads off the object
-    # pointer. Layout is fixed per build; probed once per process.
-    def probe_offsets : {mt: Int32, buf: Int32, base: Int32, len: Int32}
+    # --- string-key store (see @slots): flat open addressing, linear
+    # probing, identity keys. The index function is reproduced verbatim
+    # in JIT-compiled probes (jit/compiler.cr) — keep in sync:
+    # ((addr * 0x9E3779B97F4A7C15) >> 32) & mask.
+
+    private def slot_idx(addr : UInt64) : Int32
+      ((addr &* 0x9E3779B97F4A7C15_u64) >> 32 & @smask.to_u64!).to_i32!
+    end
+
+    # identity probe; returns the slot index or -1
+    private def slot_find(k : String) : Int32
+      return -1 if @smask == 0
+      i = slot_idx(k.as(Void*).address)
+      while true
+        sk = @slots[i].key
+        return i if !sk.nil? && sk.not_nil!.same?(k)
+        return -1 if sk.nil?
+        i = (i + 1) & @smask
+      end
+    end
+
+    def str_get(k : String) : LuaValue?
+      i = slot_find(k)
+      i < 0 ? nil : @slots[i].val
+    end
+
+    # insert/overwrite (non-nil val); canonicalizes the key on a fresh
+    # insert; grows at 70% load
+    def str_set(key : String, val : LuaValue) : Nil
+      str_grow if (@scount + 1) * 10 > (@smask + 1) * 7
+      i = slot_find(key)
+      if i < 0
+        c = Lua.intern(key)
+        unless c.same?(key)
+          i = slot_find(c) # the canonical instance may already sit there
+        end
+        if i < 0
+          j = c.same?(key) ? slot_find_empty(key) : slot_find_empty(c)
+          ins = @slots[j]
+          ins.key = c
+          ins.val = val
+          @slots[j] = ins
+          @scount += 1
+          return
+        end
+      end
+      hit = @slots[i]
+      hit.val = val
+      @slots[i] = hit
+    end
+
+    private def slot_find_empty(k : String) : Int32
+      i = slot_idx(k.as(Void*).address)
+      while !@slots[i].key.nil?
+        i = (i + 1) & @smask
+      end
+      i
+    end
+
+    private def str_grow : Nil
+      nmask = @smask == 0 ? 7 : ((@smask + 1) * 2 - 1)
+      obuf, omask = @slots, @smask
+      nbuf = Pointer(SSlot).malloc(nmask + 1)
+      (nmask + 1).times { |i| nbuf[i] = SSlot.new }
+      @slots = nbuf
+      @smask = nmask
+      return if omask == 0
+      (omask + 1).times do |i|
+        oslot = obuf[i]
+        unless oslot.key.nil?
+          j = slot_find_empty(oslot.key.not_nil!)
+          ins = nbuf[j]
+          ins.key = oslot.key
+          ins.val = oslot.val
+          nbuf[j] = ins
+        end
+      end
+    end
+
+    # delete by identity (and by canonical instance — a by-value equal
+    # key may sit under its interned twin); backward-shift deletion keeps
+    # probe chains correct
+    def str_del(key : String) : Nil
+      if (i = slot_find(key)) >= 0
+        del_at(i)
+      end
+      c = Lua.intern(key)
+      if !c.same?(key) && (j = slot_find(c)) >= 0
+        del_at(j)
+      end
+    end
+
+    private def del_at(i : Int32) : Nil
+      return if i < 0
+      mask = @smask
+      hole = i
+      j = i
+      while true
+        j = (j + 1) & mask
+        sk = @slots[j].key
+        break if sk.nil?
+        home = slot_idx(sk.not_nil!.as(Void*).address)
+        # move slot j into the hole unless its home position lies
+        # cyclically inside (hole, j]
+        dist_j = (j - home) & mask
+        dist_hole = (hole - home) & mask
+        if dist_j > dist_hole
+          moved = @slots[j]
+          dst = @slots + hole
+          hole_slot = @slots[hole]
+          hole_slot.key = moved.key
+          hole_slot.val = moved.val
+          dst[0] = hole_slot
+          cleared = @slots[j]
+          cleared.key = nil
+          cleared.val = nil
+          @slots[j] = cleared
+          hole = j
+        end
+      end
+      cleared = @slots[hole]
+      cleared.key = nil
+      cleared.val = nil
+      @slots[hole] = cleared
+      @scount -= 1
+    end
+    # JIT layout probe (jit/compiler.cr Layout): byte offsets of the
+    # fields the inlined GETTABLE/SETTABLE fast paths (numeric array part
+    # and string-key flat table) read off the object pointer. Layout is
+    # fixed per build; probed once per process.
+    def probe_offsets : {mt: Int32, buf: Int32, base: Int32, len: Int32,
+                         slots: Int32, smask: Int32,
+                         slot_size: Int32, slot_key: Int32, slot_val: Int32}
       p = self.as(Void*).address
-      {mt:  (pointerof(@metatable).address - p).to_i32!,
-       buf: (pointerof(@buf).address - p).to_i32!,
-       base: (pointerof(@arr_base).address - p).to_i32!,
-       len: (pointerof(@arr_len).address - p).to_i32!}
+      so = SSlot.field_offsets
+      {mt:    (pointerof(@metatable).address - p).to_i32!,
+       buf:   (pointerof(@buf).address - p).to_i32!,
+       base:  (pointerof(@arr_base).address - p).to_i32!,
+       len:   (pointerof(@arr_len).address - p).to_i32!,
+       slots: (pointerof(@slots).address - p).to_i32!,
+       smask: (pointerof(@smask).address - p).to_i32!,
+       slot_size: so[:size],
+       slot_key:  so[:key],
+       slot_val:  so[:val]}
     end
 
     def check_key(key : LuaValue)
@@ -351,17 +513,15 @@ module Lua
           v = @hash[key]?
           return v.nil? ? nil : v
         end
-        if s = @strs
-          if (v = s[key]?) != nil
-            return v.nil? ? nil : v
-          end
-          # miss: a by-value equal key may be stored under its canonical
-          # instance (a producer bypassed the intern choke points)
-          c = Lua.intern(key)
-          if !c.same?(key)
-            if (v = s[c]?) != nil
-              return v.nil? ? nil : v
-            end
+        if (v = str_get(key)) != nil
+          return v
+        end
+        # miss: a by-value equal key may be stored under its canonical
+        # instance (a producer bypassed the intern choke points)
+        c = Lua.intern(key)
+        if !c.same?(key)
+          if (v = str_get(c)) != nil
+            return v
           end
         end
         return nil
@@ -387,7 +547,7 @@ module Lua
         return
       end
       if key.is_a?(String)
-        # long strings stay by-value (not interned — see @strs comment)
+        # long strings stay by-value (not interned — see @slots comment)
         if key.bytesize > Lua::SHORT_STR_MAX
           if val.nil?
             @hash.delete(key)
@@ -396,30 +556,22 @@ module Lua
           end
           return
         end
-        s = @strs
-        if s.nil?
-          # identity store: canonicalize the FIRST time a string key lands
-          s = Hash(String, LuaValue).new.compare_by_identity
-          @strs = s
-          # pull by-value string keys already parked in @hash (rare: only
-          # between the array/hash split and the first string-key insert)
+        if @smask == 0
+          # first string-key insert: pull by-value string keys already
+          # parked in @hash (rare: only between the array/hash split and
+          # the first string-key insert)
           @hash.keys.each do |hk|
             if hk.is_a?(String) && !(hv = @hash[hk]?).nil?
-              s[Lua.intern(hk)] = hv
+              str_set(hk, hv)
               @hash.delete(hk)
             end
           end
         end
         if val.nil?
-          s.delete(key)
-          c = Lua.intern(key)
-          s.delete(c) unless c.same?(key)
+          str_del(key)
           return
         end
-        unless s.has_key?(key)
-          key = Lua.intern(key) # inserts are canonical (see @strs comment)
-        end
-        s[key] = val
+        str_set(key, val)
         return
       end
       if key.is_a?(Float64) && (k = int_key(key))
@@ -504,11 +656,9 @@ module Lua
         return true unless v.nil?
       elsif key.is_a?(String)
         if key.bytesize <= Lua::SHORT_STR_MAX
-          if s = @strs
-            return true if s.has_key?(key)
-            c = Lua.intern(key)
-            return true if !c.same?(key) && s.has_key?(c)
-          end
+          return true unless str_get(key).nil?
+          c = Lua.intern(key)
+          return true if !c.same?(key) && !str_get(c).nil?
           return false
         end
       end
@@ -559,7 +709,12 @@ module Lua
       end
       keys = Array(LuaValue).new(@arr_len + @hash.size)
       @arr_len.times { |i| keys << (@arr_base + i).to_f64 unless @buf[i].nil? }
-      @strs.try &.each_key { |k| keys << k }
+      if @smask > 0
+        (@smask + 1).times do |i|
+          k = @slots[i].key
+          keys << k unless k.nil?
+        end
+      end
       keys.concat(@hash.keys)
       keys
     end
@@ -585,7 +740,8 @@ module Lua
             items << {WCell.new(k), WCell.new(v)} unless v.nil?
           end
           @hash.clear
-          @strs = nil
+          @smask = 0 # string-key flat table dies with the strong side
+          @scount = 0
           @arr_len = 0 # keep @buf/@arr_cap for reuse; slots past len are never read
           @len_cache = 0
         end
@@ -629,7 +785,11 @@ module Lua
         return
       end
       @arr_len.times { |i| m.mark(@buf[i]) }
-      @strs.try &.each_value { |v| m.mark(v) }
+      if @smask > 0
+        (@smask + 1).times do |i|
+          m.mark(@slots[i].val)
+        end
+      end
       @hash.each { |k, v| m.mark(k); m.mark(v) }
     end
 
@@ -747,6 +907,15 @@ module Lua
 
     def initialize(@chunkname)
     end
+
+    # JIT layout probe (jit/compiler.cr Layout): byte offsets for the
+    # inlined direct-call fast path.
+    def probe_offsets : {num_params: Int32, vararg: Int32, max_stack: Int32}
+      p = self.as(Void*).address
+      {num_params: (pointerof(@num_params).address - p).to_i32!,
+       vararg:    (pointerof(@vararg).address - p).to_i32!,
+       max_stack: (pointerof(@max_stack).address - p).to_i32!}
+    end
   end
 
   # A captured local: either "open" (still a slot in the shared VM stack)
@@ -772,6 +941,24 @@ module Lua
     property compiled : Pointer(Void)? = nil
 
     def initialize(@proto, @upvals)
+    end
+
+    # JIT layout probe (jit/compiler.cr Layout): byte offsets of proto /
+    # compiled for the inlined direct-call fast path. NOTE: @compiled is
+    # `Pointer(Void)?` — a NILABLE POINTER, which Crystal lays out as a
+    # 16-byte union { i32 tag, payload } (not pointer-with-nil-0), so the
+    # probe returns the payload offset plus the Pointer(Void) type id the
+    # fast path must tag-check.
+    def probe_offsets : {proto: Int32, compiled: Int32, compiled_tag: Int32}
+      base = self.as(UInt8*).address
+      old = @compiled
+      @compiled = Pointer(Void).new(0xDEADBEEF_u64)
+      cell = pointerof(@compiled).as(Pointer(Int32))
+      tag = cell.value
+      @compiled = old
+      {proto:        (pointerof(@proto).address - base).to_i32!,
+       compiled:     (pointerof(@compiled).address - base + 8).to_i32!,
+       compiled_tag: tag}
     end
 
     def gc_mark_children(m : GcMark) : Nil
@@ -961,6 +1148,13 @@ module Lua
 
   def self.weak_seen? : Bool
     @@weak_seen
+  end
+
+  # address of the static flag (monotonic: set once any table turns weak,
+  # never cleared) — the JIT embeds it as a constant and loads the byte
+  # inline on loop back-edges instead of calling jit_weakcheck
+  def self.weak_seen_addr : UInt64
+    pointerof(@@weak_seen).address
   end
 
   # any weak table still alive? (drives the loop back-edge GC; dead

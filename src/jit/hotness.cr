@@ -22,17 +22,17 @@ module Lua::JIT
 
   # Bumped from the dispatch-loop CALL path on every Lua-closure call: one
   # increment + compare is the whole counting overhead (M0 criterion <=1%).
-  def self.on_call(cl : LuaClosure) : Nil
+  def self.on_call(interp : Interp, cl : LuaClosure) : Nil
     if (cl.hot += 1) == THRESHOLD
-      compile(cl)
+      compile(interp, cl)
     end
   end
 
   # Tier-up: Proto -> LLVM IR -> ORC machine code. Installs cl.compiled;
   # nil leaves the closure interpreted.
-  def self.compile(cl : LuaClosure) : Nil
+  def self.compile(interp : Interp, cl : LuaClosure) : Nil
     @@compiled_count += 1
-    addr = Compiler.compile(cl)
+    addr = Compiler.compile(interp, cl)
     if addr
       cl.compiled = addr
       Compiler.trace("compiled #{cl.proto.chunkname}:#{cl.proto.linedefined}")

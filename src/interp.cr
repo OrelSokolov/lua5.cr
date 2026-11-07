@@ -60,6 +60,8 @@ module Lua
 
     def initialize
       @globals = LuaTable.new
+      @jit_stack_buf = @stack.to_unsafe
+      @jit_stack_cap = @stack.size
       @string_lib = LuaTable.new
       @string_meta = LuaTable.new
       @string_meta.raw_set("__index", @string_lib)

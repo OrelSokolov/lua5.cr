@@ -83,75 +83,86 @@ crystal run examples/interop_demo.cr
 
 Measured 2026-11-07, Apple M5, `bench/results/` (min of 3 runs, same suite
 as `rake benchmark:*`). References: PUC Lua 5.1.5 (C interpreter), LuaJIT 2.1
-(C trace JIT).
+(C trace JIT), both re-measured the same day.
 
 | bench | lua5.1, s | clua (Crystal JIT), s | LuaJIT, s | clua vs lua5.1 |
 |---|---|---|---|---|
-| nbody | 3.24 | 10.12 | 0.157 | 3.1× slower |
-| spectral-norm | 9.69 | 12.59 | 0.255 | 1.3× slower |
-| array3d | 5.32 | 11.80 | 0.111 | 2.2× slower |
-| mandelbrot | 4.20 | 6.98 | 0.427 | 1.7× slower |
-| fannkuch | 1.77 | 3.46 | 0.204 | 2.0× slower |
-| recursive-fib | 2.76 | 2.25 | 0.206 | 1.2× faster |
-| partialsums | 1.30 | 1.72 | 0.156 | 1.3× slower |
-| binary-trees | 0.92 | 1.20 | 0.25 | 1.3× slower |
-| fasta | 2.48 | 4.54 | 0.874 | 1.8× slower |
+| nbody | 2.081 | 2.792 | 0.092 | 1.34× slower |
+| spectral-norm | 6.520 | 3.176 | 0.165 | 2.05× faster |
+| array3d | 3.542 | 3.356 | 0.071 | 1.06× faster |
+| mandelbrot | 2.833 | 1.311 | 0.283 | 2.16× faster |
+| fannkuch | 1.242 | 0.610 | 0.143 | 2.04× faster |
+| recursive-fib | 1.866 | 1.056 | 0.139 | 1.77× faster |
+| partialsums | 0.830 | 0.770 | 0.116 | 1.08× faster |
+| binary-trees | 0.649 | 0.658 | 0.165 | ~par |
+| nsieve | 0.881 | 0.436 | 0.136 | 2.02× faster |
+| series | 0.400 | 0.412 | 0.115 | ~par |
+| fasta | 1.565 | 2.585 | 0.562 | 1.65× slower |
+| scimark-fft | 10.573 | 7.881 | 0.620 | 1.34× faster |
 
-Today the JIT is a "compiler-shaped interpreter": it removes the dispatch
-switch but keeps everything else. The known costs, in impact order:
+9 of 12 benches are at parity with or faster than PUC Lua 5.1 (session
+start: 3 of 12; e.g. nbody 5.40→2.79s, mandelbrot 3.76→1.31s, array3d
+5.89→3.36s, scimark-fft 12.95→7.88s).
 
-1. **Values live in stack slots, not registers.** Every instruction loads
-   its 16-byte union operands from the shared value stack and stores the
-   result back (GC invariant 1.3 in JIT.md). LuaJIT keeps loop variables in
-   FP registers for the whole trace.
-2. **A tag guard on every operand of every arithmetic op** — no type
-   feedback yet (M3), so redundant guards are never eliminated.
-3. **LLVM ORC runs with no IR optimization pipeline** — the default
-   transform is a no-op, so the scratch/cur_stack/cur_top allocas stay in
-   memory (no mem2reg, GVN, LICM).
-4. **GETTABLE/SETTABLE/SELF always call a Crystal helper** — bounds-checked
-   array indexing plus a hash lookup per access, no inline caches.
-5. **Every CALL goes through the `jit_dispatch_call` helper** — no direct
-   JIT→JIT machine calls, no hot-call inlining (M4/M5).
-6. **A helper call on every loop back-edge** (`jit_loopedge`/`jit_weakcheck`).
-7. The Crystal runtime itself is slower than C (bounds-checked arrays,
-   conservative Boehm GC, 16-byte values vs LuaJIT's 8-byte NaN-boxing).
+What landed (see JIT.md §5, M3.2):
+
+1. **IR optimization pipeline in ORC** (`LLVMRunPasses`, `default<O2>`):
+   mem2reg/GVN/LICM over the generated IR. Critical prerequisite — the
+   module now gets the host DataLayout/triple set *before* any pass runs;
+   a bare context sizes `{i32,i64}` as 12 bytes (payload at +4) while
+   codegen later stamps the arm64 layout (payload at +8), so running
+   passes on an un-stamped module miscompiles every struct access.
+2. **Inlined loop back-edge gates**: the per-iteration
+   `jit_loopedge`/`jit_weakcheck` helper calls became inline loads — the
+   upvalue-open check reads `Interp#open_max` directly, the weak check
+   reads a static monotonic flag byte (`Lua.weak_seen_addr`).
+3. **Direct JIT→JIT calls**: every condition `jit_call_dispatch` checks
+   (closure tag, machine-code entry, arity, no coroutine/hooks, depth
+   budget, stack window) is emitted as inline loads; the callee is called
+   natively without the Crystal helper. Stack bookkeeping goes through
+   JIT mirrors on Interp (`jit_stack_buf`/`jit_stack_cap`, maintained by
+   `ensure_stack` — the single growth point).
+4. **Flat string-key table + inlined identity probe**: `@strs : Hash` was
+   replaced by a hand-rolled open-addressing table over interned keys
+   (port of luaH's string part, fixed `SSlot` layout). GETTABLE/SETTABLE
+   with a constant string key (tracked from LOADK through MOVE) and SELF
+   emit the whole probe inline: compile-time home index, 3 slots, nil
+   metatable guard — a field access costs ~6 loads, no runtime call.
+
+Remaining costs, in impact order:
+
+1. **GC/allocation-bound benches** (fasta 1.65×, binary-trees ~par) — the
+   conservative Boehm GC is the hard ceiling; needs a precise GC, out of
+   scope for this phase.
+2. **nbody 1.34×** — remaining per-iteration guard traffic on numeric
+   loops; type feedback + guard elimination at loop heads (M3 remainder)
+   is the next lever.
+3. **Values still round-trip through stack slots at loop boundaries**
+   (deopt-anywhere invariant); register allocation + snapshot deopt would
+   lift numeric kernels further.
 
 ### Targets
 
-The goal is **5× faster than PUC Lua 5.1** on compute kernels. This is
-achievable — it means landing within 2–4× of LuaJIT, which the architecture
-allows. Per category:
+The goal is **5× faster than PUC Lua 5.1** on compute kernels (DoD of
+phase 5 in PLAN.md). Current status vs that goal:
 
-| Category | Now | Realistic ceiling (full M3–M5) |
+| Category | Now | Realistic ceiling |
 |---|---|---|
-| Numeric kernels, no tables | 1.6× over own interpreter | **5–8× vs lua5.1** |
-| Table-heavy (array3d, nbody) | 2–3× slower than lua5.1 | **4–6× vs lua5.1** |
-| Call-heavy (recursive-fib) | 1.2× faster | **6–8× vs lua5.1** |
-| GC/allocation-bound (fasta, binary-trees) | 1.3–1.8× slower | **2.5–3.5× vs lua5.1** |
-
-The GC-bound category has a hard ceiling: LuaJIT itself is only 2.8–3.7×
-faster than lua5.1 there, so 5× would mean outperforming LuaJIT — blocked
-by Boehm (conservative, no precise incremental collection; NaN-boxing is
-impossible because a pointer in the NaN pattern is invisible to the
-conservative scanner). Geomean over the whole suite: ~3–4× vs lua5.1
-realistic, 5× borderline.
+| Numeric kernels, no tables | 2.0–2.2× vs lua5.1 | 5–8× |
+| Table-heavy (array3d, nbody) | 1.06–1.34× | 4–6× |
+| Call-heavy (recursive-fib) | 1.8× | 6–8× |
+| GC-bound (fasta, binary-trees) | ~par–1.65× | 2.5–3.5× (Boehm ceiling) |
 
 ### Work plan (effort/impact order)
 
-1. **Enable an IR optimization pipeline in ORC** (`IRTransformLayer` with
-   -O2) — near-free, removes the scratch-alloca traffic.
+1. **Type feedback + guard elimination** (M3 remainder) — guards only at
+   region/loop entry.
 2. **Keep values in registers between instructions + snapshot-based
-   deopt** — Boehm scans registers conservatively, so references in
-   registers are already visible; slots-as-truth is a deopt-simplicity
-   choice, not a GC requirement. Largest single win on numeric kernels.
-3. **Type feedback + guard elimination** (M3) — guards only at region/loop
-   entry.
-4. **Inline caches for GETTABLE/SETTABLE + array-part fast path** — hits
-   the worst gaps (array3d, nbody at 64–106× vs LuaJIT).
-5. **Direct JIT→JIT calls, hot-call inlining** (M4/M5); drop the per-iteration
-   `loopedge`/`weakcheck` helpers.
-6. GC-bound benches only move meaningfully with a precise GC — out of
+   deopt** — slots-as-truth is a deopt-simplicity choice, not a GC
+   requirement.
+3. **Hot-call inlining** (M5) — direct calls are in place; inlining the
+   bodies is the next step.
+4. GC-bound benches only move meaningfully with a precise GC — out of
    scope for this phase.
 
 ## Design notes
