@@ -243,6 +243,56 @@ module Lua::JIT
           call_fp(:getupval, [@clp, @i32.const_int(bb), @scratch])
           b.store(b.load(@lv, @scratch), slot(a))
           br_next(pc)
+        when .getglobal?
+          call_fp(:getglobal, [@interp, @clp, @i32.const_int(bb), @i32.const_int(pc), slot(a)])
+          br_next(pc)
+        when .setglobal?
+          call_fp(:setglobal, [@interp, @clp, @i32.const_int(bb), @i32.const_int(pc), slot(a)])
+          br_next(pc)
+        when .setupval?
+          call_fp(:setupval, [@clp, @i32.const_int(bb), slot(a)])
+          br_next(pc)
+        when .gettable?
+          call_fp(:gettable, [@interp, @clp, @base, @i32.const_int(pc),
+            @i32.const_int(a), @i32.const_int(bb), @i32.const_int(cc), slot(a)])
+          br_next(pc)
+        when .settable?
+          call_fp(:settable, [@interp, @clp, @base, @i32.const_int(pc),
+            @i32.const_int(a), @i32.const_int(bb), @i32.const_int(cc)])
+          br_next(pc)
+        when .self?
+          call_fp(:self, [@interp, @clp, @base, @i32.const_int(pc),
+            @i32.const_int(a), @i32.const_int(bb), @i32.const_int(cc), slot(a)])
+          br_next(pc)
+        when .newtable?
+          call_fp(:newtable, [slot(a)])
+          br_next(pc)
+        when .setlist?
+          call_fp(:setlist, [@interp, @base, @i32.const_int(a), @i32.const_int(bb),
+            @i32.const_int(cc), b.load(@i32, @cur_top)])
+          br_next(pc)
+        when .len?
+          call_fp(:len, [@interp, @clp, @base, @i32.const_int(pc), @i32.const_int(bb), slot(a)])
+          br_next(pc)
+        when .concat?
+          call_fp(:concat, [@interp, @clp, @base, @i32.const_int(pc), @i32.const_int(a), @i32.const_int(bb)])
+          br_next(pc)
+        when .closure?
+          call_fp(:closure, [@interp, @clp, @base, @i32.const_int(bb), slot(a)])
+          br_next(pc)
+        when .close?
+          call_fp(:close, [@interp, @base, @i32.const_int(a)])
+          br_next(pc)
+        when .forprep?
+          emit_forprep(pc, a, bb)
+        when .forloop?
+          emit_forloop(pc, a, bb)
+        when .tailcall?, .tforcall?, .vararg?
+          # deopt wholesale: the interpreter runs the rest of the function
+          # (TAILCALL slides the frame; TFORCALL re-enters; VARARG can't
+          # appear — vararg protos bail the compile)
+          st = call_fp(:deopt, [@interp, @clp, @base, @i32.const_int(pc), @want])
+          b.ret(st)
         when .call?     then emit_call(pc, a, bb, cc)
         when .return?
           # Contract: results must end at stack[base..] (the closure slot).
@@ -292,16 +342,78 @@ module Lua::JIT
           store_scalar(slot(a), @i32.const_int(Layout.tag_bool), @i64.const_int(k ? 1 : 0))
         when String
           # proto.consts keeps the string alive (closure -> proto -> consts);
-          # Boehm is non-moving, so the raw pointer is stable
-          store_scalar(slot(a), @i32.const_int(Layout.tag_str), @i64.const_int(k.to_unsafe.as(Void*).address.to_i64!))
+          # Boehm is non-moving, so the object pointer is stable. NOTE: the
+          # union payload holds the String OBJECT address, not char*.
+          store_scalar(slot(a), @i32.const_int(Layout.tag_str), @i64.const_int(k.as(Void*).address.to_i64!))
         else
           store_scalar(slot(a), @i32.const_int(0), @i64.const_int(0))
         end
         br_next(pc)
       end
 
-      private def emit_call(pc : Int32, a : Int32, bcount : Int32, want_v : Int32) : Nil
+      # FORPREP: all three controls must be numbers (guards deopt — the
+      # interpreter re-runs FORPREP and raises the proper 'for' errors or
+      # coerces numeric strings); step==0 also deopts (interp raises).
+      # Then normalize: R[A] -= step and jump to the loop test.
+      private def emit_forprep(pc : Int32, a : Int32, off : Int32) : Nil
         b = @b
+        v0 = guard_num(pc, a)
+        v1 = guard_num(pc, a + 1)
+        v2 = guard_num(pc, a + 2)
+        zero = b.fcmp(LLVM::RealPredicate::OEQ, v2, @f64.const_double(0.0))
+        cont = new_block("fornz#{pc}")
+        bad = new_block("forz#{pc}")
+        b.cond(zero, bad, cont)
+        b.position_at_end(bad)
+        st = call_fp(:deopt, [@interp, @clp, @base, @i32.const_int(pc), @want])
+        b.ret(st)
+        b.position_at_end(cont)
+        store_num(slot(a), b.fsub(v0, v2))
+        store_num(slot(a + 1), v1)
+        store_num(slot(a + 2), v2)
+        b.br(@blocks[dest(pc, off)])
+      end
+
+      # FORLOOP: R[A..A+2] are numbers by FORPREP's invariant (the
+      # interpreter also reads them unchecked). Back-edge freezes loop
+      # upvalues via the helper; weak tables active -> deopt so the
+      # interpreter drives its loop-edge GC (ctrl not yet stored, the
+      # re-run is exact).
+      private def emit_forloop(pc : Int32, a : Int32, off : Int32) : Nil
+        b = @b
+        ctrl0 = load_num_raw(a)
+        lim = load_num_raw(a + 1)
+        ste = load_num_raw(a + 2)
+        ctrl = b.fadd(ctrl0, ste)
+        pos = b.fcmp(LLVM::RealPredicate::OGT, ste, @f64.const_double(0.0))
+        t_pos = b.fcmp(LLVM::RealPredicate::OLE, ctrl, lim)
+        t_neg = b.fcmp(LLVM::RealPredicate::OGE, ctrl, lim)
+        cond_v = b.select(pos, t_pos, t_neg)
+        body = new_block("forbody#{pc}")
+        exit_b = new_block("forexit#{pc}")
+        b.cond(cond_v, body, exit_b)
+        b.position_at_end(body)
+        st = call_fp(:loopedge, [@interp, @base, @i32.const_int(a)])
+        weak = new_block("forweak#{pc}")
+        go = new_block("forgo#{pc}")
+        b.cond(b.icmp(LLVM::IntPredicate::NE, st, @i32.const_int(0)), weak, go)
+        b.position_at_end(weak)
+        d = call_fp(:deopt, [@interp, @clp, @base, @i32.const_int(pc), @want])
+        b.ret(d)
+        b.position_at_end(go)
+        store_num(slot(a), ctrl)
+        b.br(@blocks[dest(pc, off)])
+        b.position_at_end(exit_b)
+        br_next(pc)
+      end
+
+      # unchecked number load (FORPREP guarantees the tag)
+      def load_num_raw(r : Int32) : LLVM::Value
+        v = load_slot(r)
+        b.bit_cast(b.extract_value(v, 1), @f64)
+      end
+
+      private def emit_call(pc : Int32, a : Int32, bcount : Int32, want_v : Int32) : Nil        b = @b
         argn = bcount == -1 ? b.sub(b.load(@i32, @cur_top), b.add(@base, @i32.const_int(a + 1))) : @i32.const_int(bcount)
         newstk = call_fp(:dispatch,
           [@interp, @base, @i32.const_int(a), argn, @i32.const_int(want_v), @status_p])
@@ -418,22 +530,35 @@ module Lua::JIT
       n = cl.proto.packed.size
       blocks = Array(LLVM::BasicBlock).new(n) { |i| f.basic_blocks.append("pc#{i}") }
 
+      # one signature table drives the declarations AND the call-site types
+      # (LLVM 15+ opaque pointers need the function type passed explicitly;
+      # Function#function_type is broken there)
+      void = ctx.void
+      sigs = {
+        deopt:      {[ptr, ptr, i32, i32, i32], i32, "jit_deopt"},
+        dispatch:   {[ptr, i32, i32, i32, i32, ptr.pointer], lv_ptr, "jit_dispatch_call"},
+        getupval:   {[ptr, i32, lv_ptr], void, "jit_getupval"},
+        mod_fn:     {[f64, f64], f64, "jit_mod"},
+        pow:        {[f64, f64], f64, "jit_pow"},
+        getglobal:  {[ptr, ptr, i32, i32, lv_ptr], void, "jit_getglobal"},
+        setglobal:  {[ptr, ptr, i32, i32, lv_ptr], void, "jit_setglobal"},
+        setupval:   {[ptr, i32, lv_ptr], void, "jit_setupval"},
+        gettable:   {[ptr, ptr, i32, i32, i32, i32, i32, lv_ptr], void, "jit_gettable"},
+        settable:   {[ptr, ptr, i32, i32, i32, i32, i32], void, "jit_settable"},
+        self:       {[ptr, ptr, i32, i32, i32, i32, i32, lv_ptr], void, "jit_self"},
+        newtable:   {[lv_ptr], void, "jit_newtable"},
+        setlist:    {[ptr, i32, i32, i32, i32, i32], void, "jit_setlist"},
+        len:        {[ptr, ptr, i32, i32, i32, lv_ptr], void, "jit_len"},
+        concat:     {[ptr, ptr, i32, i32, i32, i32], void, "jit_concat"},
+        closure:    {[ptr, ptr, i32, i32, lv_ptr], void, "jit_closure"},
+        close:      {[ptr, i32, i32], void, "jit_close"},
+        loopedge:   {[ptr, i32, i32], i32, "jit_loopedge"},
+      }
       helpers = {} of Symbol => LLVM::Function
-      helpers[:deopt] = mod.functions.add("jit_deopt", [ptr, ptr, i32, i32, i32], i32)
-      helpers[:dispatch] = mod.functions.add("jit_dispatch_call", [ptr, i32, i32, i32, i32, ptr.pointer], lv_ptr)
-      helpers[:getupval] = mod.functions.add("jit_getupval", [ptr, i32, lv_ptr], ctx.void)
-      helpers[:mod_fn] = mod.functions.add("jit_mod", [f64, f64], f64)
-      helpers[:pow] = mod.functions.add("jit_pow", [f64, f64], f64)
-      # LLVM 15+ opaque pointers: call sites must pass the function type
-      # explicitly (Function#function_type is broken), so keep it alongside
       helper_types = {} of Symbol => LLVM::Type
-      { {:deopt,    [ptr, ptr, i32, i32, i32], i32},
-        {:dispatch, [ptr, i32, i32, i32, i32, ptr.pointer], lv_ptr},
-        {:getupval, [ptr, i32, lv_ptr], ctx.void},
-        {:mod_fn,   [f64, f64], f64},
-        {:pow,      [f64, f64], f64},
-      }.each do |key, argts, rett|
-        helper_types[key] = LLVM::Type.function(argts, rett)
+      sigs.each do |key, sig|
+        helpers[key] = mod.functions.add(sig[2], sig[0], sig[1])
+        helper_types[key] = LLVM::Type.function(sig[0], sig[1])
       end
 
       Gen.new(cl, ctx, f, helpers, helper_types, blocks, entry, f.params[1]).run

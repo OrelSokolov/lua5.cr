@@ -120,21 +120,12 @@ def build_clua!
   need = !File.executable?(CLUA_BIN) || ENV["REBUILD"] == "1"
   return unless need
   FileUtils.mkdir_p(File.dirname(CLUA_BIN))
-  # JIT (LLVM ORC, src/jit): the build needs homebrew LLVM. Prefer an
-  # explicitly configured LLVM_CONFIG, else the standard brew prefix.
-  llvm_bin = ENV["LLVM_CONFIG"]? || "/opt/homebrew/opt/llvm/bin/llvm-config"
-  env = {
-    "LLVM_CONFIG"   => llvm_bin,
-    "LIBRARY_PATH"  => [
-      ENV["LIBRARY_PATH"]?, File.dirname(`#{llvm_bin} --libdir`.strip),
-    ].compact.join(":"),
-  }.compact
-  # pkg-config may be absent; LLVM libdir suffices for -lLLVM
-  sh env, "crystal build --release --no-debug src/cli.cr -o #{CLUA_BIN}",
-     chdir: REPO_ROOT do |ok, _res|
-    # fallback: build without the env guess and let crystal report
-    sh "crystal build --release --no-debug src/cli.cr -o #{CLUA_BIN}", chdir: REPO_ROOT unless ok
-  end
+  # JIT (LLVM ORC, src/jit): the build needs LLVM. Prefer an explicitly
+  # configured LLVM_CONFIG, else the standard homebrew prefix.
+  llvm_bin = ENV["LLVM_CONFIG"] || "/opt/homebrew/opt/llvm/bin/llvm-config"
+  libdir = File.dirname(`#{llvm_bin} --libdir`.strip)
+  env = { "LLVM_CONFIG" => llvm_bin, "LIBRARY_PATH" => libdir }
+  sh env, "crystal build --release --no-debug src/cli.cr -o #{CLUA_BIN}", chdir: REPO_ROOT
 end
 
 namespace :benchmark do

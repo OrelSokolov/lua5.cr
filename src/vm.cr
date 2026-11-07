@@ -1461,9 +1461,15 @@ module Lua
                   if top2 + argn + 4 < @stack.size
                     # JIT entry (JIT.md 1.2): machine code runs the callee,
                     # results land at R[a] — adjust top like store_results.
-                    # Hooks and coroutines keep the interpreter (M1).
-                    if (jcp = fn.compiled) && !@current_co && @hook_on == 0
-                      n = JIT.invoke(jcp, self, fn, newbase, argn, c)
+                    # Hooks, coroutines and deep recursion (jit_depth, see
+                    # runtime.cr) keep the interpreter (M1).
+                    if (jcp = fn.compiled) && !@current_co && @hook_on == 0 && @jit_depth < 512
+                      @jit_depth += 1
+                      begin
+                        n = JIT.invoke(jcp, self, fn, newbase, argn, c)
+                      ensure
+                        @jit_depth -= 1
+                      end
                       if c == -1
                         frame.top = newbase + n
                       elsif c == 0

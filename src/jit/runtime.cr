@@ -62,11 +62,85 @@ fun jit_pow(a : Float64, b : Float64) : Float64
   a ** b
 end
 
+# --- M2: full opcode coverage (JIT.md 2). All mirror the dispatch-loop
+# handlers exactly, including @line/@vi_pc for error naming; Array (@stack)
+# indexing instead of raw pointers — these can re-enter the VM and
+# reallocate the value stack. Results go to `dst` scratch slots. ---
+
+fun jit_getglobal(interp : Void*, cl : Void*, kidx : Int32, pc : Int32, dst : Void*) : Void
+  interp.as(Lua::Interp).jit_getglobal(cl.as(Lua::LuaClosure), kidx, pc, dst.as(Pointer(Lua::LuaValue)))
+end
+
+fun jit_setglobal(interp : Void*, cl : Void*, kidx : Int32, pc : Int32, src : Void*) : Void
+  interp.as(Lua::Interp).jit_setglobal(cl.as(Lua::LuaClosure), kidx, pc, src.as(Pointer(Lua::LuaValue)))
+end
+
+fun jit_setupval(cl : Void*, idx : Int32, src : Void*) : Void
+  u = cl.as(Lua::LuaClosure).upvals[idx]
+  v = src.as(Pointer(Lua::LuaValue)).value
+  if s = u.stack
+    s[u.idx] = v
+  else
+    u.value = v
+  end
+end
+
+fun jit_gettable(interp : Void*, cl : Void*, base : Int32, pc : Int32, a : Int32, b : Int32, c : Int32, dst : Void*) : Void
+  interp.as(Lua::Interp).jit_gettable(cl.as(Lua::LuaClosure), base, pc, a, b, c, dst.as(Pointer(Lua::LuaValue)))
+end
+
+fun jit_settable(interp : Void*, cl : Void*, base : Int32, pc : Int32, a : Int32, b : Int32, c : Int32) : Void
+  interp.as(Lua::Interp).jit_settable(cl.as(Lua::LuaClosure), base, pc, a, b, c)
+end
+
+fun jit_self(interp : Void*, cl : Void*, base : Int32, pc : Int32, a : Int32, b : Int32, kidx : Int32, dst : Void*) : Void
+  interp.as(Lua::Interp).jit_self(cl.as(Lua::LuaClosure), base, pc, a, b, kidx, dst.as(Pointer(Lua::LuaValue)))
+end
+
+fun jit_newtable(dst : Void*) : Void
+  dst.as(Pointer(Lua::LuaValue)).value = Lua::LuaTable.new
+end
+
+fun jit_setlist(interp : Void*, base : Int32, a : Int32, bcount : Int32, c : Int32, top : Int32) : Void
+  interp.as(Lua::Interp).jit_setlist(base, a, bcount, c, top)
+end
+
+fun jit_len(interp : Void*, cl : Void*, base : Int32, pc : Int32, b : Int32, dst : Void*) : Void
+  interp.as(Lua::Interp).jit_len(cl.as(Lua::LuaClosure), base, pc, b, dst.as(Pointer(Lua::LuaValue)))
+end
+
+fun jit_concat(interp : Void*, cl : Void*, base : Int32, pc : Int32, a : Int32, b : Int32) : Void
+  interp.as(Lua::Interp).jit_concat(cl.as(Lua::LuaClosure), base, pc, a, b)
+end
+
+fun jit_closure(interp : Void*, cl : Void*, base : Int32, pidx : Int32, dst : Void*) : Void
+  interp.as(Lua::Interp).jit_closure(cl.as(Lua::LuaClosure), base, pidx, dst.as(Pointer(Lua::LuaValue)))
+end
+
+fun jit_close(interp : Void*, base : Int32, a : Int32) : Void
+  interp.as(Lua::Interp).close_upvals(base + a)
+end
+
+# FORLOOP back-edge: freeze loop-body upvalues; 1 = weak tables active —
+# the caller deopts so the interpreter drives its loop-edge GC (a JIT
+# frame has no CallInfo, gc_clear_stale cannot see its live window)
+fun jit_loopedge(interp : Void*, base : Int32, a : Int32) : Int32
+  interp.as(Lua::Interp).jit_loopedge(base, a)
+end
+
 module Lua
   class Interp
     # LuaError raised somewhere under a JIT invocation; re-raised by the
     # Crystal boundary (JIT.invoke), never unwound through machine frames.
     property jit_err : Exception? = nil
+
+    # Native nesting of JIT entries. NOT reset by run_frames (unlike
+    # @call_depth) — a reset would let deep recursion rebuild JIT chains
+    # inside every interpreter continuation until the C stack dies.
+    # Past the limit, recursion runs flat in the interpreter until
+    # ensure_stack raises "stack overflow" (250k slots) — same observable
+    # behavior as without the JIT.
+    property jit_depth : Int32 = 0
 
     def stack : Array(LuaValue)
       @stack
@@ -76,23 +150,28 @@ module Lua
     def jit_call_dispatch(base : Int32, a : Int32, argn : Int32, want : Int32) : Int32
       fn = @stack[base + a]
       if fn.is_a?(LuaClosure) && (cp = fn.compiled) && !@current_co && @hook_on == 0 &&
-         fn.proto.num_params == argn && !fn.proto.vararg? && @call_depth < 512
+         fn.proto.num_params == argn && !fn.proto.vararg? && @jit_depth < 512
         # JIT->JIT: direct native call, guarded against runaway native
-        # recursion (deep Lua recursion stays in the interpreter).
+        # recursion (deep Lua recursion stays in the interpreter). The
+        # callee window must be ensured first — the VM fast path does the
+        # same check before its entry, and ensure_stack raising here is
+        # what turns deep recursion into "stack overflow" (250k slots).
+        ra = base + a
+        ensure_stack(ra + {fn.proto.max_stack, argn + 1}.max + argn + 4)
         begin
-          @call_depth += 1
-          n = JIT.raw_invoke(cp, self, fn, base + a, argn, want)
+          @jit_depth += 1
+          n = JIT.raw_invoke(cp, self, fn, ra, argn, want)
           # nil-fill missing fixed results (store_results analog)
           if want > 0
             i = n
             while i < want
-              @stack[base + a + i] = nil
+              @stack[ra + i] = nil
               i += 1
             end
           end
           n
         ensure
-          @call_depth -= 1
+          @jit_depth -= 1
         end
       else
         begin
@@ -150,6 +229,109 @@ module Lua
         end
         want
       end
+    end
+
+    # --- M2 helper bodies (see the fun wrappers above): exact mirrors of
+    # the dispatch-loop handlers, @stack-indexed because they can re-enter
+    # the VM (metamethods) and reallocate the value stack ---
+
+    # position info for errors raised by the ops below (pc = instruction
+    # index, the loop's pc-1)
+    def jit_line(cl : LuaClosure, pc : Int32) : Nil
+      @line = cl.proto.lines[pc]? || @line
+      @vi_pc = pc
+    end
+
+    def jit_getglobal(cl : LuaClosure, kidx : Int32, pc : Int32, dst : Pointer(LuaValue)) : Nil
+      jit_line(cl, pc)
+      n = cl.proto.consts[kidx].as(String)
+      dst.value = if (g = cl.env) || @globals.metatable
+                    getindex(g || @globals, n)
+                  else
+                    @globals.raw_get(n)
+                  end
+    end
+
+    def jit_setglobal(cl : LuaClosure, kidx : Int32, pc : Int32, src : Pointer(LuaValue)) : Nil
+      jit_line(cl, pc)
+      setindex(cl.env || @globals, cl.proto.consts[kidx].as(String), src.value)
+    end
+
+    def jit_gettable(cl : LuaClosure, base : Int32, pc : Int32, a : Int32, b : Int32,
+                     c : Int32, dst : Pointer(LuaValue)) : Nil
+      jit_line(cl, pc)
+      o = @stack[base + b]
+      k = @stack[base + c]
+      dst.value = if o.is_a?(LuaTable) && o.metatable.nil?
+                    o.raw_get(k)
+                  else
+                    getindex(o, k, b)
+                  end
+    end
+
+    def jit_settable(cl : LuaClosure, base : Int32, pc : Int32, a : Int32, b : Int32, c : Int32) : Nil
+      jit_line(cl, pc)
+      t = @stack[base + a]
+      k = @stack[base + b]
+      if t.is_a?(LuaTable) && t.metatable.nil?
+        t.raw_set(k, @stack[base + c])
+      else
+        setindex(t, k, @stack[base + c], a)
+      end
+    end
+
+    def jit_self(cl : LuaClosure, base : Int32, pc : Int32, a : Int32, b : Int32,
+                 kidx : Int32, dst : Pointer(LuaValue)) : Nil
+      jit_line(cl, pc)
+      obj = @stack[base + b]
+      @stack[base + a + 1] = obj
+      key = cl.proto.consts[kidx].as(String)
+      dst.value = if obj.is_a?(LuaTable) && obj.metatable.nil?
+                    obj.raw_get(key)
+                  else
+                    getindex(obj, key, b)
+                  end
+    end
+
+    def jit_setlist(base : Int32, a : Int32, bcount : Int32, c : Int32, top : Int32) : Nil
+      t = @stack[base + a].as(LuaTable)
+      # 0-value multi feeds can leave top at the table slot
+      n = bcount == -1 ? {top - (base + a + 1), 0}.max : bcount
+      vals = Array(LuaValue).new(n) { |i| @stack[base + a + 1 + i] }
+      t.raw_fill(c + 1, vals)
+    end
+
+    def jit_len(cl : LuaClosure, base : Int32, pc : Int32, b : Int32, dst : Pointer(LuaValue)) : Nil
+      jit_line(cl, pc)
+      dst.value = lua_len(@stack[base + b], b)
+    end
+
+    def jit_concat(cl : LuaClosure, base : Int32, pc : Int32, a : Int32, b : Int32) : Nil
+      jit_line(cl, pc)
+      v = @stack[base + b]
+      i = b - 1
+      while i >= a
+        v = lua_concat(@stack[base + i], v, i, i + 1)
+        i -= 1
+      end
+      @stack[base + a] = v
+    end
+
+    def jit_closure(cl : LuaClosure, base : Int32, pidx : Int32,
+                    dst : Pointer(LuaValue)) : Nil
+      pr = cl.proto.protos[pidx]
+      ups = Array(UpValue).new(pr.upvals.size)
+      pr.upvals.each do |d|
+        ups << (d.from_stack? ? capture(base + d.index) : cl.upvals[d.index])
+      end
+      nc = LuaClosure.new(pr, ups)
+      nc.env = cl.env # 5.1: closures inherit the enclosing env
+      dst.value = nc
+    end
+
+    def jit_loopedge(base : Int32, a : Int32) : Int32
+      close_upvals(base + a) if @open_max >= base + a
+      Lua.weak_active? ? 1 : 0
     end
 
     # Deopt (JIT.md 3): rebuild the interpreter frame at `pc` and run the
