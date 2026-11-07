@@ -107,7 +107,10 @@ debug.sethook(function (e)
   end, "l")
 end, "c")
 t:m(1, 2, 3, 4)
-assert(X.self == t and X.p == 1 and X.arg.n == 3 and X.q == nil)
+-- xray's LuaJIT is built without LUA_COMPAT_VARARG: no implicit `arg`
+-- local in vararg functions (verified against the engine build, see the
+-- VibeRay lua_run corpus), so frame 2 has no `arg` local at all
+assert(X.self == t and X.p == 1 and X.q == nil and X.arg == nil)
 
 -- tail levels: what="tail", no func, getfenv is a loud error there
 -- (pcall's C frame shifts the count, as in 5.1)

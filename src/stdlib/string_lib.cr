@@ -104,18 +104,23 @@ module Lua::Stdlib
         [nil] of LuaValue
       }))
 
-      tbl.raw_set("gmatch", LuaFunction.new("string.gmatch", ->(i2 : Interp, args : Array(LuaValue)) {
-        s = i2.str!(args, 0, "gmatch").to_slice
-        p = i2.str!(args, 1, "gmatch").to_slice
-        pat, anchored = strip_anchor(p)
-        st = GmatchState.new(s, pat, anchored)
-        iter = LuaFunction.new("gmatch_iter", ->(i3 : Interp, _a : Array(LuaValue)) {
-          st.next_match(i3)
+      # gmatch factory: the deprecated 5.1 alias gfind must be its OWN
+      # function so arg-check errors carry the CALLED name (engine LuaJIT:
+      # "bad argument #1 to 'gfind'", see xr_logic.script)
+      make_gmatch = ->(fname : String) {
+        LuaFunction.new(fname, ->(i2 : Interp, args : Array(LuaValue)) {
+          s = i2.str!(args, 0, fname).to_slice
+          p = i2.str!(args, 1, fname).to_slice
+          pat, anchored = strip_anchor(p)
+          st = GmatchState.new(s, pat, anchored)
+          iter = LuaFunction.new("gmatch_iter", ->(i3 : Interp, _a : Array(LuaValue)) {
+            st.next_match(i3)
+          })
+          [iter] of LuaValue
         })
-        [iter] of LuaValue
-      }))
-      # 5.1 deprecated alias
-      tbl.raw_set("gfind", tbl.raw_get("gmatch"))
+      }
+      tbl.raw_set("gmatch", make_gmatch.call("string.gmatch"))
+      tbl.raw_set("gfind", make_gmatch.call("gfind"))
 
       # string.dump(f): no real bytecode — returns the proto's source slice,
       # which load() recompiles to an equivalent chunk (calls.lua roundtrip)

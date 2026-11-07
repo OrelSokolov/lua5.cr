@@ -377,6 +377,20 @@ module Lua::Stdlib
       i.globals.raw_set("_G", i.globals)
       i.globals.raw_set("_VERSION", "Lua 5.1")
 
+      # LuaJIT registers a `jit` table as part of the baseline stdlib; xray
+      # scripts branch on its existence (`if jit == nil then ... end`, see
+      # _g.script). Data fields match LuaJIT 2.1.0-beta3 on x64 Linux; the
+      # members are stubs unless a corpus case exercises them.
+      jit_tab = LuaTable.new
+      jit_tab.raw_set("version", "LuaJIT 2.1.0-beta3")
+      jit_tab.raw_set("version_num", 20100)
+      jit_tab.raw_set("arch", "x64")
+      jit_tab.raw_set("os", "Linux")
+      {"on", "off", "flush"}.each do |fn|
+        jit_tab.raw_set(fn, LuaFunction.new("jit.#{fn}", ->(_i : Interp, _args : Array(LuaValue)) { [] of LuaValue }))
+      end
+      i.globals.raw_set("jit", jit_tab)
+
       # 5.1 function environments (luaB_setfenv/luaB_getfenv)
       i.native("setfenv") do |i2, args|
         t = args[1]?

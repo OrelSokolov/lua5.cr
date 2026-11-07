@@ -97,6 +97,18 @@ module Lua
               adv
             end
           end
+        elsif ch == 0x2F && c(1) == 0x2F # xray LuaJIT ext: "//" line comment
+          adv; adv
+          until eof? || @s[@pos] == 0x0A || @s[@pos] == 0x0D
+            adv
+          end
+        elsif ch == 0x2F && c(1) == 0x2A # xray LuaJIT ext: "/* */" comment
+          adv; adv
+          until eof? || (c == 0x2A && c(1) == 0x2F)
+            adv
+          end
+          break if eof? # xray lexer ends an unterminated /* comment at EOF silently
+          adv; adv # consume '*' '/'
         else
           return
         end
@@ -332,13 +344,15 @@ module Lua
       loop do
         ch = c
         if ch == -1 || ch == 0x0A || ch == 0x0D
-          err("unfinished string (starting at line #{line})", line)
+          # lj_lex: the shown token is the raw partial string INCLUDING the
+          # opening quote, control bytes and all (no escaping)
+          err("unfinished string near '#{String.new(@s[tstart, @pos - tstart])}'", line)
         elsif ch == quote
           adv
           break
         elsif ch == 0x5C # '\\'
           adv
-          read_escape(buf, line)
+          read_escape(buf, line, tstart)
         else
           buf.write_byte(adv.to_u8)
         end
@@ -347,9 +361,9 @@ module Lua
       Token.new(Tk::Str, line, String.new(buf.to_slice), 0.0, raw)
     end
 
-    private def read_escape(buf : IO::Memory, line : Int32)
+    private def read_escape(buf : IO::Memory, line : Int32, tstart : Int32)
       if eof?
-        err("unfinished string (starting at line #{line})", line)
+        err("unfinished string near '#{String.new(@s[tstart, @pos - tstart])}'", line)
       end
       case e = adv
       when 0x61 then buf.write_byte(7)
@@ -391,7 +405,8 @@ module Lua
         err("decimal escape too large near '\\#{v}'") if v > 255
         buf.write_byte(v.to_u8)
       else
-        err("invalid escape sequence '\\#{e.chr}'")
+        # lj_lex invalid-escape error token: just the opening quote
+        err(%(invalid escape sequence near '"'))
       end
     end
   end

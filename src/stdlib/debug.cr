@@ -548,22 +548,31 @@ module Lua
   # luaO_chunkid: source → short_src
   def self.short_src(source : String) : String
     if source.starts_with?('=')
-      src = source[1..]
-      src.size > 59 ? src[0, 59] : src
+      # lj_debug_shortname: strncpy(out, src+1, LUA_IDSIZE=60)
+      src = source.byte_slice(1, source.bytesize - 1)
+      src.bytesize > 60 ? src.byte_slice(0, 60) : src
     elsif source.starts_with?('@')
-      src = source[1..]
-      if src.size > 54 # bufflen 60 - " '...' " overhead
-        "..." + src[(src.size - 54)..]
+      # lj_debug_shortname: "..." + last LUA_IDSIZE-4 = 56 chars when the
+      # name (sans '@') is >= 60
+      src = source.byte_slice(1, source.bytesize - 1)
+      if src.bytesize >= 60
+        "..." + src.byte_slice(src.bytesize - 56, 56)
       else
         src
       end
     else
-      head = source.split('\n').first
-      head = head.split('\r').first
-      if head.size > 40
-        "[string \"#{head[0, 40]}...\"]"
-      elsif head.size < source.size
-        "[string \"#{head}...\"]"
+      # lj_debug_shortname: scan up to the first control char (< 0x20) or
+      # LUA_IDSIZE-12 = 48; if the source continues past that, keep the head
+      # (at most LUA_IDSIZE-15 = 45) + "..."
+      head = String.build do |b|
+        source.each_byte do |byte|
+          break if byte < 0x20 || b.bytesize >= 48
+          b.write_byte(byte)
+        end
+      end
+      if head.bytesize < source.bytesize || (head.bytesize == 48 && source.bytesize > 48)
+        h = head.bytesize > 45 ? head.byte_slice(0, 45) : head
+        "[string \"#{h}...\"]"
       else
         "[string \"#{head}\"]"
       end

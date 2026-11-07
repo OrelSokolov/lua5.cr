@@ -233,12 +233,14 @@ module Lua
         f.freereg = base + s.names.size
       when AST::AssignStat
         f = fs
-        base = f.freereg
+        base0 = f.freereg
         n = s.targets.size
-        compile_explist(s.exps, base, n)
-        # pre-evaluate every index target's table/key before any store: a
-        # simple-variable assignment earlier in the list must not change
-        # how later index targets resolve (5.1 restassign)
+        # 5.1 lparser: each target's prefix/index code is emitted while the
+        # target is PARSED — i.e. BEFORE the RHS is evaluated (engine corpus
+        # dialogs.script:246: the lhs 'db' index error must fire before the
+        # rhs call error). Evaluate every index target's table/key first;
+        # this also keeps the restassign invariant (a simple-variable store
+        # earlier in the list cannot change how later index targets resolve).
         tgt = [] of {Int32, Int32}
         s.targets.each do |t|
           if t.is_a?(AST::IndexE)
@@ -253,6 +255,8 @@ module Lua
             tgt << {-1, -1}
           end
         end
+        base = f.freereg
+        compile_explist(s.exps, base, n)
         s.targets.each_with_index do |t, i|
           case t
           when AST::NameE then assign_name(t.name, base + i)
@@ -263,7 +267,7 @@ module Lua
             syntax_err("internal: bad assignment target")
           end
         end
-        f.freereg = base
+        f.freereg = base0
       when AST::ExprStat
         base = fs.freereg
         expr(s.e, base, 0)
@@ -575,14 +579,10 @@ module Lua
       end
       use_reg(e.params.size)
       if e.vararg
-        # 5.1 LUA_COMPAT_VARARG: implicit `arg` local right after the
-        # params — but NOT if the body uses `...` (NEEDSARG is cleared)
-        p.needs_arg = true
-        add_local("arg", 1 + e.params.size)
-        use_reg(1 + e.params.size)
+        # xray's LuaJIT is built without LUA_COMPAT_VARARG: no implicit
+        # `arg` local (engine parity — see VibeRay lua_run corpus, bug7.script)
       end
       block_scope(e.body)
-      p.needs_arg = false if nfs.uses_vararg?
       pop_scope
       # 5.1 endfunc: the implicit RETURN is attributed to the `end` line
       # (activelines[lastlinedefined] must be set)
@@ -1338,6 +1338,11 @@ module Lua
               t = sp[base + a]
               k = sp[base + b]
               if t.is_a?(LuaTable) && t.metatable.nil?
+                if k.nil? || (k.is_a?(Float64) && k.nan?)
+                  @line = lines[pc - 1]
+                  @vi_pc = pc - 1
+                  raise_lua(k.nil? ? "table index is nil" : "table index is NaN")
+                end
                 t.raw_set(k, sp[base + c])
               else
                 @line = lines[pc - 1]
@@ -1522,7 +1527,7 @@ module Lua
               v1 = Lua.tonumber(sp[base + a + 1])
               v2 = Lua.tonumber(sp[base + a + 2])
               raise_lua("'for' initial value must be a number") unless v0
-              raise_lua("'for' limit value must be a number") unless v1
+              raise_lua("'for' limit must be a number") unless v1
               raise_lua("'for' step value must be a number") unless v2
               init = v0.not_nil!
               lim = v1.not_nil!

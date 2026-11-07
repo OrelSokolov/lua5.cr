@@ -112,23 +112,26 @@ module Lua::Stdlib
       }))
 
       tbl.raw_set("random", LuaFunction.new("math.random", ->(i2 : Interp, args : Array(LuaValue)) {
+        # xray's LuaJIT lib_math.c: NO interval validation —
+        #   d = prng_double() - 1.0 (in [0,1))
+        #   0 args: d | 1 arg: floor(d*r1) + 1 | 2 args: floor(d*(r2-r1+1)) + r1
+        # (engine corpus: math.random(1, 0) == 1, math.random(5, 5) == 5)
+        d = i2.rng.next_double
         case args.size
-        when 0 then [i2.rng.next_float] of LuaValue
+        when 0 then [d] of LuaValue
         when 1
-          m = i2.num!(args, 0, "random").to_i
-          i2.raise_lua("bad argument #1 to 'random' (interval is empty)") if m < 1
-          [i2.rng.rand(1..m).to_f64] of LuaValue
+          r1 = i2.num!(args, 0, "random")
+          [(d * r1).floor + 1.0] of LuaValue
         else
-          m = i2.num!(args, 0, "random").to_i
-          n = i2.num!(args, 1, "random").to_i
-          i2.raise_lua("bad argument #2 to 'random' (interval is empty)") if n < m
-          [i2.rng.rand(m..n).to_f64] of LuaValue
+          r1 = i2.num!(args, 0, "random")
+          r2 = i2.num!(args, 1, "random")
+          [(d * (r2 - r1 + 1.0)).floor + r1] of LuaValue
         end
       }))
 
       tbl.raw_set("randomseed", LuaFunction.new("math.randomseed", ->(i2 : Interp, args : Array(LuaValue)) {
-        seed = i2.num!(args, 0, "randomseed").to_i64
-        i2.rng = Random.new(seed)
+        seed = i2.num!(args, 0, "randomseed")
+        i2.rng.seed(seed)
         [] of LuaValue
       }))
 

@@ -18,7 +18,7 @@ module Lua
     property globals : LuaTable
     getter string_lib : LuaTable
     getter string_meta : LuaTable
-    property rng : Random = Random.new
+    property rng : LuaJitPrng = LuaJitPrng.new
     property chunkname : String = "chunk"
     property line : Int32 = 0
     # Index of the faulting instruction, set by the VM slow paths alongside
@@ -414,6 +414,14 @@ module Lua
     end
 
     def setindex(obj : LuaValue, key : LuaValue, val : LuaValue, objreg : Int32 = -1) : Nil
+      # 5.1: "table index is nil/NaN" carries the faulting position
+      # (lj_err / luaG_runerror add "[string ...]:line:") — raise through
+      # raise_lua so the prefix matches (engine corpus: _g.script:32)
+      if key.nil?
+        raise_lua("table index is nil")
+      elsif key.is_a?(Float64) && key.nan?
+        raise_lua("table index is NaN")
+      end
       cur = obj
       while cur.is_a?(LuaTable)
         if cur.has_key?(key)
