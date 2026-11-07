@@ -12,11 +12,20 @@ def plain(s)
   s.gsub(/\e\[\d+m/, "")
 end
 
-# vm → { json:, file: } of its newest results file (timestamped names sort)
+# vm → { json:, file: } of its newest results file (timestamped names sort).
+# Single-bench runs (rake benchmark:clua[fannkuch]) don't shadow full-suite
+# runs: the newest file covering the whole BENCHES list wins; the newest
+# file at all is the fallback when no full run exists for that vm.
 def latest_runs
   Dir[File.join(RESULTS, "*-*.json")].sort.group_by { |f|
     File.basename(f).sub(/\A\d{8}-\d{6}-/, "").sub(/\.json\z/, "")
-  }.transform_values { |files| { json: JSON.parse(File.read(files.last)), file: files.last } }
+  }.transform_values { |files|
+    full = files.reverse.find { |f|
+      names = JSON.parse(File.read(f))["results"].keys
+      BENCHES.map(&:first).all? { |b| names.include?(b) }
+    } || files.last
+    { json: JSON.parse(File.read(full)), file: full }
+  }
 end
 
 desc "Comparison table (bench × interpreter) from bench/results/, latest run per vm"
@@ -57,8 +66,8 @@ namespace :benchmark do
       end
       if vms.include?("jitlua")
         jit = runs.dig("jitlua", :json, "results", name, "min")
-        if vms.include?("lua") && jit
-          row << format("%.1fx", runs.dig("lua", :json, "results", name, "min").fdiv(jit))
+        if vms.include?("lua") && jit && (l = runs.dig("lua", :json, "results", name, "min"))
+          row << format("%.1fx", l.fdiv(jit))
         end
         if vms.include?("clua") && (c = runs.dig("clua", :json, "results", name, "min")) && jit
           row << format("%.1fx", c.fdiv(jit))
