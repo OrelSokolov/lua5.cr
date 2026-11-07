@@ -4,12 +4,15 @@ require "tempfile"
 
 # ————— benchmark:report — comparison table from bench/results/ —————
 
-def bold(s)
-  $stdout.tty? ? "\e[1m#{s}\e[0m" : s
+RANK_COLORS = { 1 => "\e[1;32m", 2 => "\e[34m", 3 => "\e[33m", 4 => "\e[31m" }.freeze
+
+def rank_style(s, rank)
+  return s unless $stdout.tty? && (c = RANK_COLORS[rank])
+  "#{c}#{s}\e[0m"
 end
 
 def plain(s)
-  s.gsub(/\e\[\d+m/, "")
+  s.gsub(/\e\[\d+(?:;\d+)*m/, "")
 end
 
 # vm → { json:, file: } of its newest results file (timestamped names sort).
@@ -38,7 +41,7 @@ namespace :benchmark do
   labels = vms.to_h { |v| [v, VMS.fetch(v)[:label]] }
 
   puts
-  puts "Min-of-N wall time, seconds (bold — fastest per bench; ! — output differs from luajit):"
+  puts "Min-of-N wall time, seconds (green — fastest per bench, blue — 2nd, yellow — 3rd, red — 4th; ! — output differs from luajit):"
   rows = []
   header = ["bench", *vms.map { |v| labels[v] }]
   header << "51/jit" if vms.include?("jitlua") && vms.include?("lua")
@@ -47,7 +50,8 @@ namespace :benchmark do
   BENCHES.map(&:first).each do |name|
       row = [name]
       mins = vms.map { |v| r = runs[v][:json]["results"][name]; r && r["min"] }
-      best = mins.compact.min
+      # distinct mins sorted ascending → rank 1..n; equal times share a rank
+      order = mins.compact.uniq.sort
       vms.each_with_index do |v, i|
         r = runs[v][:json]["results"][name]
         if r.nil? || r["min"].nil?
@@ -61,7 +65,7 @@ namespace :benchmark do
             mark = " !"
           end
           cell = format("%.3f%s", r["min"], mark)
-          row << (r["min"] == best ? bold(cell) : cell)
+          row << rank_style(cell, order.index(r["min"]) + 1)
         end
       end
       if vms.include?("jitlua")
