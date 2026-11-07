@@ -302,10 +302,13 @@ module Lua::JIT
     # 21+; the Crystal bindings stub ThreadSafeContext#new(Context) with
     # NotImplementedError on older LLVM). There the ThreadSafeContext must
     # own its context up front — so create it first and hand out the
-    # context it owns.
+    # context it owns. The C entry point takes ownership of the ContextRef:
+    # the wrapper must not also dispose it on finalize (double free — the
+    # GC'd wrapper would free the context out from under the kept
+    # ThreadSafeContext, crashing ~LLVMContextImpl later).
     private def self.module_context : {LLVM::Context, LLVM::Orc::ThreadSafeContext}
       {% if LibLLVM.has_method?(:orc_create_new_thread_safe_context_from_llvm_context) %}
-      ctx = LLVM::Context.new
+      ctx = LLVM::Context.new(dispose_on_finalize: false)
       {ctx, LLVM::Orc::ThreadSafeContext.new(ctx)}
       {% else %}
       ts_ctx = LLVM::Orc::ThreadSafeContext.new
