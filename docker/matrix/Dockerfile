@@ -16,12 +16,14 @@ ARG CRYSTAL=crystallang/crystal:1.21
 FROM ${CRYSTAL}
 
 ARG LLVM=20
-ARG UBUNTU_CODENAME=noble
 
+# The codename comes from the image itself: the official Crystal images ride
+# different Ubuntu releases (1.21 -> noble, 1.22 -> resolute).
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates wget g++ \
  && wget -qO /etc/apt/trusted.gpg.d/llvm.asc https://apt.llvm.org/llvm-snapshot.gpg.key \
- && echo "deb http://apt.llvm.org/${UBUNTU_CODENAME}/ llvm-toolchain-${UBUNTU_CODENAME}-${LLVM} main" \
+ && . /etc/os-release \
+ && echo "deb http://apt.llvm.org/${VERSION_CODENAME}/ llvm-toolchain-${VERSION_CODENAME}-${LLVM} main" \
       > /etc/apt/sources.list.d/llvm.list \
  && apt-get update \
  && apt-get install -y --no-install-recommends llvm-${LLVM}-dev \
