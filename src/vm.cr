@@ -1450,6 +1450,7 @@ module Lua
               fn = sp[base + a]
               argn = b == -1 ? {frame.top - (base + a + 1), 0}.max : b # 0-value multi feeds: top can sit on the closure slot
               if fn.is_a?(LuaClosure)
+                JIT.on_call(fn) # M0 hotness (JIT.md 1.2): bump + threshold check
                 frame.pc = pc
                 p = fn.proto
                 # fast path: exact args, no varargs, stack already sized —
@@ -1458,6 +1459,27 @@ module Lua
                   newbase = base + a
                   top2 = newbase + {p.max_stack, argn + 1}.max
                   if top2 + argn + 4 < @stack.size
+                    # JIT entry (JIT.md 1.2): machine code runs the callee,
+                    # results land at R[a] — adjust top like store_results.
+                    # Hooks and coroutines keep the interpreter (M1).
+                    if (jcp = fn.compiled) && !@current_co && @hook_on == 0
+                      n = JIT.invoke(jcp, self, fn, newbase, argn, c)
+                      if c == -1
+                        frame.top = newbase + n
+                      elsif c == 0
+                        frame.top = newbase
+                      else
+                        stack = @stack
+                        sp2 = stack.to_unsafe
+                        i = n
+                        while i < c
+                          sp2[newbase + i] = nil
+                          i += 1
+                        end
+                        frame.top = newbase + c
+                      end
+                      next
+                    end
                     fp = @frames.to_unsafe
                     if @fsize < @frames.size
                       nf = fp[@fsize]

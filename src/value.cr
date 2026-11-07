@@ -638,6 +638,11 @@ module Lua
     getter upvals : Array(UpValue)
     # Function environment (5.1 setfenv/getfenv): nil = interpreter globals.
     property env : LuaTable? = nil
+    # JIT (JIT.md 1.2): calls since creation; crossing Lua::JIT::THRESHOLD
+    # tiers the closure up (stub in M0).
+    property hot : Int32 = 0
+    # Machine code entry once the JIT compiled this closure (M1+).
+    property compiled : Pointer(Void)? = nil
 
     def initialize(@proto, @upvals)
     end
