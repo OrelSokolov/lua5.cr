@@ -62,6 +62,37 @@ fun jit_pow(a : Float64, b : Float64) : Float64
   a ** b
 end
 
+# --- M3 remainder: polymorphic fallbacks for arithmetic / compare. The
+# JIT's inline fast paths take number operands only; these run the exact
+# interpreter semantics (string coercion, metamethods, errors) for every
+# other shape observed in the type feedback. ---
+
+# opid: 0 = +, 1 = -, 2 = *, 3 = /, 4 = %, 5 = ^
+fun jit_arith(interp : Void*, cl : Void*, base : Int32, pc : Int32,
+              opid : Int32, b : Int32, c : Int32, dst : Void*) : Void
+  interp.as(Lua::Interp).jit_arith(cl.as(Lua::LuaClosure), base, pc, opid, b, c,
+    dst.as(Pointer(Lua::LuaValue)))
+end
+
+fun jit_unm(interp : Void*, cl : Void*, base : Int32, pc : Int32,
+            b : Int32, dst : Void*) : Void
+  interp.as(Lua::Interp).jit_unm(cl.as(Lua::LuaClosure), base, pc, b,
+    dst.as(Pointer(Lua::LuaValue)))
+end
+
+# opid: 0 = ==, 1 = <, 2 = <=, 3 = ~=
+fun jit_cmp(interp : Void*, cl : Void*, base : Int32, pc : Int32,
+            opid : Int32, b : Int32, c : Int32, dst : Void*) : Void
+  interp.as(Lua::Interp).jit_cmp(cl.as(Lua::LuaClosure), base, pc, opid, b, c,
+    dst.as(Pointer(Lua::LuaValue)))
+end
+
+# Bytewise string order (Lua.strcmp) for the inlined str/str compare
+# path — arguments are String object pointers from LuaValue payloads.
+fun jit_strcmp(a : Void*, b : Void*) : Int32
+  Lua.strcmp(a.as(String), b.as(String))
+end
+
 # --- M2: full opcode coverage (JIT.md 2). All mirror the dispatch-loop
 # handlers exactly, including @line/@vi_pc for error naming; Array (@stack)
 # indexing instead of raw pointers — these can re-enter the VM and
@@ -219,6 +250,11 @@ module Lua
           @jit_stack_hi = prev_hi
         end
       else
+        # Callee tier-up from a JIT caller: without this bump an
+        # OSR'd caller would keep its callees one call short of the
+        # threshold forever (the interpreter's FORLOOP bumps the caller
+        # BEFORE the body, so the caller always wins the race).
+        JIT.on_call(self, fn) if fn.is_a?(LuaClosure)
         begin
           jit_slow_call(fn, base, a, argn, want)
         rescue e : LuaError
@@ -379,6 +415,43 @@ module Lua
       Lua.weak_active? ? 1 : 0
     end
 
+    # Polymorphic arithmetic fallback (see jit_arith above): the exact
+    # interpreter slow path — tonumber coercion, then metamethods/error.
+    def jit_arith(cl : LuaClosure, base : Int32, pc : Int32, opid : Int32,
+                  b : Int32, c : Int32, dst : Pointer(LuaValue)) : Nil
+      jit_line(cl, pc)
+      op = case opid
+           when 0 then "+"
+           when 1 then "-"
+           when 2 then "*"
+           when 3 then "/"
+           when 4 then "%"
+           else        "^"
+           end
+      dst.value = arith(op, @stack[base + b], @stack[base + c], b, c)
+    end
+
+    def jit_unm(cl : LuaClosure, base : Int32, pc : Int32, b : Int32,
+                dst : Pointer(LuaValue)) : Nil
+      jit_line(cl, pc)
+      dst.value = negate(@stack[base + b], b)
+    end
+
+    # Polymorphic compare fallback (see jit_cmp above): string order,
+    # metamethods and the comparison error — the interpreter semantics.
+    def jit_cmp(cl : LuaClosure, base : Int32, pc : Int32, opid : Int32,
+                b : Int32, c : Int32, dst : Pointer(LuaValue)) : Nil
+      jit_line(cl, pc)
+      l = @stack[base + b]
+      r = @stack[base + c]
+      dst.value = case opid
+                  when 0 then lua_eq(l, r)
+                  when 1 then lua_compare(l, r, "<")
+                  when 2 then lua_compare(l, r, "<=")
+                  else        !lua_eq(l, r)
+                  end
+    end
+
     # Deopt (JIT.md 3): rebuild the interpreter frame at `pc` and run the
     # rest of the closure in the VM; same result/status contract as a
     # fresh JIT entry. An OSR entry (vm.cr back-edge tier-up) left the very
@@ -391,15 +464,16 @@ module Lua
         # (osr_run in vm.cr) completes its return when we hand control back
         tf.pc = pc
         tf.osr_blocked = true
-        res = run_frames(@fsize - 1, base)
+        vals = run_frames(@fsize - 1, base)
         @fsize += 1 # run_frames' ensure retired the entry frame; restore it
         # the JIT entry contract wants results at stack[base..]
         i = 0
-        while i < res.size
-          @stack[base + i] = res[i]
+        while i < vals.size
+          @stack[base + i] = vals[i]
           i += 1
         end
-        return res.size
+        JIT.on_deopt(self, cl)
+        return vals.size
       end
       ensure_stack(base + p.max_stack + 4)
       top = base + p.max_stack
@@ -413,11 +487,16 @@ module Lua
       f.pc = pc
       @fsize += 1
       begin
-        jit_store_results(base, want, run_frames(@fsize - 1, base))
+        res = jit_store_results(base, want, run_frames(@fsize - 1, base))
       rescue e : LuaError
         @jit_err = e
-        -1
+        res = -1
       end
+      # the frame just re-ran interpreted from the deopt pc, so any new
+      # operand shape was sampled into the proto's feedback table —
+      # recompile when the compile never saw these bits (JIT.md §2)
+      JIT.on_deopt(self, cl)
+      res
     end
   end
 end

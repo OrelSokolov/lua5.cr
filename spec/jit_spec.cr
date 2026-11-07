@@ -5,7 +5,9 @@ describe "JIT hotness" do
   it "hands a hot closure to the compiler" do
     Lua::JIT.compiled_count = 0
     lua_run("local function f() end for i = 1, 600 do f() end")
-    Lua::JIT.compiled_count.should eq(1)
+    # both tier up: the main chunk (back-edge hotness, OSR) and f itself
+    # (calls from the OSR'd caller bump the callee counter too)
+    Lua::JIT.compiled_count.should eq(2)
   end
 
   it "does not tier up below the threshold" do
@@ -79,5 +81,115 @@ describe "JIT hotness" do
     r[5].should eq(70.0)
     r[6].should eq("a")
     r[7].should eq(2.0)
+  end
+
+  # M3 remainder: type feedback (JIT.md §2) — the interpreter samples
+  # non-number operand shapes per pc into the Proto side-table; the JIT
+  # specializes mono-numeric when the mask is clean and polymorphic
+  # (helper fallback, no deopt churn) when it is not. Wrong speculation
+  # deopts, the interpreter samples the new shape and on_deopt recompiles.
+  #
+  # Warm-up uses TWO loops of THRESHOLD/2 calls: a single loop past the
+  # threshold would tier the MAIN chunk up first (back-edge hotness) and
+  # OSR it — calls from machine code do not bump the callee's counter,
+  # so the callee would stay short of the threshold and never compile.
+  describe "type feedback" do
+    it "compiles polymorphic from the first compile when strings were seen" do
+      Lua::JIT.compiled_count = 0
+      n = {Lua::JIT::THRESHOLD // 2, 1}.max
+      r = lua_run(<<-LUA)
+        local function add(a, b) return a + b end
+        for i = 1, #{n} do add("1", "2") end
+        for i = 1, #{n} do add("1", "2") end
+        return add("10", "5"), add(2, 3), add(1.5, "1")
+      LUA
+      r[0].should eq(15.0) # tonumber coercion, helper path
+      r[1].should eq(5.0)  # num/num inline path
+      r[2].should eq(2.5)
+    end
+
+    it "recompiles after a deopt widens the feedback mask" do
+      Lua::JIT.compiled_count = 0
+      n = {Lua::JIT::THRESHOLD // 2, 1}.max
+      r = lua_run(<<-LUA)
+        local function mul(a, b) return a * b end
+        for i = 1, #{n} do mul(i, 2) end   -- interpreted warm-up (mono mask)
+        for i = 1, #{n} do mul(i, 2) end   -- mul compiles here (call #{n * 2})
+        local a = mul("3", "4")            -- deopt + drift sample + recompile
+        for i = 1, 100 do if mul("2", "5") ~= 10 then return "bad" end end
+        return a, mul(3, 4)
+      LUA
+      r[0].should eq(12.0)
+      r[1].should eq(12.0)
+      Lua::JIT.compiled_count.should be >= 2 # initial compile + recompile
+    end
+
+    it "keeps string compares in machine code" do
+      n = {Lua::JIT::THRESHOLD // 2, 1}.max
+      r = lua_run(<<-LUA)
+        local function lt(a, b) return a < b end
+        local function le(a, b) return a <= b end
+        for i = 1, #{n} do lt("a", "b"); le("a", "a") end
+        for i = 1, #{n} do lt("a", "b"); le("a", "a") end
+        return lt("abc", "abd"), lt("b", "a"), le("a", "a"), le("b", "a"), lt(1, 2)
+      LUA
+      r[0].should be_true # inline strcmp path
+      r[1].should be_false
+      r[2].should be_true
+      r[3].should be_false
+      r[4].should be_true # num/num path of the same polymorphic op
+    end
+
+    it "handles equality of every shape through the feedback path" do
+      n = {Lua::JIT::THRESHOLD // 2, 1}.max
+      r = lua_run(<<-LUA)
+        local t1, t2 = {}, {}
+        local function eqv(a, b) return a == b end
+        local function neq(a, b) return a ~= b end
+        for i = 1, #{n} do eqv(t1, t1); neq("a", "a") end
+        for i = 1, #{n} do eqv(t1, t1); neq("a", "a") end
+        return eqv(t1, t1), eqv(t1, t2), eqv("x", "x"), eqv("x", "y"),
+               eqv(1, "1"), neq("x", "y"), neq(2, 2), eqv(true, true), eqv(nil, nil)
+      LUA
+      r[0].should be_true
+      r[1].should be_false
+      r[2].should be_true
+      r[3].should be_false
+      r[4].should be_false # no cross-type coercion in ==
+      r[5].should be_true
+      r[6].should be_false
+      r[7].should be_true
+      r[8].should be_true
+    end
+
+    it "runs metamethod arith and compare errors through the helper" do
+      n = {Lua::JIT::THRESHOLD // 2, 1}.max
+      r = lua_run(<<-LUA)
+        local mt = setmetatable({}, {__add = function(x, y) return 42 end})
+        local function add(a, b) return a + b end
+        for i = 1, #{n} do add(mt, 1) end
+        for i = 1, #{n} do add(mt, 1) end
+        local function le(a, b) return a <= b end
+        for i = 1, #{n} do le("a", "b") end
+        for i = 1, #{n} do le("a", "b") end
+        local ok = pcall(le, {}, {})
+        return add(mt, 1), add(1, 2), ok
+      LUA
+      r[0].should eq(42.0)
+      r[1].should eq(3.0)
+      r[2].should be_false # compare error raised from the helper
+    end
+
+    it "specializes unary minus on strings" do
+      n = {Lua::JIT::THRESHOLD // 2, 1}.max
+      r = lua_run(<<-LUA)
+        local function neg(a) return -a end
+        for i = 1, #{n} do neg("5") end
+        for i = 1, #{n} do neg("5") end
+        return neg("5"), neg(3)
+      LUA
+      r[0].should eq(-5.0)
+      r[1].should eq(-3.0)
+    end
   end
 end

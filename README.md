@@ -104,24 +104,26 @@ as `rake benchmark:*`). References: PUC Lua 5.1.5 (C interpreter), LuaJIT 2.1
 
 | bench | lua5.1, s | clua (Crystal JIT), s | LuaJIT, s | clua vs lua5.1 |
 |---|---|---|---|---|
-| nbody | 2.081 | 2.645 | 0.092 | 1.27× slower |
-| spectral-norm | 6.520 | 3.105 | 0.165 | 2.10× faster |
-| array3d | 3.542 | 3.442 | 0.071 | 1.03× faster |
-| mandelbrot | 2.833 | 1.282 | 0.283 | 2.21× faster |
-| fannkuch | 1.242 | 0.576 | 0.143 | 2.16× faster |
-| recursive-fib | 1.866 | 1.049 | 0.139 | 1.78× faster |
-| partialsums | 0.830 | 0.736 | 0.116 | 1.13× faster |
-| binary-trees | 0.649 | 0.659 | 0.165 | ~par |
-| nsieve | 0.881 | 0.398 | 0.136 | 2.21× faster |
-| series | 0.400 | 0.404 | 0.115 | ~par |
-| fasta | 1.565 | 2.517 | 0.562 | 1.61× slower |
-| scimark-fft | 10.573 | 7.448 | 0.620 | 1.42× faster |
+| nbody | 2.081 | 2.636 | 0.092 | 1.27× slower |
+| spectral-norm | 6.520 | 3.028 | 0.165 | 2.15× faster |
+| array3d | 3.542 | 3.528 | 0.071 | ~par |
+| mandelbrot | 2.833 | 1.285 | 0.283 | 2.20× faster |
+| fannkuch | 1.242 | 0.581 | 0.143 | 2.14× faster |
+| recursive-fib | 1.866 | 1.060 | 0.139 | 1.76× faster |
+| partialsums | 0.830 | 0.731 | 0.116 | 1.14× faster |
+| binary-trees | 0.649 | 0.652 | 0.165 | ~par |
+| nsieve | 0.881 | 0.403 | 0.136 | 2.18× faster |
+| series | 0.400 | 0.385 | 0.115 | 1.04× faster |
+| fasta | 1.565 | 2.475 | 0.562 | 1.58× slower |
+| scimark-fft | 10.573 | 7.412 | 0.620 | 1.43× faster |
 
 9 of 12 benches are at parity with or faster than PUC Lua 5.1 (session
-start: 3 of 12; e.g. nbody 5.40→2.65s, mandelbrot 3.76→1.28s, array3d
-5.89→3.44s, scimark-fft 12.95→7.45s).
+start: 3 of 12; e.g. nbody 5.40→2.64s, mandelbrot 3.76→1.29s, array3d
+5.89→3.53s, scimark-fft 12.95→7.41s). Against the project's own
+interpreter the JIT is now 1.98× on nbody and 3.8× on mandelbrot
+(M3.4 DoD, `LUA5_JIT_THRESHOLD` huge vs default).
 
-What landed (see JIT.md §5, M3.2):
+What landed (see JIT.md §5, M3.2–M3.4):
 
 1. **IR optimization pipeline in ORC** (`LLVMRunPasses`, `default<O2>`):
    mem2reg/GVN/LICM over the generated IR. Critical prerequisite — the
@@ -152,15 +154,29 @@ What landed (see JIT.md §5, M3.2):
    Innermost loops only — an OSR entry into a nested loop head bypasses
    the enclosing head, whose phi would then read a stale register
    (dominance violation, caught by module verification).
+6. **Type feedback (M3.4)**: the interpreter samples non-number operand
+   shapes per pc into a side-table on Proto; the JIT compiles
+   mono-numeric sites with deopt guards and polymorphic sites with an
+   inline fast path plus a runtime helper for string coercion,
+   metamethods and errors (no deopt churn on polymorphic code, e.g.
+   string compares stay in machine code). A wrong guess deopts, the
+   interpreter samples the new shape and the closure recompiles against
+   the widened mask (bounded, the mask is monotone). Also fixed callee
+   tier-up: calls from JIT code now bump the callee's hotness counter —
+   an OSR'd caller used to win the threshold race by one iteration and
+   leave its callees interpreted forever.
 
 Remaining costs, in impact order:
 
-1. **GC/allocation-bound benches** (fasta 1.61×, binary-trees ~par) — the
+1. **GC/allocation-bound benches** (fasta 1.58×, binary-trees ~par) — the
    conservative Boehm GC is the hard ceiling; needs a precise GC, out of
    scope for this phase.
-2. **nbody 1.27×** — remaining per-iteration guard traffic on numeric
-   loops: non-innermost loops keep their slot reloads (see 5. above), and
-   loop bodies with helper calls still reload operands after every call.
+2. **nbody 1.27×** — values round-trip through stack slots at every
+   instruction (deopt-anywhere invariant) and non-innermost loops keep
+   their slot reloads; per-block guard traffic is already CSE'd by the
+   O2 pipeline (measured: table-provenance caching in the compiler
+   changed nothing), so the lever is full SSA merges + snapshot deopt
+   (M4).
 3. **Values still round-trip through stack slots at loop boundaries**
    (deopt-anywhere invariant); register allocation + snapshot deopt would
    lift numeric kernels further.

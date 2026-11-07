@@ -1378,6 +1378,9 @@ module Lua
               else
                 @line = lines[pc - 1]
                 @vi_pc = pc - 1
+                # type feedback: remember the non-number shape at this pc
+                proto.fb_record(pc - 1,
+                  (l.is_a?(String) || r.is_a?(String)) ? Lua::FB_STR : Lua::FB_OTH)
                 o = case op
                     when .add? then "+"
                     when .sub? then "-"
@@ -1389,9 +1392,15 @@ module Lua
                 stack[base + a] = arith(o, l, r, b, c)
               end
             when .unm?
-              @line = lines[pc - 1]
-              @vi_pc = pc - 1
-              stack[base + a] = negate(stack[base + b], b)
+              v = sp[base + b]
+              if v.is_a?(Float64)
+                sp[base + a] = -v
+              else
+                @line = lines[pc - 1]
+                @vi_pc = pc - 1
+                proto.fb_record(pc - 1, v.is_a?(String) ? Lua::FB_STR : Lua::FB_OTH)
+                stack[base + a] = negate(v, b)
+              end
             when .not?       then sp[base + a] = !Lua.truthy(sp[base + b])
             when .len?
               @line = lines[pc - 1]
@@ -1409,20 +1418,34 @@ module Lua
               stack[base + a] = v
             when .eq?
               @line = lines[pc - 1]
-              stack[base + a] = lua_eq(stack[base + b], stack[base + c])
+              l = sp[base + b]
+              r = sp[base + c]
+              unless l.is_a?(Float64) && r.is_a?(Float64)
+                proto.fb_record(pc - 1,
+                  (l.is_a?(String) && r.is_a?(String)) ? Lua::FB_STR : Lua::FB_OTH)
+              end
+              stack[base + a] = lua_eq(l, r)
             when .neq?
               @line = lines[pc - 1]
-              stack[base + a] = !lua_eq(stack[base + b], stack[base + c])
+              l = sp[base + b]
+              r = sp[base + c]
+              unless l.is_a?(Float64) && r.is_a?(Float64)
+                proto.fb_record(pc - 1,
+                  (l.is_a?(String) && r.is_a?(String)) ? Lua::FB_STR : Lua::FB_OTH)
+              end
+              stack[base + a] = !lua_eq(l, r)
             when .lt?
               l = sp[base + b]
               r = sp[base + c]
               if l.is_a?(Float64) && r.is_a?(Float64)
                 sp[base + a] = l < r
               elsif l.is_a?(String) && r.is_a?(String)
+                proto.fb_record(pc - 1, Lua::FB_STR)
                 sp[base + a] = Lua.strcmp(l, r) < 0
               else
                 @line = lines[pc - 1]
                 @vi_pc = pc - 1
+                proto.fb_record(pc - 1, Lua::FB_OTH)
                 stack[base + a] = lua_compare(l, r, "<")
               end
             when .le?
@@ -1431,10 +1454,12 @@ module Lua
               if l.is_a?(Float64) && r.is_a?(Float64)
                 sp[base + a] = l <= r
               elsif l.is_a?(String) && r.is_a?(String)
+                proto.fb_record(pc - 1, Lua::FB_STR)
                 sp[base + a] = Lua.strcmp(l, r) <= 0
               else
                 @line = lines[pc - 1]
                 @vi_pc = pc - 1
+                proto.fb_record(pc - 1, Lua::FB_OTH)
                 stack[base + a] = lua_compare(l, r, "<=")
               end
             when .jmp?

@@ -29,13 +29,41 @@ module Lua::JIT
   end
 
   # Tier-up: Proto -> LLVM IR -> ORC machine code. Installs cl.compiled;
-  # nil leaves the closure interpreted.
+  # nil leaves the closure interpreted. A successful compile snapshots the
+  # proto's feedback mask it specialized on (deopt drift detection, see
+  # on_deopt) and bumps the compile generation.
   def self.compile(interp : Interp, cl : LuaClosure) : Nil
     @@compiled_count += 1
     addr = Compiler.compile(interp, cl)
     if addr
       cl.compiled = addr
+      cl.fb_snap = cl.proto.feedback.try(&.dup)
+      cl.fb_gen += 1
       Compiler.trace("compiled #{cl.proto.chunkname}:#{cl.proto.linedefined}")
+    end
+  end
+
+  # Speculation drift check after a deopt (JIT.md §2): the interpreter
+  # just re-ran the frame from the deopt pc, so any operand shape the
+  # mono-numeric guards rejected is now sampled into the proto's
+  # feedback table. If the table has bits this compile never saw,
+  # recompile — the new code is polymorphic where the mask says so. The
+  # mask is monotone and recompiles are capped (fb_gen), so this
+  # converges; a failed recompile leaves the previous machine code live.
+  def self.on_deopt(interp : Interp, cl : LuaClosure) : Nil
+    return if cl.fb_gen >= 3
+    fb = cl.proto.feedback
+    return if fb.nil?
+    snap = cl.fb_snap
+    widened = if snap.nil?
+                fb.any? { |m| m != 0 }
+              else
+                s = snap.not_nil!
+                fb.each_with_index.any? { |m, i| (m & ~(s[i]? || 0_u8)) != 0 }
+              end
+    if widened
+      Compiler.trace("recompile: feedback widened #{cl.proto.chunkname}:#{cl.proto.linedefined}")
+      compile(interp, cl)
     end
   end
 

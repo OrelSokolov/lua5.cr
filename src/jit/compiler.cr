@@ -379,16 +379,27 @@ module Lua::JIT
       # (LOADK/LOADK+MOVE chains). Enables the inlined identity probe for
       # GETTABLE/SETTABLE. Same lifetime rules as @nums.
       @skeys = Hash(Int32, UInt64).new
+      # Table provenance: register -> table payload pointer whose tag and
+      # nil metatable were already checked in this block. Field accesses
+      # (GETTABLE/SETTABLE/SELF) on the same register skip both guards.
+      # Same lifetime rules as @nums.
+      @tabs = Hash(Int32, LLVM::Value).new
+      # Type feedback per-pc mask (JIT.md §2): nil/0 = numbers only seen
+      # → mono-numeric code with deopt guards; set bits → polymorphic
+      # code with the helper fallback (coercion/metamethods/str compares)
+      @fb : Array(UInt8)?
 
-      # invalidate provenance of register r (both maps)
+      # invalidate provenance of register r (all maps)
       private def kill(r : Int32) : Nil
         @nums.delete(r)
         @skeys.delete(r)
+        @tabs.delete(r)
       end
 
       private def kill_all : Nil
         @nums.clear
         @skeys.clear
+        @tabs.clear
       end
 
       def initialize(@cl, @ctx : LLVM::Context, f : LLVM::Function,
@@ -396,7 +407,8 @@ module Lua::JIT
                      @helper_types : Hash(Symbol, LLVM::Type), @blocks,
                      entry : LLVM::BasicBlock, stack0 : LLVM::Value,
                      osr_heads : Set(Int32), @preds : Array(Int32),
-                     @forloops : Hash(Int32, {Int32, Int32}))
+                     @forloops : Hash(Int32, {Int32, Int32}),
+                     @fb : Array(UInt8)?)
         @b = @ctx.new_builder
         @i8 = @ctx.int8
         @i32 = @ctx.int32
@@ -536,47 +548,24 @@ module Lua::JIT
           else
             @skeys.delete(a)
           end
+          if tb = @tabs[bb]?
+            @tabs[a] = tb
+          else
+            @tabs.delete(a)
+          end
           b.store(load_slot(bb), slot(a))
           br_next(pc)
         when .add?, .sub?, .mul?, .div?, .mod?, .pow?
-          l = guard_num(pc, bb)
-          r = guard_num(pc, cc)
-          res = case op
-                when .add? then b.fadd(l, r)
-                when .sub? then b.fsub(l, r)
-                when .mul? then b.fmul(l, r)
-                when .div? then b.fdiv(l, r)
-                when .mod? then call_fp_pure(:mod_fn, [l, r])
-                else            call_fp_pure(:pow, [l, r])
-                end
-          store_num(slot(a), res)
-          @nums[a] = res
-          @skeys.delete(a)
-          br_next(pc)
+          emit_arith(pc, a, bb, cc, op)
         when .unm?
-          v = guard_num(pc, bb)
-          res = b.fneg(v)
-          store_num(slot(a), res)
-          @nums[a] = res
-          @skeys.delete(a)
-          br_next(pc)
+          emit_unm(pc, a, bb)
         when .not?
           t = truthy(bb)
           store_bool(slot(a), b.not(t))
           kill(a)
           br_next(pc)
         when .eq?, .neq?, .lt?, .le?
-          l = guard_num(pc, bb)
-          r = guard_num(pc, cc)
-          t = case op
-              when .eq?  then b.fcmp(LLVM::RealPredicate::OEQ, l, r)
-              when .neq? then b.fcmp(LLVM::RealPredicate::ONE, l, r)
-              when .lt?  then b.fcmp(LLVM::RealPredicate::OLT, l, r)
-              else            b.fcmp(LLVM::RealPredicate::OLE, l, r)
-              end
-          store_bool(slot(a), t)
-          kill(a)
-          br_next(pc)
+          emit_cmp(pc, a, bb, cc, op)
         when .jmp?
           backedge(pc, bb)
           wire_forloop_edge(dest(pc, bb))
@@ -694,6 +683,7 @@ module Lua::JIT
         k = @consts[kb]?
         case k
         when Float64
+          kill(a) # stale string-key/table provenance must not survive
           store_num(slot(a), @f64.const_double(k))
           @nums[a] = @f64.const_double(k)
         when Bool
@@ -717,6 +707,205 @@ module Lua::JIT
         br_next(pc)
       end
 
+      # feedback mask byte at pc (0 = numbers only ever seen / no table)
+      private def fb_bits(pc : Int32) : UInt8
+        f = @fb
+        f ? (f[pc]? || 0_u8) : 0_u8
+      end
+
+      # Arithmetic (type feedback, JIT.md §2): a clean feedback byte at
+      # this pc means only numbers were ever seen — mono-numeric code
+      # with deopt guards (a wrong guess deopts, the interpreter samples
+      # the new shape and on_deopt recompiles). With bits set the code is
+      # polymorphic: number operands inline, everything else through the
+      # jit_arith helper (coercion/metamethods — the interpreter's exact
+      # semantics, no deopt churn).
+      private def emit_arith(pc : Int32, a : Int32, br : Int32, cr : Int32,
+                             op : Op) : Nil
+        b = @b
+        if fb_bits(pc) == 0
+          l = guard_num(pc, br)
+          r = guard_num(pc, cr)
+          res = arith_fop(op, l, r)
+          store_num(slot(a), res)
+          kill(a) # stale string-key/table provenance must not survive
+          @nums[a] = res
+          br_next(pc)
+          return
+        end
+        slow = new_block("arslow#{pc}")
+        lv = if v = @nums[br]?
+               v
+             else
+               vb = load_slot(br)
+               okb = new_block("arnl#{pc}")
+               b.cond(tag_is(vb, Layout.tag_num), okb, slow)
+               b.position_at_end(okb)
+               f64_of(vb)
+             end
+        rv = if v = @nums[cr]?
+               v
+             else
+               vc = load_slot(cr)
+               okc = new_block("arnr#{pc}")
+               b.cond(tag_is(vc, Layout.tag_num), okc, slow)
+               b.position_at_end(okc)
+               f64_of(vc)
+             end
+        res = arith_fop(op, lv, rv)
+        store_num(slot(a), res)
+        kill(a) # stale string-key/table provenance must not survive
+        @nums[a] = res
+        br_next(pc)
+        b.position_at_end(slow)
+        call_fp(:arith, [@interp, @clp, @base, @i32.const_int(pc),
+          @i32.const_int(arith_id(op)), @i32.const_int(br), @i32.const_int(cr),
+          slot(a)])
+        br_next(pc)
+      end
+
+      # Unary minus — same feedback split as emit_arith.
+      private def emit_unm(pc : Int32, a : Int32, br : Int32) : Nil
+        b = @b
+        if fb_bits(pc) == 0
+          v = guard_num(pc, br)
+          res = b.fneg(v)
+          store_num(slot(a), res)
+          kill(a) # stale string-key/table provenance must not survive
+          @nums[a] = res
+          br_next(pc)
+          return
+        end
+        if v = @nums[br]?
+          res = b.fneg(v)
+          store_num(slot(a), res)
+          kill(a)
+          @nums[a] = res
+          br_next(pc)
+          return
+        end
+        slow = new_block("unmslow#{pc}")
+        vb = load_slot(br)
+        fast = new_block("unm#{pc}")
+        b.cond(tag_is(vb, Layout.tag_num), fast, slow)
+        b.position_at_end(fast)
+        res = b.fneg(f64_of(vb))
+        store_num(slot(a), res)
+        kill(a)
+        @nums[a] = res
+        @skeys.delete(a)
+        br_next(pc)
+        b.position_at_end(slow)
+        call_fp(:unmf, [@interp, @clp, @base, @i32.const_int(pc),
+          @i32.const_int(br), slot(a)])
+        br_next(pc)
+      end
+
+      # Comparisons — same feedback split. Polymorphic: num/num inline
+      # fcmp; str/str (FB_STR) inline bytewise strcmp; anything else
+      # through the jit_cmp helper (metamethods, errors — no deopt).
+      private def emit_cmp(pc : Int32, a : Int32, br : Int32, cr : Int32,
+                           op : Op) : Nil
+        b = @b
+        fb = fb_bits(pc)
+        if fb == 0
+          l = guard_num(pc, br)
+          r = guard_num(pc, cr)
+          t = case op
+              when .eq?  then b.fcmp(LLVM::RealPredicate::OEQ, l, r)
+              when .neq? then b.fcmp(LLVM::RealPredicate::ONE, l, r)
+              when .lt?  then b.fcmp(LLVM::RealPredicate::OLT, l, r)
+              else            b.fcmp(LLVM::RealPredicate::OLE, l, r)
+              end
+          store_bool(slot(a), t)
+          kill(a)
+          br_next(pc)
+          return
+        end
+        slow = new_block("cmpslow#{pc}")
+        vb = load_slot(br)
+        numl = new_block("cmpnl#{pc}")
+        strl = (fb & Lua::FB_STR) != 0 ? new_block("cmpsl#{pc}") : nil
+        b.cond(tag_is(vb, Layout.tag_num), numl, strl || slow)
+        b.position_at_end(numl)
+        vc = load_slot(cr)
+        fast = new_block("cmpn#{pc}")
+        b.cond(tag_is(vc, Layout.tag_num), fast, slow)
+        b.position_at_end(fast)
+        t = case op
+            when .eq?  then b.fcmp(LLVM::RealPredicate::OEQ, f64_of(vb), f64_of(vc))
+            when .neq? then b.fcmp(LLVM::RealPredicate::ONE, f64_of(vb), f64_of(vc))
+            when .lt?  then b.fcmp(LLVM::RealPredicate::OLT, f64_of(vb), f64_of(vc))
+            else            b.fcmp(LLVM::RealPredicate::OLE, f64_of(vb), f64_of(vc))
+            end
+        store_bool(slot(a), t)
+        kill(a)
+        br_next(pc)
+        if strl
+          b.position_at_end(strl)
+          strl2 = new_block("cmpsl2#{pc}")
+          b.cond(tag_is(vb, Layout.tag_str), strl2, slow)
+          b.position_at_end(strl2)
+          vc2 = load_slot(cr)
+          strs = new_block("cmps#{pc}")
+          b.cond(tag_is(vc2, Layout.tag_str), strs, slow)
+          b.position_at_end(strs)
+          # pure C call — no runtime re-entry, provenance survives
+          k = call_fp_pure(:strcmp, [payload_ptr(vb), payload_ptr(vc2)])
+          t2 = case op
+               when .eq?  then b.icmp(LLVM::IntPredicate::EQ, k, @i32.const_int(0))
+               when .neq? then b.icmp(LLVM::IntPredicate::NE, k, @i32.const_int(0))
+               when .lt?  then b.icmp(LLVM::IntPredicate::SLT, k, @i32.const_int(0))
+               else            b.icmp(LLVM::IntPredicate::SLE, k, @i32.const_int(0))
+               end
+          store_bool(slot(a), t2)
+          kill(a)
+          br_next(pc)
+        end
+        b.position_at_end(slow)
+        opid = case op
+               when .eq?  then 0
+               when .lt?  then 1
+               when .le?  then 2
+               else            3 # neq
+               end
+        call_fp(:cmp, [@interp, @clp, @base, @i32.const_int(pc),
+          @i32.const_int(opid), @i32.const_int(br), @i32.const_int(cr), slot(a)])
+        br_next(pc)
+      end
+
+      private def arith_fop(op : Op, l : LLVM::Value, r : LLVM::Value) : LLVM::Value
+        case op
+        when .add? then @b.fadd(l, r)
+        when .sub? then @b.fsub(l, r)
+        when .mul? then @b.fmul(l, r)
+        when .div? then @b.fdiv(l, r)
+        when .mod? then call_fp_pure(:mod_fn, [l, r])
+        else            call_fp_pure(:pow, [l, r])
+        end
+      end
+
+      # jit_arith helper opid (see runtime.cr)
+      private def arith_id(op : Op) : Int32
+        case op
+        when .add? then 0
+        when .sub? then 1
+        when .mul? then 2
+        when .div? then 3
+        when .mod? then 4
+        else            5
+        end
+      end
+
+      # LuaValue tag compare / payload extraction
+      private def tag_is(v : LLVM::Value, tag : Int32) : LLVM::Value
+        @b.icmp(LLVM::IntPredicate::EQ, @b.extract_value(v, 0), @i32.const_int(tag))
+      end
+
+      private def f64_of(v : LLVM::Value) : LLVM::Value
+        @b.bit_cast(@b.extract_value(v, 1), @f64)
+      end
+
       # FORPREP: all three controls must be numbers (guards deopt — the
       # interpreter re-runs FORPREP and raises the proper 'for' errors or
       # coerces numeric strings); step==0 also deopts (interp raises).
@@ -735,6 +924,9 @@ module Lua::JIT
         b.ret(st)
         b.position_at_end(cont)
         s0 = b.fsub(v0, v2)
+        # loop controls become plain numbers — stale string-key/table
+        # provenance on these registers must not survive
+        3.times { |i| @skeys.delete(a + i); @tabs.delete(a + i) }
         store_num(slot(a), s0)
         @nums[a] = s0
         store_num(slot(a + 1), v1)
@@ -800,6 +992,8 @@ module Lua::JIT
         b.ret(d)
         b.position_at_end(go)
         store_num(slot(a), ctrl)
+        @skeys.delete(a)
+        @tabs.delete(a)
         @nums[a] = ctrl
         # back-edge: the head phis take the incremented control (limit and
         # step are loop-invariant — their FORLOOP phis flow straight back)
@@ -969,25 +1163,17 @@ module Lua::JIT
           return
         end
         slow = new_block("gtslow#{pc}")
-        vb = load_slot(br)
-        ok = new_block("gt#{pc}tab")
-        b.cond(b.icmp(LLVM::IntPredicate::EQ, b.extract_value(vb, 0),
-          @i32.const_int(Layout.tag_table)), ok, slow)
-        b.position_at_end(ok)
-        tbl = payload_ptr(vb)
-        mt = b.load(@i64, tbl_fld(tbl, Layout.tbl_mt))
-        ok = new_block("gt#{pc}mt")
-        b.cond(b.icmp(LLVM::IntPredicate::EQ, mt, @i64.const_int(0)), ok, slow)
-        b.position_at_end(ok)
+        # R[B]: plain table with nil metatable (cached per block — the
+        # tag/mt guards run once per register, see @tabs)
+        tbl = guard_table(pc, br, "gt", slow)
         kf = if v = @nums[cr]?
                v # provenance guarantees the number tag
              else
                vc = load_slot(cr)
                ok = new_block("gt#{pc}num")
-               b.cond(b.icmp(LLVM::IntPredicate::EQ, b.extract_value(vc, 0),
-                 @i32.const_int(Layout.tag_num)), ok, slow)
+               b.cond(tag_is(vc, Layout.tag_num), ok, slow)
                b.position_at_end(ok)
-               b.bit_cast(b.extract_value(vc, 1), @f64)
+               f64_of(vc)
              end
         # integrality: int32 range first (fptosi of out-of-range/NaN is
         # poison), then trunc == value
@@ -1014,6 +1200,7 @@ module Lua::JIT
           slow, ok)
         b.position_at_end(ok)
         b.store(v, slot(a))
+        kill(a)
         br_next(pc)
         b.position_at_end(slow)
         call_fp(:gettable, [@interp, @clp, @base, @i32.const_int(pc),
@@ -1040,25 +1227,16 @@ module Lua::JIT
           return
         end
         slow = new_block("stslow#{pc}")
-        vt = load_slot(a)
-        ok = new_block("st#{pc}tab")
-        b.cond(b.icmp(LLVM::IntPredicate::EQ, b.extract_value(vt, 0),
-          @i32.const_int(Layout.tag_table)), ok, slow)
-        b.position_at_end(ok)
-        tbl = payload_ptr(vt)
-        mt = b.load(@i64, tbl_fld(tbl, Layout.tbl_mt))
-        ok = new_block("st#{pc}mt")
-        b.cond(b.icmp(LLVM::IntPredicate::EQ, mt, @i64.const_int(0)), ok, slow)
-        b.position_at_end(ok)
+        # R[A]: plain table with nil metatable (cached per block, @tabs)
+        tbl = guard_table(pc, a, "st", slow)
         kf = if v = @nums[br]?
                v
              else
                vb = load_slot(br)
                ok = new_block("st#{pc}num")
-               b.cond(b.icmp(LLVM::IntPredicate::EQ, b.extract_value(vb, 0),
-                 @i32.const_int(Layout.tag_num)), ok, slow)
+               b.cond(tag_is(vb, Layout.tag_num), ok, slow)
                b.position_at_end(ok)
-               b.bit_cast(b.extract_value(vb, 1), @f64)
+               f64_of(vb)
              end
         inr = b.and(b.fcmp(LLVM::RealPredicate::OGE, kf, @f64.const_double(-2147483648.0)),
           b.fcmp(LLVM::RealPredicate::OLT, kf, @f64.const_double(2147483648.0)))
@@ -1101,19 +1279,12 @@ module Lua::JIT
                                     kaddr : UInt64) : Nil
         b = @b
         slow = new_block("sgtslow#{pc}")
-        vb = load_slot(br)
-        ok = new_block("sgt#{pc}tab")
-        b.cond(b.icmp(LLVM::IntPredicate::EQ, b.extract_value(vb, 0),
-          @i32.const_int(Layout.tag_table)), ok, slow)
-        b.position_at_end(ok)
-        tbl = payload_ptr(vb)
-        mt = b.load(@i64, tbl_fld(tbl, Layout.tbl_mt))
-        ok = new_block("sgt#{pc}mt")
-        b.cond(b.icmp(LLVM::IntPredicate::EQ, mt, @i64.const_int(0)), ok, slow)
-        b.position_at_end(ok)
+        # R[B]: plain table with nil metatable (cached per block, @tabs)
+        tbl = guard_table(pc, br, "sgt", slow)
         valp, miss = str_probe_begin(pc, tbl, kaddr, "sgt")
         v = b.load(@lv, valp)
         b.store(v, slot(a))
+        kill(a)
         br_next(pc)
         b.position_at_end(miss)
         b.br(slow)
@@ -1133,16 +1304,8 @@ module Lua::JIT
                                     kaddr : UInt64) : Nil
         b = @b
         slow = new_block("sstslow#{pc}")
-        vt = load_slot(a)
-        ok = new_block("sst#{pc}tab")
-        b.cond(b.icmp(LLVM::IntPredicate::EQ, b.extract_value(vt, 0),
-          @i32.const_int(Layout.tag_table)), ok, slow)
-        b.position_at_end(ok)
-        tbl = payload_ptr(vt)
-        mt = b.load(@i64, tbl_fld(tbl, Layout.tbl_mt))
-        ok = new_block("sst#{pc}mt")
-        b.cond(b.icmp(LLVM::IntPredicate::EQ, mt, @i64.const_int(0)), ok, slow)
-        b.position_at_end(ok)
+        # R[A]: plain table with nil metatable (cached per block, @tabs)
+        tbl = guard_table(pc, a, "sst", slow)
         vv = load_slot(cr)
         ok = new_block("sst#{pc}nn")
         b.cond(b.icmp(LLVM::IntPredicate::NE, b.extract_value(vv, 0),
@@ -1175,18 +1338,13 @@ module Lua::JIT
         kaddr = Lua.intern(k).as(Void*).address
         slow = new_block("slfslow#{pc}")
         obj = load_slot(bb)
-        ok = new_block("slf#{pc}tab")
-        b.cond(b.icmp(LLVM::IntPredicate::EQ, b.extract_value(obj, 0),
-          @i32.const_int(Layout.tag_table)), ok, slow)
-        b.position_at_end(ok)
-        tbl = payload_ptr(obj)
-        mt = b.load(@i64, tbl_fld(tbl, Layout.tbl_mt))
-        ok = new_block("slf#{pc}mt")
-        b.cond(b.icmp(LLVM::IntPredicate::EQ, mt, @i64.const_int(0)), ok, slow)
-        b.position_at_end(ok)
+        # R[B]: plain table with nil metatable (cached per block, @tabs)
+        tbl = guard_table(pc, bb, "slf", slow)
         valp, miss = str_probe_begin(pc, tbl, kaddr, "slf")
         b.store(obj, slot(a + 1))
         b.store(b.load(@lv, valp), slot(a))
+        kill(a)
+        kill(a + 1)
         br_next(pc)
         b.position_at_end(miss)
         b.br(slow)
@@ -1239,6 +1397,30 @@ module Lua::JIT
       # current basic block of the builder
       private def current_block : LLVM::BasicBlock
         @b.insert_block
+      end
+
+      # R[r] as a metatable-free table: per-block provenance cache first
+      # (tag + nil-mt already checked on this register — see @tabs), else
+      # fresh guards with a miss into `slow`. Returns the table payload
+      # pointer with the builder positioned in the OK block, and caches
+      # the result.
+      private def guard_table(pc : Int32, r : Int32, tag : String,
+                              slow : LLVM::BasicBlock) : LLVM::Value
+        if t = @tabs[r]?
+          return t
+        end
+        b = @b
+        vb = load_slot(r)
+        ok = new_block("#{tag}#{pc}tab")
+        b.cond(tag_is(vb, Layout.tag_table), ok, slow)
+        b.position_at_end(ok)
+        tbl = payload_ptr(vb)
+        mt = b.load(@i64, tbl_fld(tbl, Layout.tbl_mt))
+        ok = new_block("#{tag}#{pc}mt")
+        b.cond(b.icmp(LLVM::IntPredicate::EQ, mt, @i64.const_int(0)), ok, slow)
+        b.position_at_end(ok)
+        @tabs[r] = tbl
+        tbl
       end
 
       # empty f64 phi trio at the current insert point (block must be
@@ -1478,6 +1660,10 @@ module Lua::JIT
         retclose:   {[ptr, i32], void, "jit_ret"},
         weakcheck:  {[ptr], i32, "jit_weakcheck"},
         loopedge:   {[ptr, i32, i32], i32, "jit_loopedge"},
+        arith:      {[ptr, ptr, i32, i32, i32, i32, i32, lv_ptr], void, "jit_arith"},
+        unmf:       {[ptr, ptr, i32, i32, i32, lv_ptr], void, "jit_unm"},
+        cmp:        {[ptr, ptr, i32, i32, i32, i32, i32, lv_ptr], void, "jit_cmp"},
+        strcmp:     {[ptr, ptr], i32, "jit_strcmp"},
       }
       helpers = {} of Symbol => LLVM::Function
       helper_types = {} of Symbol => LLVM::Type
@@ -1486,7 +1672,7 @@ module Lua::JIT
         helper_types[key] = LLVM::Type.function(sig[0], sig[1])
       end
 
-      Gen.new(cl, ctx, f, helpers, helper_types, blocks, entry, f.params[1], @@osr_heads, @@preds, @@forloops).run
+      Gen.new(cl, ctx, f, helpers, helper_types, blocks, entry, f.params[1], @@osr_heads, @@preds, @@forloops, cl.proto.feedback).run
     end
   end
 end

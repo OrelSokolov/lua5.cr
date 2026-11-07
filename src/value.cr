@@ -880,6 +880,13 @@ module Lua
   # `packed` is the execution form — one UInt64 per instruction
   # (op:8 | a:16s | b:20s | c:20s) — half the fetch traffic of the 16-byte
   # struct and the fixed encoding the JIT will consume.
+  # Type-feedback bits (JIT.md §2, M3 remainder): per-pc mask of the
+  # NON-number operand shapes the interpreter observed. A clean byte
+  # means "numbers only seen here" — the JIT specializes mono-numeric
+  # with deopt guards; set bits make it emit the polymorphic shape.
+  FB_STR = 1_u8 # string operands (arith coercion, string compares)
+  FB_OTH = 2_u8 # any other non-number shape (metamethods, mixed compares)
+
   class Proto
     property code = [] of Inst
     property packed = [] of UInt64
@@ -904,6 +911,16 @@ module Lua
     property? needs_arg : Bool = false
     property max_stack : Int32 = 2
     getter chunkname : String
+
+    # Type feedback side-table (see FB_STR/FB_OTH above): one mask byte
+    # per instruction, lazily allocated on the first non-number shape.
+    # Monotone — bits are only ever OR-ed in, so feedback-driven
+    # recompiles converge (Lua::JIT.on_deopt).
+    property feedback : Array(UInt8)? = nil
+
+    def fb_record(pc : Int32, bits : UInt8) : Nil
+      (@feedback ||= Array(UInt8).new(packed.size, 0_u8))[pc] |= bits
+    end
 
     def initialize(@chunkname)
     end
@@ -939,6 +956,12 @@ module Lua
     property hot : Int32 = 0
     # Machine code entry once the JIT compiled this closure (M1+).
     property compiled : Pointer(Void)? = nil
+    # Type-feedback compile state: the feedback mask snapshot this
+    # compile specialized on (nil = compiled against a clean table) and
+    # the compile generation — recompiles after deopt drift are bounded
+    # (Lua::JIT.on_deopt).
+    property fb_snap : Array(UInt8)? = nil
+    property fb_gen : Int32 = 0
 
     def initialize(@proto, @upvals)
     end
