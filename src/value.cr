@@ -744,6 +744,10 @@ module Lua
     # 5.1 ci->tailcalls: tail calls that reused this frame — each is a
     # "lost" level reported by debug level walks as what="tail".
     property tail_calls : Int32 = 0
+    # OSR: set while this frame's code continues in the interpreter after
+    # a deopt from machine code entered via osr_run — the deopt session
+    # must not tier the same loop up again (infinite OSR/deopt cycle)
+    property? osr_blocked : Bool = false
     # pc of the last executed instruction, maintained while line hooks run
     # (5.1 L->savedpc): persists across a coroutine suspension.
     property old_pc : Int32 = -1

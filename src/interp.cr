@@ -102,6 +102,18 @@ module Lua
       @globals.raw_set(name, LuaFunction.new(name, fn))
     end
 
+    # Single-result scratch for hot native returns (math.* etc.): callers
+    # on the VM path (store_results / jit_store_results) copy the values
+    # out immediately and never retain the array — same discipline as the
+    # call-args pool in vm.cr. Natives that return through anything which
+    # might keep the array must build a fresh one instead.
+    @ret1 = [nil.as(LuaValue)]
+
+    def ret1(v : LuaValue) : Array(LuaValue)
+      @ret1[0] = v
+      @ret1
+    end
+
     # The closure `level` VM frames out from a native call (1 = the Lua
     # function that called the native, 2 = its caller, ...). For setfenv/
     # getfenv level semantics and debug.getinfo.
@@ -178,6 +190,10 @@ module Lua
       else
         limit = fr.base + fr.closure.proto.max_stack
       end
+      # JIT frames ride above the top interpreter frame without a CallInfo;
+      # their register windows are live roots until the invocation returns
+      # (see jit_stack_hi) — never clear into them.
+      limit = @jit_stack_hi if @jit_stack_hi > limit
       i = {limit, 0}.max
       while i < @stack.size
         @stack[i] = nil
@@ -629,6 +645,10 @@ module Lua
     end
 
     private def objname(proto : Proto, lastpc : Int32, reg : Int32) : {String, String}?
+      # @vi_pc can belong to a JITed closure while the top interpreter
+      # frame is another proto (JIT frames have no CallInfo) — clamp so
+      # the walk stays inside this proto's code
+      lastpc = {lastpc, proto.code.size - 1}.min
       proto.loc_vars.each do |lv|
         if lv.reg == reg && lastpc >= lv.start_pc && lastpc <= lv.end_pc
           return {"local", lv.name}

@@ -12,7 +12,9 @@ module Lua::JIT
   # JIT entry ABI (compiler.cr): C convention, never called through a
   # Crystal Proc boundary from machine code (jit_call_dispatch calls it
   # via raw_invoke to keep exceptions out of machine frames).
-  alias EntryFn = (Interp, Pointer(LuaValue), LuaClosure, Int32, Int32, Int32) -> Int32
+  # (interp, stack, cl, base, argn, want, start_pc, top0) — start_pc > 0
+  # is an OSR entry (resume block; top0 = live frame top).
+  alias EntryFn = (Interp, Pointer(LuaValue), LuaClosure, Int32, Int32, Int32, Int32, Int32) -> Int32
 
   # Closures handed to compile() since startup — lets specs observe tier-up
   # without touching VM internals.
@@ -42,16 +44,19 @@ module Lua::JIT
   # through JIT frames. Status follows the compiler ABI (-1 = pending
   # LuaError in interp.jit_err).
   def self.raw_invoke(cp : Pointer(Void), interp : Interp, cl : LuaClosure,
-                      base : Int32, argn : Int32, want : Int32) : Int32
-    EntryFn.new(cp, Pointer(Void).null).call(interp, interp.stack.to_unsafe, cl, base, argn, want)
+                      base : Int32, argn : Int32, want : Int32,
+                      start_pc : Int32 = 0, top0 : Int32 = 0) : Int32
+    top0 = base + argn + 1 if start_pc <= 0 && top0 <= 0
+    EntryFn.new(cp, Pointer(Void).null).call(interp, interp.stack.to_unsafe, cl, base, argn, want, start_pc, top0)
   end
 
   # Entry from the VM dispatch loop (Crystal frames above): translates a
   # negative status into the stashed LuaError. Results (count returned)
   # already sit at stack[base..].
   def self.invoke(cp : Pointer(Void), interp : Interp, cl : LuaClosure,
-                  base : Int32, argn : Int32, want : Int32) : Int32
-    n = raw_invoke(cp, interp, cl, base, argn, want)
+                  base : Int32, argn : Int32, want : Int32,
+                  start_pc : Int32 = 0, top0 : Int32 = 0) : Int32
+    n = raw_invoke(cp, interp, cl, base, argn, want, start_pc, top0)
     if n >= 0
       n
     else

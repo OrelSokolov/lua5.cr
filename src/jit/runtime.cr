@@ -128,6 +128,22 @@ fun jit_loopedge(interp : Void*, base : Int32, a : Int32) : Int32
   interp.as(Lua::Interp).jit_loopedge(base, a)
 end
 
+# RETURN: close upvalues at or above this frame's base before the frame
+# dies — a compiled closure factory's captured locals must be frozen into
+# their UpValue cells before the stack slots are reused (the interpreter
+# RETURN handler does the same, guarded the same way).
+fun jit_ret(interp : Void*, base : Int32) : Void
+  i = interp.as(Lua::Interp)
+  i.close_upvals(base) if i.open_max >= base
+end
+
+# Backward JMP (while/repeat back-edge): 1 = weak tables active — the
+# caller deopts so the interpreter drives its loop-edge GC (the loop may
+# be *waiting* for a weak-table sweep to finish, which only gc_full does)
+fun jit_weakcheck(interp : Void*) : Int32
+  Lua.weak_active? ? 1 : 0
+end
+
 module Lua
   class Interp
     # LuaError raised somewhere under a JIT invocation; re-raised by the
@@ -141,6 +157,13 @@ module Lua
     # ensure_stack raises "stack overflow" (250k slots) — same observable
     # behavior as without the JIT.
     property jit_depth : Int32 = 0
+
+    # High-water mark of live JIT register windows: JIT frames have no
+    # CallInfo, so gc_clear_stale (which clears everything above the top
+    # interpreter frame's window) must not clear into an active JIT
+    # closure's registers — e.g. collectgarbage() called from JITed code.
+    # Maintained as max(base+max_stack) around every JIT invocation.
+    property jit_stack_hi : Int32 = -1
 
     def stack : Array(LuaValue)
       @stack
@@ -158,6 +181,9 @@ module Lua
         # what turns deep recursion into "stack overflow" (250k slots).
         ra = base + a
         ensure_stack(ra + {fn.proto.max_stack, argn + 1}.max + argn + 4)
+        prev_hi = @jit_stack_hi
+        win = ra + fn.proto.max_stack
+        @jit_stack_hi = win if win > prev_hi
         begin
           @jit_depth += 1
           n = JIT.raw_invoke(cp, self, fn, ra, argn, want)
@@ -172,6 +198,7 @@ module Lua
           n
         ensure
           @jit_depth -= 1
+          @jit_stack_hi = prev_hi
         end
       else
         begin
@@ -180,6 +207,7 @@ module Lua
           @jit_err = e
           -1
         rescue e : Exception
+          e.inspect_with_backtrace(STDERR) if ENV["LUA5_JIT_DEBUG"]?
           @jit_err = LuaError.new("(crystal) jit call: #{e.class}: #{e.message || "error"}")
           -1
         end
@@ -202,7 +230,6 @@ module Lua
         end
         jit_store_results(ra, want, run_frames(@fsize - 1, ra))
       else
-        args = Array(LuaValue).new(argn) { |i| @stack[ra + 1 + i] }
         r = call_value(fn, ra, argn, a)
         jit_store_results(ra, want, r)
       end
@@ -336,9 +363,26 @@ module Lua
 
     # Deopt (JIT.md 3): rebuild the interpreter frame at `pc` and run the
     # rest of the closure in the VM; same result/status contract as a
-    # fresh JIT entry.
+    # fresh JIT entry. An OSR entry (vm.cr back-edge tier-up) left the very
+    # same frame live at the top of @frames — reuse it instead of pushing
+    # a duplicate.
     def jit_deopt(cl : LuaClosure, base : Int32, pc : Int32, want : Int32) : Int32
       p = cl.proto
+      if @fsize > 0 && (tf = @frames[@fsize - 1]) && tf.closure.same?(cl) && tf.base == base
+        # OSR continuation: keep the frame — the machine-code caller
+        # (osr_run in vm.cr) completes its return when we hand control back
+        tf.pc = pc
+        tf.osr_blocked = true
+        res = run_frames(@fsize - 1, base)
+        @fsize += 1 # run_frames' ensure retired the entry frame; restore it
+        # the JIT entry contract wants results at stack[base..]
+        i = 0
+        while i < res.size
+          @stack[base + i] = res[i]
+          i += 1
+        end
+        return res.size
+      end
       ensure_stack(base + p.max_stack + 4)
       top = base + p.max_stack
       f = Frame.new(cl, base, top, Lua::EMPTY_VALS)

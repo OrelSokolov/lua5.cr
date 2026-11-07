@@ -67,6 +67,8 @@ module Lua::JIT
   module Compiler
     @@lljit : LLVM::Orc::LLJIT? = nil
     @@sym = 0
+    # OSR entry points of the proto being compiled (see compile)
+    @@osr_heads = Set(Int32).new
     # Keep-alives: ORC code and its context must outlive the closures
     # pointing into it; the Crystal GC would free them otherwise.
     @@keep = [] of LLVM::Orc::ThreadSafeContext
@@ -75,8 +77,29 @@ module Lua::JIT
     def self.compile(cl : LuaClosure) : Pointer(Void)?
       Layout.probe!
       p = cl.proto
-      return nil if p.vararg? || p.needs_arg?
+      # `arg`-table protos bail: the implicit local is built by push_call at
+      # frame entry, which the JIT entry does not do. A bare vararg flag is
+      # fine as long as the body never executes VARARG (jit_deopt cannot
+      # rebuild frame.varargs, so a mid-body VARARG must never enter JIT).
+      return nil if p.needs_arg?
+      p.packed.each do |w|
+        return nil if (w & 0xFF).to_u8! == Op::VARARG.value
+      end
       return nil if p.code.size > 4096 # M1 sanity cap
+
+      # OSR points: targets of backward jumps (numeric-for bodies, while/
+      # repeat loops). The entry function starts at blocks[start_pc] for
+      # these, blocks[0] otherwise (see gen).
+      heads = Set(Int32).new
+      p.packed.each_with_index do |w, pc|
+        op = (w & 0xFF).to_u8!.unsafe_as(Op)
+        case op
+        when .jmp?, .jmpf?, .jmpt?, .forloop?
+          off = ((w >> 24).to_i64! << 44 >> 44).to_i32!
+          heads << (pc + 1 + off) if off < 0
+        end
+      end
+      @@osr_heads = heads
 
       @@sym += 1
       sym = "lua5jit#{@@sym}"
@@ -141,7 +164,8 @@ module Lua::JIT
       def initialize(@cl, @ctx : LLVM::Context, f : LLVM::Function,
                      @helpers : Hash(Symbol, LLVM::Function),
                      @helper_types : Hash(Symbol, LLVM::Type), @blocks,
-                     entry : LLVM::BasicBlock, stack0 : LLVM::Value)
+                     entry : LLVM::BasicBlock, stack0 : LLVM::Value,
+                     osr_heads : Set(Int32))
         @b = @ctx.new_builder
         @i32 = @ctx.int32
         @i64 = @ctx.int64
@@ -164,8 +188,16 @@ module Lua::JIT
         @cur_stack = b.alloca(@lv_ptr, "cur_stack")
         @cur_top = b.alloca(@i32, "cur_top")
         b.store(stack0, @cur_stack)
-        b.store(b.add(@base, b.add(f.params[4], @i32.const_int(1))), @cur_top)
-        b.br(@blocks[0])
+        # frame top: normal entries compute it from argn; OSR entries carry
+        # the live frame's top (multi-value feeds may sit above max_stack)
+        b.store(b.select(b.icmp(LLVM::IntPredicate::SGT, f.params[6], @i32.const_int(0)),
+          f.params[7], b.add(@base, b.add(f.params[4], @i32.const_int(1)))), @cur_top)
+        if osr_heads.empty?
+          b.br(@blocks[0])
+        else
+          cases = osr_heads.map { |hpc| {@i32.const_int(hpc), @blocks[hpc]} }
+          b.switch(f.params[6], @blocks[0], cases)
+        end
       end
 
       def run : Nil
@@ -234,10 +266,13 @@ module Lua::JIT
           store_bool(slot(a), t)
           br_next(pc)
         when .jmp?
+          backedge(pc, bb)
           b.br(@blocks[dest(pc, bb)])
         when .jmpf?
+          backedge(pc, bb)
           b.cond(truthy(a), @blocks[pc + 1], @blocks[dest(pc, bb)])
         when .jmpt?
+          backedge(pc, bb)
           b.cond(truthy(a), @blocks[dest(pc, bb)], @blocks[pc + 1])
         when .getupval?
           call_fp(:getupval, [@clp, @i32.const_int(bb), @scratch])
@@ -299,6 +334,9 @@ module Lua::JIT
           # The interpreter does this shift in frame_return; the JIT copies
           # here — unrolled for a fixed count, a loop for `return ...`
           # multi-feeds (b == -1: everything up to the frame top).
+          # Close this frame's open upvalues first: a compiled closure
+          # factory's captures must freeze before the slots are reused.
+          call_fp(:retclose, [@interp, @base])
           if bb == 0
             b.ret(@i32.const_int(0))
           elsif bb > 0
@@ -448,6 +486,24 @@ module Lua::JIT
         end
       end
 
+      # Backward jump (loop back-edge): with weak tables around, deopt —
+      # the interpreter's back-edge handlers drive the Lua-graph GC, and a
+      # loop can be *waiting* for a weak-table sweep that only gc_full
+      # performs (repeat-until compiles to a backward JMPF, so all three
+      # jump ops take this guard).
+      private def backedge(pc : Int32, off : Int32) : Nil
+        return if off >= 0
+        b = @b
+        st = call_fp(:weakcheck, [@interp])
+        weak = new_block("jmpweak#{pc}")
+        go = new_block("jmpgo#{pc}")
+        b.cond(b.icmp(LLVM::IntPredicate::NE, st, @i32.const_int(0)), weak, go)
+        b.position_at_end(weak)
+        d = call_fp(:deopt, [@interp, @clp, @base, @i32.const_int(pc), @want])
+        b.ret(d)
+        b.position_at_end(go)
+      end
+
       private def dest(pc : Int32, off : Int32) : Int32
         d = pc + 1 + off
         raise CompileBail.new("jump out of range") if d < 0 || d >= @blocks.size
@@ -525,7 +581,10 @@ module Lua::JIT
       lv = ctx.struct([i32, i64])
       lv_ptr = lv.pointer
 
-      f = mod.functions.add(sym, [ptr, lv_ptr, ptr, i32, i32, i32], i32)
+      # params: interp, stack, cl, base, argn, want, start_pc, top0 — the
+      # last two carry the OSR entry (resume block and frame top); normal
+      # calls pass 0 and the caller-computed top
+      f = mod.functions.add(sym, [ptr, lv_ptr, ptr, i32, i32, i32, i32, i32], i32)
       entry = f.basic_blocks.append("entry")
       n = cl.proto.packed.size
       blocks = Array(LLVM::BasicBlock).new(n) { |i| f.basic_blocks.append("pc#{i}") }
@@ -552,6 +611,8 @@ module Lua::JIT
         concat:     {[ptr, ptr, i32, i32, i32, i32], void, "jit_concat"},
         closure:    {[ptr, ptr, i32, i32, lv_ptr], void, "jit_closure"},
         close:      {[ptr, i32, i32], void, "jit_close"},
+        retclose:   {[ptr, i32], void, "jit_ret"},
+        weakcheck:  {[ptr], i32, "jit_weakcheck"},
         loopedge:   {[ptr, i32, i32], i32, "jit_loopedge"},
       }
       helpers = {} of Symbol => LLVM::Function
@@ -561,7 +622,7 @@ module Lua::JIT
         helper_types[key] = LLVM::Type.function(sig[0], sig[1])
       end
 
-      Gen.new(cl, ctx, f, helpers, helper_types, blocks, entry, f.params[1]).run
+      Gen.new(cl, ctx, f, helpers, helper_types, blocks, entry, f.params[1], @@osr_heads).run
     end
   end
 end

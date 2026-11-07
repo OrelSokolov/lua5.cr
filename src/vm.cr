@@ -863,7 +863,10 @@ module Lua
     @open_upvals = [] of UpValue
     # Highest stack index currently captured by an open upvalue; lets hot
     # paths skip close_upvals entirely when nothing this deep is captured.
-    @open_max = -1
+    getter open_max = -1
+    protected def open_max=(v : Int32)
+      @open_max = v
+    end
     # run_frames entry points (frame counts) — one per nested VM re-entry.
     # coroutine.yield is only legal at depth 1 of the running coroutine.
     @entry_stack = [] of Int32
@@ -1042,14 +1045,39 @@ module Lua
       nf.pc = 0
       nf.want = want
       nf.tail_calls = 0
+      nf.osr_blocked = false
       nf.old_pc = -1
       @fsize += 1
+    end
+
+    # Reusable argument buffers for native (LuaFunction) calls from the VM,
+    # one per native-stack depth: a nested native (a metamethod, pcall,
+    # sort comparator) always runs one level deeper, so its buffer never
+    # aliases a live one. Buffers are referenced by @native_stack entries
+    # while their call runs (debug.getlocal roots) and are NOT stable
+    # after the call returns — natives must not keep them.
+    @arg_pool = [] of Array(LuaValue)
+
+    private def arg_buf(ra : Int32, argn : Int32) : Array(LuaValue)
+      d = @native_stack.size
+      while @arg_pool.size <= d
+        @arg_pool << Array(LuaValue).new(8, nil.as(LuaValue))
+      end
+      buf = @arg_pool[d]
+      buf.clear
+      i = 0
+      stack = @stack
+      while i < argn
+        buf << stack[ra + 1 + i]
+        i += 1
+      end
+      buf
     end
 
     # Call a non-closure value from the VM (native / __call table), used by
     # CALL and TAILCALL. vreg: the function's register, for error naming.
     private def call_value(fn : LuaValue, ra : Int32, argn : Int32, vreg : Int32 = -1) : Array(LuaValue)
-      args = Array(LuaValue).new(argn) { |i| @stack[ra + 1 + i] }
+      args = arg_buf(ra, argn)
       case fn
       when LuaFunction
         call_native(fn, args)
@@ -1067,6 +1095,58 @@ module Lua
     # Pop the top frame: just shrink the logical size (the slot is reused).
     private def retire_frame : Nil
       @fsize -= 1
+    end
+
+    # --- OSR (loop back-edge tier-up, JIT.md 1.2) ---
+    # A hot loop inside a once-called closure (main chunks especially)
+    # never reaches the call-count threshold; back-edges bump the same
+    # hotness counter, and once compiled the interpreter can resume the
+    # loop head inside the machine code — every register already lives in
+    # its stack slot (the JIT invariant), so the loop-head block is a
+    # valid entry point.
+    private def osr_ready?(frame : Frame, cl : LuaClosure) : Bool
+      !cl.compiled.nil? && !frame.osr_blocked? && @hook_on == 0 &&
+        @current_co.nil? && @jit_depth < 512
+    end
+
+    # Enter the compiled code at `start_pc` (a loop head). Runs the rest of
+    # the frame; on return completes the frame's RETURN to its caller.
+    # Returns the run_frames results when this was the entry frame (the
+    # caller finishes), nil after an inline return to the caller (caller
+    # re-fetches). Raises LuaError unchanged.
+    private def osr_run(frame : Frame, cl : LuaClosure, proto : Proto,
+                        base : Int32, start_pc : Int32) : Array(LuaValue)?
+      @jit_depth += 1
+      prev_hi = @jit_stack_hi
+      win = base + proto.max_stack
+      @jit_stack_hi = win if win > prev_hi
+      begin
+        # argn is unused on an OSR entry (top0 carries the live top)
+        n = JIT.invoke(cl.compiled.not_nil!, self, cl, base, 0, frame.want, start_pc, frame.top)
+      ensure
+        @jit_depth -= 1
+        @jit_stack_hi = prev_hi
+      end
+      if @fsize == @entry_stack.last.not_nil! + 1
+        stack = @stack
+        return Array(LuaValue).new(n) { |j| stack[base + j] }
+      end
+      close_upvals(base) if @open_max >= base
+      cf = @frames[@fsize - 2]
+      case frame.want
+      when -1 then cf.top = base + n
+      when 0  then cf.top = base
+      else
+        st = @stack
+        i = n
+        while i < frame.want
+          st[base + i] = nil
+          i += 1
+        end
+        cf.top = base + frame.want
+      end
+      @fsize -= 1
+      nil
     end
 
     # Place call results at R[ra] according to the CALL C operand.
@@ -1359,11 +1439,22 @@ module Lua
               # drive the Lua-graph GC (PUC's automatic collections) —
               # clear stale registers and periodically mark/sweep, so
               # weak entries settle without an explicit collectgarbage
-              if b < 0 && Lua.weak_active?
-                @gc_tick &+= 1
-                if (@gc_tick & 31) == 0
-                  gc_clear_stale(false)
-                  Lua.gc_full(self)
+              if b < 0
+                if Lua.weak_active?
+                  @gc_tick &+= 1
+                  if (@gc_tick & 31) == 0
+                    gc_clear_stale(false)
+                    Lua.gc_full(self)
+                  end
+                end
+                JIT.on_call(cl) # back-edge hotness: OSR tier-up (see osr_run)
+                if osr_ready?(frame, cl)
+                  rs = osr_run(frame, cl, proto, base, pc)
+                  if rs
+                    results = rs
+                    done = true
+                  end
+                  break # entry frame done / re-fetch the caller frame
                 end
               end
             when .jmpf? then pc += b unless Lua.truthy(sp[base + a])
@@ -1431,6 +1522,15 @@ module Lua
                     Lua.gc_full(self)
                   end
                 end
+                JIT.on_call(cl) # back-edge hotness: OSR tier-up (see osr_run)
+                if osr_ready?(frame, cl)
+                  rs = osr_run(frame, cl, proto, base, pc)
+                  if rs
+                    results = rs
+                    done = true
+                  end
+                  break # entry frame done / re-fetch the caller frame
+                end
               end
             when .tforcall?
               @line = lines[pc - 1]
@@ -1465,10 +1565,14 @@ module Lua
                     # runtime.cr) keep the interpreter (M1).
                     if (jcp = fn.compiled) && !@current_co && @hook_on == 0 && @jit_depth < 512
                       @jit_depth += 1
+                      prev_hi = @jit_stack_hi
+                      win2 = newbase + p.max_stack
+                      @jit_stack_hi = win2 if win2 > prev_hi
                       begin
                         n = JIT.invoke(jcp, self, fn, newbase, argn, c)
                       ensure
                         @jit_depth -= 1
+                        @jit_stack_hi = prev_hi
                       end
                       if c == -1
                         frame.top = newbase + n
@@ -1500,6 +1604,7 @@ module Lua
                     nf.pc = 0
                     nf.want = c
                     nf.tail_calls = 0
+                    nf.osr_blocked = false
                     nf.old_pc = -1
                     @fsize += 1
                     if (@hook_on & HOOK_CALL) != 0
@@ -1590,6 +1695,7 @@ module Lua
                   frame.pc = 0
                 end
                 frame.tail_calls += 1
+                frame.osr_blocked = false
                 frame.old_pc = -1
                 break # re-fetch frame
               else
@@ -1756,6 +1862,10 @@ module Lua
       @open_max = co.open_max
       # native calls of the resumed state, not the resumer's
       s_natives = @native_stack
+      # Detach the suspended natives' arg buffers (call_value's pool): the
+      # resumed coroutine reuses the same pool depths while this state is
+      # parked, which would mutate the arrays these entries still name.
+      s_natives.map! { |(f, fs, a)| {f, fs, a.dup} }
       @native_stack = co.native_stack
       # per-state hooks (5.1 lua_sethook): swap with the stacks
       s_hook_fn, s_hook_mask, s_hook_count, s_hook_countdown = @hook_fn, @hook_mask, @hook_count, @hook_countdown
