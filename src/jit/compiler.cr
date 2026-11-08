@@ -148,6 +148,8 @@ module Lua::JIT
     # back-edge gates can each be disabled from the environment
     FAST_CALL = ENV["LUA5_JIT_FASTCALL"]? != "0"
     INLINE_EDGE = ENV["LUA5_JIT_EDGE"]? != "0"
+    # cross-block numeric SSA (merge phis) — M3.7
+    PHIMERGE = ENV["LUA5_JIT_PHIMERGE"]? != "0"
     @@tm : LLVM::TargetMachine? = nil
     # OSR entry points and block predecessor counts of the proto being
     # compiled (see compile)
@@ -292,7 +294,7 @@ module Lua::JIT
       @@keep << ts_ctx
       engine.lookup(sym)
     rescue e : CompileBail
-      trace("bail: #{cl.proto.chunkname} #{e.message}")
+      trace("bail: #{cl.proto.chunkname}:#{cl.proto.linedefined} #{e.message}")
       nil
     end
 
@@ -422,6 +424,12 @@ module Lua::JIT
       # → mono-numeric code with deopt guards; set bits → polymorphic
       # code with the helper fallback (coercion/metamethods/str compares)
       @fb : Array(UInt8)?
+      # Cross-block numeric SSA (M3.7): real-CFG predecessors per pc (no
+      # OSR switch edges), per-pc numeric-fact sets from the dataflow, and
+      # the f64 phis created at blocks with >1 LLVM predecessor
+      @real_preds = [] of Array(Int32)
+      @in_nums = [] of Set(Int32)
+      @merge_phi = Hash(Int32, Hash(Int32, LLVM::Value)).new
 
       # invalidate provenance of register r (all maps)
       private def kill(r : Int32) : Nil
@@ -476,6 +484,34 @@ module Lua::JIT
         end
         # OSR for-head load blocks (see the switch below)
         @osr_ldr = Hash(Int32, {LLVM::BasicBlock, LLVM::Value, LLVM::Value, LLVM::Value}).new
+        # Cross-block numeric SSA (M3.7): static dataflow facts per pc and
+        # the merge phis built from them (see analyze_num_flow). phis are
+        # created for every block with >1 LLVM predecessor — including OSR
+        # heads, whose entry edges route through guard blocks below.
+        @real_preds, @in_nums = analyze_num_flow
+        if Compiler::PHIMERGE
+          @in_nums.each_with_index do |st, pc|
+            # A block whose single real predecessor is a NON-ADJACENT jump
+            # (JMPF arm, forward JMP) needs phis just like a merge: the
+            # emitter is linear, so by the time it emits this pc its maps
+            # describe the fallthrough chain's state, not the jump edge's
+            # (LLVM dominance is fine — one predecessor — the maps are the
+            # problem). A single-incoming phi carries the edge state over.
+            single_jump = (rp = @real_preds[pc]?) && rp.size == 1 && rp[0] != pc - 1
+            next if (@preds[pc]? || 0) <= 1 && !single_jump
+            next if st.empty?
+            # for-controls at head/FORLOOP blocks already live in the
+            # M3.3 phis — never double-source a register
+            ca = @for_by_head[pc]?.try(&.[1]) || @forloops[pc]?.try(&.[1])
+            b.position_at_end(@blocks[pc])
+            m = Hash(Int32, LLVM::Value).new
+            st.each do |r|
+              next if ca && r >= ca && r <= ca + 2
+              m[r] = LLVM::Value.new LibLLVM.build_phi(@b, @f64, "mp#{pc}r#{r}")
+            end
+            @merge_phi[pc] = m unless m.empty?
+          end
+        end
         # Create ALL for-loop phis up front (FORPREP is emitted before its
         # FORLOOP block, so phis must exist before any block is filled).
         # Blocks are still empty — the phis land first, as LLVM requires.
@@ -501,28 +537,63 @@ module Lua::JIT
         if osr_heads.empty?
           b.br(@blocks[0])
         else
-          # For-loop heads that are OSR targets route through a small
-          # load block: the raw f64 loads feed the head phis (the
-          # interpreter's FORLOOP guarantees the tags on entry).
+          # OSR targets route through a load block: for-heads load the
+          # controls raw (the interpreter's FORLOOP guarantees the tags);
+          # general merge phis (M3.7) load each register behind a tag
+          # guard — the analysis facts hold for the interpreter's state
+          # too, so the guard is insurance, deopt on a bug only.
           cases = osr_heads.map do |hpc|
-            if (fa = @for_by_head[hpc]?) && (a = fa[1])
-              ldb = new_block("osrf#{hpc}")
-              b.position_at_end(ldb)
+            fa = @for_by_head[hpc]?
+            mp = @merge_phi[hpc]?
+            next {@i32.const_int(hpc), @blocks[hpc]} if !fa && (mp.nil? || mp.empty?)
+            ldb = new_block("osrf#{hpc}")
+            b.position_at_end(ldb)
+            if (a = fa.try(&.[1]))
               cv = load_num_raw(a)
               lv = load_num_raw(a + 1)
               sv = load_num_raw(a + 2)
-              b.br(@blocks[hpc])
               @osr_ldr[hpc] = {ldb, cv, lv, sv}
-              # feed the head phis on the OSR entry edge
-              if (hp = @phi_head[hpc]?)
-                phi_add(hp[0], cv, ldb)
-                phi_add(hp[1], lv, ldb)
-                phi_add(hp[2], sv, ldb)
-              end
-              {@i32.const_int(hpc), ldb}
-            else
-              {@i32.const_int(hpc), @blocks[hpc]}
             end
+            unless mp.nil? || mp.empty?
+              # guard chain: every phi's tag check funnels into ONE block
+              # that branches to the head — phi incomings must all cite
+              # that block (citing each guard's own ok-block leaves them
+              # non-predecessors: "PHI node entries do not match
+              # predecessors" on verify)
+              bad = new_block("osrbad#{hpc}")
+              pend = [] of {LLVM::Value, LLVM::Value}
+              mp.each do |r, phi|
+                v = load_slot(r)
+                okb = new_block("osrok#{hpc}r#{r}")
+                b.cond(tag_is(v, Layout.tag_num), okb, bad)
+                b.position_at_end(okb)
+                pend << {phi, f64_of(v)}
+              end
+              done = new_block("osrdone#{hpc}")
+              b.br(done)
+              b.position_at_end(done)
+              pend.each { |phi, v| phi_add(phi, v, done) }
+              if (a2 = fa.try(&.[1])) && (hp = @phi_head[hpc]?)
+                phi_add(hp[0], cv.not_nil!, done)
+                phi_add(hp[1], lv.not_nil!, done)
+                phi_add(hp[2], sv.not_nil!, done)
+              end
+              b.br(@blocks[hpc])
+              b.position_at_end(bad)
+              st = b.call(@helper_types[:deopt], @helpers[:deopt],
+                [@interp, @clp, @base, @i32.const_int(hpc), @want], "st")
+              b.ret(st)
+            else
+              # no general phis: controls (if any) feed the head phis from
+              # the load block, which branches to the head directly
+              if (a2 = fa.try(&.[1])) && (hp = @phi_head[hpc]?)
+                phi_add(hp[0], cv.not_nil!, ldb)
+                phi_add(hp[1], lv.not_nil!, ldb)
+                phi_add(hp[2], sv.not_nil!, ldb)
+              end
+              b.br(@blocks[hpc])
+            end
+            {@i32.const_int(hpc), ldb}
           end
           b.position_at_end(entry)
           b.switch(f.params[6], @blocks[0], cases)
@@ -534,8 +605,21 @@ module Lua::JIT
         pc = 0
         while pc < n
           @b.position_at_end(@blocks[pc])
-          # numeric SSA survives linear chains; reset where control merges
-          kill_all if (@preds[pc]? || 0) > 1
+          if (@preds[pc]? || 0) > 1 ||
+             ((rp = @real_preds[pc]?) && rp.size == 1 && rp[0]? != pc - 1 && (@preds[pc]? || 0) > 0)
+            # control merges — and single-predecessor blocks entered by a
+            # non-adjacent jump (see initialize) — take their provenance
+            # from the merge phis (M3.7); registers without a phi are
+            # reloaded/re-guarded
+            kill_all
+            @merge_phi[pc]?.try &.each { |r, phi| @nums[r] = phi }
+          elsif pc > 0 && (@real_preds[pc]? || [-2]) != [pc - 1]
+            # single predecessor reached by a JUMP: the emitter's maps are
+            # leftovers from the previous instruction's emission, which
+            # describe the state on ITS outgoing edge, not this block's
+            # incoming one — drop them (fallthrough keeps linear flow)
+            kill_all
+          end
           if (fa = @for_by_head[pc]?) && (a = fa[1])
             # loop head: the phis (created up front in initialize) are the
             # live ctrl/limit/step values for the body; OSR entry loads
@@ -603,16 +687,21 @@ module Lua::JIT
         when .jmp?
           backedge(pc, bb)
           wire_forloop_edge(dest(pc, bb))
+          wire_gen_edge(dest(pc, bb))
           b.br(@blocks[dest(pc, bb)])
         when .jmpf?
           backedge(pc, bb)
           wire_forloop_edge(pc + 1)
           wire_forloop_edge(dest(pc, bb))
+          wire_gen_edge(pc + 1)
+          wire_gen_edge(dest(pc, bb))
           b.cond(truthy(a), @blocks[pc + 1], @blocks[dest(pc, bb)])
         when .jmpt?
           backedge(pc, bb)
           wire_forloop_edge(pc + 1)
           wire_forloop_edge(dest(pc, bb))
+          wire_gen_edge(pc + 1)
+          wire_gen_edge(dest(pc, bb))
           b.cond(truthy(a), @blocks[dest(pc, bb)], @blocks[pc + 1])
         when .getupval?
           call_fp(:getupval, [@clp, @i32.const_int(bb), @scratch])
@@ -981,7 +1070,7 @@ module Lua::JIT
         bad = new_block("forz#{pc}")
         b.cond(zero, bad, cont)
         b.position_at_end(bad)
-        st = call_fp(:deopt, [@interp, @clp, @base, @i32.const_int(pc), @want])
+        st = call_fp_exit(:deopt, [@interp, @clp, @base, @i32.const_int(pc), @want])
         b.ret(st)
         b.position_at_end(cont)
         s0 = b.fsub(v0, v2)
@@ -1000,6 +1089,7 @@ module Lua::JIT
           phi_add(phis[1], v1, cont)
           phi_add(phis[2], v2, cont)
         end
+        wire_gen_edge(dest(pc, off))
         b.br(@blocks[dest(pc, off)])
       end
 
@@ -1045,11 +1135,11 @@ module Lua::JIT
         go = new_block("forgo#{pc}")
         b.cond(need, slow, go)
         b.position_at_end(slow)
-        st = call_fp(:loopedge, [@interp, @base, @i32.const_int(a)])
+        st = call_fp_exit(:loopedge, [@interp, @base, @i32.const_int(a)])
         weak = new_block("forweak#{pc}")
         b.cond(b.icmp(LLVM::IntPredicate::NE, st, @i32.const_int(0)), weak, go)
         b.position_at_end(weak)
-        d = call_fp(:deopt, [@interp, @clp, @base, @i32.const_int(pc), @want])
+        d = call_fp_exit(:deopt, [@interp, @clp, @base, @i32.const_int(pc), @want])
         b.ret(d)
         b.position_at_end(go)
         store_num(slot(a), ctrl)
@@ -1063,8 +1153,13 @@ module Lua::JIT
           phi_add(hphis[1], lim, go)
           phi_add(hphis[2], ste, go)
         end
+        wire_gen_edge(dest(pc, off))
         b.br(@blocks[dest(pc, off)])
         b.position_at_end(exit_b)
+        # the exit edge leaves R[A] at its LAST EXECUTED value — the go
+        # block's store + @nums update (incremented ctrl) only run on the
+        # continue edge, so drop the register's provenance here
+        @nums.delete(a)
         br_next(pc)
       end
 
@@ -1216,15 +1311,15 @@ module Lua::JIT
       private def emit_gettable(pc : Int32, a : Int32, br : Int32, cr : Int32) : Nil
         b = @b
         spec = spec_clean?(pc)
-        if @nums[br]?
-          # R[B] proven numeric — cannot be a table; getindex on a number
-          # (error/metamethod) is the helper's job. Speculative: the shape
-          # can never hold, deopt straight away (drift recompiles polymorphic)
-          if spec
-            st = call_fp(:deopt, [@interp, @clp, @base, @i32.const_int(pc), @want])
-            b.ret(st)
-            return
-          end
+        if @nums[br]? && !spec
+          # R[B] proven numeric (poly mode): cannot be a table; getindex on
+          # a number (error/metamethod) is the helper's job — the helper
+          # merge kills the maps, which the poly transfer models. In SPEC
+          # mode this early exit is skipped on purpose: the generic guard
+          # chain reaches the same runtime deopt (the tag check cannot
+          # pass) while the fast-path maps keep flowing, exactly as the
+          # M3.7 dataflow models them (an unconditional terminal here
+          # desynced emitter maps from the analysis: "merge phi hole").
           call_fp(:gettable, [@interp, @clp, @base, @i32.const_int(pc),
             @i32.const_int(a), @i32.const_int(br), @i32.const_int(cr), slot(a)])
           br_next(pc)
@@ -1288,15 +1383,11 @@ module Lua::JIT
       private def emit_settable(pc : Int32, a : Int32, br : Int32, cr : Int32) : Nil
         b = @b
         spec = spec_clean?(pc)
-        if @nums[a]?
-          # R[A] proven numeric — cannot be a table (setindex on a number
-          # raises or fires metamethods — helper; speculative: never holds,
-          # deopt and let drift recompile)
-          if spec
-            st = call_fp(:deopt, [@interp, @clp, @base, @i32.const_int(pc), @want])
-            b.ret(st)
-            return
-          end
+        if @nums[a]? && !spec
+          # R[A] proven numeric (poly mode): cannot be a table (setindex
+          # on a number raises or fires metamethods — helper; the merge
+          # kills the maps as the poly transfer models). SPEC mode takes
+          # the generic guard chain instead — see emit_gettable.
           call_fp(:settable, [@interp, @clp, @base, @i32.const_int(pc),
             @i32.const_int(a), @i32.const_int(br), @i32.const_int(cr)])
           br_next(pc)
@@ -1531,6 +1622,119 @@ module Lua::JIT
         LibLLVM.add_incoming(phi, vals.to_unsafe, blks.to_unsafe, 1)
       end
 
+      # Static numeric-provenance dataflow over the proto's real CFG
+      # (M3.7). Facts only — no speculation: registers become numeric via
+      # LOADK-num, mono-arith results, MOVE copies and for-controls, and
+      # the interpreter guarantees the same on every path (guards/deopts
+      # never establish a fact here, so an OSR entry can always re-prove
+      # them). Helper-op pcs kill everything (the emitter's kill_all after
+      # the helper merge); speculative table ops keep everything but their
+      # destination; polymorphic arith merges with a slow path that may
+      # store any Lua value → kills. Returns per-pc real predecessors
+      # (fallthrough + jump edges, NO OSR switch edges) and IN sets.
+      private def analyze_num_flow : {Array(Array(Int32)), Array(Set(Int32))}
+        n = @code.size
+        preds = Array(Array(Int32)).new(n + 1) { [] of Int32 }
+        @code.each_with_index do |w, pc|
+          op = (w & 0xFF).to_u8!.unsafe_as(Op)
+          off = ((w >> 24).to_i64! << 44 >> 44).to_i32!
+          tgts = case op
+                 when .jmp?        then {pc + 1 + off}
+                 when .jmpf?, .jmpt?, .forloop?
+                   {pc + 1 + off, pc + 1}
+                 when .forprep?    then {pc + 1 + off}
+                 when .tailcall?, .tforcall?, .vararg?, .return?
+                   {-1} # terminal
+                 else                  {pc + 1}
+                 end
+          tgts.each do |t|
+            preds[t] << pc if t >= 0 && t < n
+          end
+        end
+        preds[0] << -1 # function entry: the maps start empty
+
+        bottom = Set(Int32).new
+        outs = Array(Set(Int32) | Nil).new(n, nil) # nil = TOP
+        ins = Array(Set(Int32)).new(n) { bottom.dup }
+        changed = true
+        while changed
+          changed = false
+          pc = 0
+          while pc < n
+            acc = nil
+            preds[pc].each do |p|
+              o = nil
+              if p < 0
+                o = bottom # function entry: empty state
+              elsif (t = outs[p])
+                o = t # not yet assigned = TOP: no constraint this round
+              end
+              next if o.nil?
+              acc = acc.nil? ? o.dup : (acc & o)
+            end
+            acc = bottom.dup if acc.nil? # unreachable pc: no facts
+            ins[pc] = acc
+            o = num_transfer(pc, acc)
+            if outs[pc].nil? || o != outs[pc]
+              outs[pc] = o
+              changed = true
+            end
+            pc += 1
+          end
+        end
+        {preds, ins}
+      end
+
+      # OUT state of the instruction at pc, given its IN (see
+      # analyze_num_flow for the modeling rules)
+      private def num_transfer(pc : Int32, st : Set(Int32)) : Set(Int32)
+        w = @code[pc]
+        op = (w & 0xFF).to_u8!.unsafe_as(Op)
+        a = ((w >> 8).to_i64! << 48 >> 48).to_i32!
+        bb = ((w >> 24).to_i64! << 44 >> 44).to_i32!
+        s = st.dup
+        case op
+        when .move?      then s.includes?(bb) ? (s << a) : s.delete(a)
+        when .loadk?     then @consts[bb]?.is_a?(Float64) ? (s << a) : s.delete(a)
+        when .loadnil?   then (a..a + bb).each { |r| s.delete(r) }
+        when .loadbool? then s.delete(a)
+        when .not?      then s.delete(a)
+        when .eq?, .neq?, .lt?, .le?
+          # mono compare keeps the other registers; the polymorphic slow
+          # path (call_fp: cmp) kills the emitter's maps — mirror exactly
+          fb_bits(pc) == 0 ? s.delete(a) : s.clear
+        when .add?, .sub?, .mul?, .div?, .mod?, .pow?, .unm?
+          fb_bits(pc) == 0 ? (s << a) : s.clear
+        when .forprep?   then s << a << a + 1 << a + 2
+        when .forloop?, .jmp?, .jmpf?, .jmpt? then s
+        when .gettable?
+          spec_clean?(pc) ? s.delete(a) : s.clear
+        when .settable?
+          spec_clean?(pc) ? s : s.clear
+        when .self?
+          spec_clean?(pc) ? (s.delete(a); s.delete(a + 1)) : s.clear
+        else s.clear # every helper-backed op: kill_all after the merge
+        end
+        s
+      end
+
+      # Feed the general merge phis at `tgt` from the current edge. The
+      # dataflow guarantees the register is proven on every incoming edge
+      # and the emitter state is a superset of the analysis along linear
+      # flow — a miss is a static/emitter mismatch: bail loudly (the
+      # closure stays interpreted) instead of emitting broken IR.
+      private def wire_gen_edge(tgt : Int32) : Nil
+        return unless Compiler::PHIMERGE
+        mp = @merge_phi[tgt]? || return
+        mp.each do |r, phi|
+          if v = @nums[r]?
+            phi_add(phi, v, current_block)
+          else
+            raise CompileBail.new("merge phi hole: pc#{tgt} r#{r} src=#{current_block.name} fb=#{@fb.inspect}")
+          end
+        end
+      end
+
       private def new_block(name : String) : LLVM::BasicBlock
         f = @blocks[0].parent.not_nil!
         f.basic_blocks.append(name)
@@ -1539,6 +1743,7 @@ module Lua::JIT
       private def br_next(pc : Int32) : Nil
         if pc + 1 < @blocks.size
           wire_forloop_edge(pc + 1)
+          wire_gen_edge(pc + 1)
           @b.br(@blocks[pc + 1])
         else
           @b.ret(@i32.const_int(0))
@@ -1576,11 +1781,11 @@ module Lua::JIT
         go = new_block("jmpgo#{pc}")
         b.cond(weak, slow, go)
         b.position_at_end(slow)
-        st = call_fp(:weakcheck, [@interp])
+        st = call_fp_exit(:weakcheck, [@interp])
         still = new_block("jmpweak2#{pc}")
         b.cond(b.icmp(LLVM::IntPredicate::NE, st, @i32.const_int(0)), still, go)
         b.position_at_end(still)
-        d = call_fp(:deopt, [@interp, @clp, @base, @i32.const_int(pc), @want])
+        d = call_fp_exit(:deopt, [@interp, @clp, @base, @i32.const_int(pc), @want])
         b.ret(d)
         b.position_at_end(go)
       end
@@ -1683,7 +1888,7 @@ module Lua::JIT
         bad = new_block("numbad#{pc}_r#{r}")
         b.cond(ok, okb, bad)
         b.position_at_end(bad)
-        st = call_fp(:deopt, [@interp, @clp, @base, @i32.const_int(pc), @want])
+        st = call_fp_exit(:deopt, [@interp, @clp, @base, @i32.const_int(pc), @want])
         b.ret(st)
         b.position_at_end(okb)
         d = b.bit_cast(b.extract_value(v, 1), @f64)
@@ -1706,6 +1911,21 @@ module Lua::JIT
       def call_fp_pure(key : Symbol, args : Array(LLVM::Value)) : LLVM::Value
         name = @helper_types[key].return_type.kind.void? ? "" : "r"
         @b.call(@helper_types[key], @helpers[key], args, name)
+      end
+
+      # EXIT-only helper call (deopt / loop-edge gates): the edge never
+      # rejoins the fast path, and the helper itself runs no Lua and
+      # writes no register slot (jit_deopt READS slots to rebuild the
+      # interpreter frame; jit_loopedge only closes upvalue cells) — so
+      # the provenance maps must stay live: the fast path continues to be
+      # emitted after these. Routing them through call_fp wiped @skeys/
+      # @nums mid-block (guard_num's deopt block sits INSIDE ordinary
+      # arith), silently degrading every string-key SETTABLE whose key
+      # LOADK preceded an unproven arith into the numeric-key path
+      # (nbody's b.vx stores: spec deopt on a string key, then a
+      # helper fallback forever).
+      def call_fp_exit(key : Symbol, args : Array(LLVM::Value)) : LLVM::Value
+        @b.call(@helper_types[key], @helpers[key], args, "st")
       end
     end
 

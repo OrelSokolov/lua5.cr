@@ -475,6 +475,11 @@ module Lua
     # a duplicate.
     def jit_deopt(cl : LuaClosure, base : Int32, pc : Int32, want : Int32) : Int32
       p = cl.proto
+      if ENV["LUA5_JIT"]? == "trace"
+        osr = @fsize > 0 && (tf = @frames[@fsize - 1]) && tf.closure.same?(cl) && tf.base == base
+        STDERR.puts "lua5-jit: deopt #{p.chunkname}:#{p.linedefined} pc=#{pc} " \
+                    "op=#{(w = p.packed[pc]?) ? ((w & 0xFF).to_u8!) : 'x'} gen=#{cl.fb_gen} osr=#{osr}"
+      end
       # A deopt IS the feedback sample (M3.6): record the shape the guards
       # rejected at this pc so the next compile specializes for it. Table
       # ops record FB_TMISS (polymorphic helper fallback); mono-numeric

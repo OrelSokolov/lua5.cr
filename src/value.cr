@@ -352,7 +352,12 @@ module Lua
     # insert/overwrite (non-nil val); canonicalizes the key on a fresh
     # insert; grows at 70% load
     def str_set(key : String, val : LuaValue) : Nil
-      str_grow if (@scount + 1) * 10 > (@smask + 1) * 7
+      # grow at load 0.5: the JIT's inline probe covers 3 slots, and at
+      # higher loads (0.7 kept 9 string fields in 16 slots, alpha 0.56) a
+      # key or two always probes past 3 — every access then falls to the
+      # helper (nbody's b.fx stores). 0.5 keeps distances <= 2 almost
+      # always; the extra slots are 16B each.
+      str_grow if (@scount + 1) * 2 > (@smask + 1)
       i = slot_find(key)
       if i < 0
         c = Lua.intern(key)

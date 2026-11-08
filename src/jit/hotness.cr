@@ -62,15 +62,28 @@ module Lua::JIT
   # the rejected shape into the proto's feedback table (jit_deopt), and the
   # interpreter re-ran the frame from the deopt pc, sampling any further
   # shapes. If the table has bits this compile never saw, recompile — the
-  # new code is polymorphic where the mask says so. The mask is monotone
-  # and recompiles are capped (fb_gen), so this converges; a failed
-  # recompile leaves the previous machine code live. Returns true when
+  # new code is polymorphic where the mask says so.
+  #
+  # Widening recompiles are NOT capped at a small generation count: each
+  # one strictly grows the feedback snapshot (bits are monotone and
+  # bounded), so the chain terminates on its own — capping at 3 let a
+  # hot function with 3+ widening table-op pcs (nbody's advance: string
+  # field stores whose 3-slot identity probe misses depend on the build's
+  # string addresses) deopt forever on the still-speculative pcs
+  # (4M deopts on nbody = 4x slowdown). A FAILED compile sets the
+  # snapshot to the current feedback instead: no widening can be observed
+  # anymore, so a broken compile is never retried. Returns true when
   # fresh machine code was installed.
   def self.recompile_widened(interp : Interp, cl : LuaClosure) : Bool
-    return false if cl.fb_gen >= 3
+    return false if cl.fb_gen >= 32 # hard safety cap
     return false unless feedback_widened?(cl)
     Compiler.trace("recompile: feedback widened #{cl.proto.chunkname}:#{cl.proto.linedefined}")
-    !compile(interp, cl).nil?
+    if compile(interp, cl)
+      true
+    else
+      cl.fb_snap = cl.proto.feedback.try(&.dup)
+      false
+    end
   end
 
   # Post-deopt drift check for interpreted continuations that finish the
