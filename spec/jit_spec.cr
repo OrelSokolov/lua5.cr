@@ -14,6 +14,9 @@ describe "JIT hotness" do
   end
 
   it "inlines a monomorphic callee instead of compiling it" do
+    GC.collect # earlier weak-table specs leave live registrations: a weak
+    # table alive anywhere deopts closure-creating loops at back-edges, and
+    # this chunk creates the f closure — drop the dead state first
     Lua::JIT.compiled_count = 0
     lua_run("local function f() end for i = 1, 600 do f() end")
     # M5: the OSR'd main chunk inlines f at its single call site before
@@ -365,11 +368,13 @@ describe "JIT hotness" do
       local ok, err = pcall(function()
         local t = setmetatable({}, {__mode = 'v'})
         do
-          local d = setmetatable({}, {__gc = function() error("boom") end})
+          local d = newproxy(true)
+          getmetatable(d).__gc = function() error("boom") end
           t.d = d
+          d = nil
         end
         local n = 0
-        while t.d ~= nil and n < 500000 do
+        while n < 500000 do
           n = n + 1
           local junk = { n }
         end
@@ -381,5 +386,38 @@ describe "JIT hotness" do
     # finishes normally and pcall sees the inner return value.
     r[0].should be_true
     r[1].should eq("no-error")
+  end
+
+  # A captured register written by a __gc finalizer (run by the weak-GC
+  # tick on the back-edge) must be OBSERVED by a hot loop reading it:
+  # frames whose proto creates closures deopt at weak back-edges (the
+  # interpreter re-reads the slot); capture-free frames tick in place —
+  # but nothing external can write their slots, so both are exact.
+  # (5.1 finalizes userdata only — newproxy, not tables.)
+  it "observes finalizer writes to a captured loop variable" do
+    r = lua_run(<<-LUA)
+      local total = 0
+      local function bump() total = total + 100 end
+      do
+        local d = newproxy(true)
+        getmetatable(d).__gc = bump
+        d = nil
+      end
+      local t = setmetatable({}, {__mode = 'v'})
+      do
+        local hold = { 1 }
+        t.h = hold
+      end
+      local n = 0
+      local saw = false
+      while n < 300000 and not saw do
+        n = n + 1
+        local junk = { n }
+        if total >= 100 then saw = true end
+      end
+      return saw, total >= 100
+    LUA
+    r[0].should be_true # the loop saw the finalizer's write mid-flight
+    r[1].should be_true
   end
 end

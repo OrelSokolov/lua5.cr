@@ -958,6 +958,20 @@ module Lua
     # the JIT inline the callee body behind a closure-identity guard; a
     # polymorphic site just misses the guard and takes the normal call.
     property call_fb : Array(Proto?)? = nil
+    property captures_slots : Bool? = nil
+
+    # True when this proto contains a CLOSURE opcode: executing it creates
+    # closures that may capture this frame's registers into upvalue cells,
+    # letting any Lua running later (e.g. a __gc finalizer driven by the
+    # JIT back-edge weak tick) write those slots behind machine code's
+    # back. Memoized — the JIT back-edge gate reads it on every weak edge.
+    def captures_slots? : Bool
+      if (c = @captures_slots).nil?
+        c = packed.any? { |w| (w & 0xFF).to_u8! == Op::CLOSURE.value }
+        @captures_slots = c
+      end
+      c
+    end
 
     def call_record(pc : Int32, target : Proto) : Nil
       (@call_fb ||= Array(Proto?).new(packed.size, nil))[pc] = target

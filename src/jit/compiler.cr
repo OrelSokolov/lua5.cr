@@ -1189,11 +1189,20 @@ module Lua::JIT
         go = new_block("forgo#{pc}")
         b.cond(need, slow, go)
         b.position_at_end(slow)
-        st = call_fp_exit(:loopedge, [@interp, @base, @i32.const_int(a)])
+        st = call_fp_exit(:loopedge, [@interp, @clp, @base, @i32.const_int(a)])
         weak = new_block("forweak#{pc}")
         b.cond(b.icmp(LLVM::IntPredicate::NE, st, @i32.const_int(0)), weak, go)
         b.position_at_end(weak)
-        b.ret(st) # -1: pending error from the weak-GC tick (finalizer)
+        # 1 = deopt (captured slots a __gc finalizer may write), -1 =
+        # pending error from the tick — split before any slot store
+        werr = new_block("forwerr#{pc}")
+        wdpt = new_block("forwdpt#{pc}")
+        b.cond(b.icmp(LLVM::IntPredicate::SLT, st, @i32.const_int(0)), werr, wdpt)
+        b.position_at_end(werr)
+        b.ret(st)
+        b.position_at_end(wdpt)
+        d = call_fp_exit(:deopt, [@interp, @clp, @base, @i32.const_int(pc), @want])
+        b.ret(d)
         b.position_at_end(go)
         store_num(slot(a), ctrl)
         @skeys.delete(a)
@@ -2185,11 +2194,20 @@ module Lua::JIT
         go = new_block("jmpgo#{pc}")
         b.cond(weak, slow, go)
         b.position_at_end(slow)
-        st = call_fp_exit(:weakcheck, [@interp])
+        st = call_fp_exit(:weakcheck, [@interp, @clp])
         bad = new_block("jmpweak2#{pc}")
         b.cond(b.icmp(LLVM::IntPredicate::NE, st, @i32.const_int(0)), bad, go)
         b.position_at_end(bad)
-        b.ret(st) # -1: pending error (e.g. a __gc finalizer raised)
+        # 1 = deopt (captured slots a __gc finalizer may write), -1 =
+        # pending error from the tick
+        werr = new_block("jmpwerr#{pc}")
+        wdpt = new_block("jmpwdpt#{pc}")
+        b.cond(b.icmp(LLVM::IntPredicate::SLT, st, @i32.const_int(0)), werr, wdpt)
+        b.position_at_end(werr)
+        b.ret(st)
+        b.position_at_end(wdpt)
+        d = call_fp_exit(:deopt, [@interp, @clp, @base, @i32.const_int(pc), @want])
+        b.ret(d)
         b.position_at_end(go)
       end
 
@@ -2372,8 +2390,8 @@ module Lua::JIT
         close:      {[ptr, i32, i32], void, "jit_close"},
         retclose:   {[ptr, i32], void, "jit_ret"},
         fast1:      {[ptr, f64], f64, "jit_fast1"},
-        weakcheck:  {[ptr], i32, "jit_weakcheck"},
-        loopedge:   {[ptr, i32, i32], i32, "jit_loopedge"},
+        weakcheck:  {[ptr, ptr], i32, "jit_weakcheck"},
+        loopedge:   {[ptr, ptr, i32, i32], i32, "jit_loopedge"},
         arith:      {[ptr, ptr, i32, i32, i32, i32, i32, lv_ptr], void, "jit_arith"},
         unmf:       {[ptr, ptr, i32, i32, i32, lv_ptr], void, "jit_unm"},
         cmp:        {[ptr, ptr, i32, i32, i32, i32, i32, lv_ptr], void, "jit_cmp"},

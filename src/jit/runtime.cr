@@ -174,11 +174,11 @@ fun jit_close(interp : Void*, base : Int32, a : Int32) : Void
   interp.as(Lua::Interp).close_upvals(base + a)
 end
 
-# FORLOOP back-edge: freeze loop-body upvalues; 1 = weak tables active —
-# the caller deopts so the interpreter drives its loop-edge GC (a JIT
-# frame has no CallInfo, gc_clear_stale cannot see its live window)
-fun jit_loopedge(interp : Void*, base : Int32, a : Int32) : Int32
-  interp.as(Lua::Interp).jit_loopedge(base, a)
+# FORLOOP back-edge: freeze loop-body upvalues, then the weak-GC tick
+# (status contract as jit_weakcheck: 0 stay, 1 deopt — captured slots the
+# finalizer may write, -1 pending error)
+fun jit_loopedge(interp : Void*, cl : Void*, base : Int32, a : Int32) : Int32
+  interp.as(Lua::Interp).jit_loopedge(cl.as(Lua::LuaClosure), base, a)
 end
 
 # RETURN: close upvalues at or above this frame's base before the frame
@@ -192,9 +192,12 @@ end
 
 # Backward JMP (while/repeat back-edge): runs the weak-GC tick (same as
 # the interpreter's back-edge handler) and returns 0 to stay in machine
-# code; -1 = pending error in interp.jit_err (a __gc finalizer raised).
-fun jit_weakcheck(interp : Void*) : Int32
-  interp.as(Lua::Interp).jit_weakcheck
+# code. 1 = weak tables active and this frame's proto creates closures —
+# a __gc finalizer could write captured slots behind machine code's back
+# (stale loop-carried phis), so the caller deopts (M2.1 semantics);
+# -1 = pending error in interp.jit_err (a finalizer raised).
+fun jit_weakcheck(interp : Void*, cl : Void*) : Int32
+  interp.as(Lua::Interp).jit_weakcheck(cl.as(Lua::LuaClosure))
 end
 
 module Lua
@@ -455,24 +458,29 @@ module Lua
       dst.value = nc
     end
 
-    def jit_loopedge(base : Int32, a : Int32) : Int32
+    def jit_loopedge(cl : LuaClosure, base : Int32, a : Int32) : Int32
       close_upvals(base + a) if @open_max >= base + a
-      weak_tick
+      weak_edge(cl)
     end
 
     # Weak-GC tick the interpreter's back-edge handlers run (vm.cr .jmp? /
     # FORLOOP): bump @gc_tick while any weak table is alive and every 32nd
     # edge clear stale registers + sweep weak tables/finalizers. Doing this
     # here — instead of deopting the whole loop to the interpreter — keeps
-    # the loop in machine code; a finalizer may run Lua code (i.call), so
-    # an escaping exception is stashed as @jit_err and reported as -1
-    # (never unwound through machine frames).
-    def jit_weakcheck : Int32
-      weak_tick
+    # the loop in machine code. EXCEPTION: a proto that creates closures
+    # can have captured slots, and a __gc finalizer run by the sweep may
+    # write them behind machine code's back (loop-carried phis would go
+    # stale) — such frames deopt (1) and the interpreter drives the tick,
+    # exactly the pre-tick M2.1 semantics. A finalizer may run Lua code
+    # (i.call), so an escaping exception is stashed as @jit_err and
+    # reported as -1 (never unwound through machine frames).
+    def jit_weakcheck(cl : LuaClosure) : Int32
+      weak_edge(cl)
     end
 
-    private def weak_tick : Int32
+    private def weak_edge(cl : LuaClosure) : Int32
       return 0 unless Lua.weak_active?
+      return 1 if cl.proto.captures_slots?
       @gc_tick &+= 1
       if (@gc_tick & 31) == 0
         begin
