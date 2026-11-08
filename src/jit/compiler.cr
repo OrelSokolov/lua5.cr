@@ -94,6 +94,10 @@ module Lua::JIT
     class_getter i_jit_hi : Int32 = -1
     class_getter i_stack_buf : Int32 = -1
     class_getter i_stack_cap : Int32 = -1
+    class_getter i_globals : Int32 = -1
+    # inlined GETGLOBAL probe (M4): cl.env is a nilable reference (8 bytes,
+    # null = nil) — setfenv'd closures take the helper via a null check
+    class_getter cl_env : Int32 = -1
     class_getter weak_seen : UInt64 = 0
 
     @@probed = false
@@ -164,6 +168,8 @@ module Lua::JIT
       @@i_jit_hi = i[:jit_stack_hi]
       @@i_stack_buf = i[:jit_stack_buf]
       @@i_stack_cap = i[:jit_stack_cap]
+      @@i_globals = i[:globals]
+      @@cl_env = c[:env]
       @@weak_seen = Lua.weak_seen_addr
       @@probed = true
     end
@@ -193,6 +199,9 @@ module Lua::JIT
     INLINE_MAX_OPS = 64
     # inline fast1 builtin calls (M5.1) — kill-switch for bisection
     FAST1_CALL = ENV["LUA5_JIT_FAST1"]? != "0"
+
+    # identity-guarded generic native calls (M4) — kill-switch for bisection
+    NATIVE_CALL = ENV["LUA5_JIT_NATIVE"]? != "0"
     # callee feedback snapshots of the last compile (M5): populated by gen,
     # consumed by JIT.compile for the closure's drift detection
     class_property last_inline_snaps = [] of {Proto, Array(UInt8)}
@@ -413,9 +422,21 @@ module Lua::JIT
     # Run the new-PM optimization pipeline over the freshly generated IR.
     # LLVMGetErrorMessage consumes the error, LLVMDisposeErrorMessage frees
     # the string.
+    #
+    # SLP vectorization is OFF: our IR is scalar Lua arithmetic over 16-byte
+    # stack slots — SLP burns ~27% of xr-update's total wall time trying to
+    # vectorize GEP index chains of the slot addressing and never produces
+    # anything (found in perf after M4.2; compile-time halved). Loop
+    # vectorization stays on (env-tunable) — unboxed f64 arrays (M7.1) give
+    # it real double[] loads to chew on (scimark-fft).
+    SLP_VECTORIZE = ENV["LUA5_JIT_SLP"]? == "1"
+    LOOP_VECTORIZE = ENV["LUA5_JIT_LV"]? != "0"
+
     private def self.optimize!(mod : LLVM::Module) : Nil
       return if PIPELINE.empty? || PIPELINE == "none"
       LLVM::PassBuilderOptions.new do |opts|
+        opts.set_slp_vectorization(SLP_VECTORIZE)
+        opts.set_loop_vectorization(LOOP_VECTORIZE)
         err = LibLLVM.run_passes(mod, PIPELINE, target_machine, opts)
         if err
           msg = LibLLVM.get_error_message(err)
@@ -778,8 +799,7 @@ module Lua::JIT
           emit_getupval(pc, a, bb, @clp)
           br_next(pc)
         when .getglobal?
-          call_fp(:getglobal, [@interp, @clp, @i32.const_int(bb), @i32.const_int(pc), slot(a)])
-          br_next(pc)
+          emit_str_getglobal(pc, a, bb)
         when .setglobal?
           call_fp(:setglobal, [@interp, @clp, @i32.const_int(bb), @i32.const_int(pc), slot(a)])
           br_next(pc)
@@ -886,7 +906,12 @@ module Lua::JIT
         # stage func/state/control at a+3 (the results window — func and
         # args sit exactly where the callee frame expects them)
         3.times { |i| b.store(load_slot(a + i), slot(a + 3 + i)) }
-        if Compiler::FAST_CALL
+        if Compiler::NATIVE_CALL && (fnn = native_target(pc))
+          # recorded native iterator (pairs/next): the M4 identity guard
+          # and a single jit_call_native hop replace the dispatch helper —
+          # xr-update's 2.4M-step pairs loop paid the full dispatch per step
+          emit_tforcall_native(pc, a, off, cnt, fnn)
+        elsif Compiler::FAST_CALL
           # direct JIT->JIT for a compiled iterator (the guard chain),
           # dispatch helper otherwise — 27M-iteration for-in loops pay the
           # helper hop otherwise
@@ -927,6 +952,61 @@ module Lua::JIT
         b.br(@blocks[dest(pc, off)])
         b.position_at_end(done)
         br_next(pc)
+      end
+
+      # TFORCALL of a recorded native iterator (M4): guard tag + object
+      # identity + hooks off, then one C-ABI hop to jit_call_native — the
+      # staged window at A+3 already matches the helper's convention
+      # (func/state/control in place, results land on the var slots). A
+      # guard miss takes the generic dispatch; both paths converge on the
+      # shared continuation (emit_tforcall_next).
+      private def emit_tforcall_native(pc : Int32, a : Int32, off : Int32,
+                                       cnt : Int32, fn : LuaFunction) : Nil
+        b = @b
+        slow = new_block("tnfslow#{pc}")
+        join = new_block("tnfjoin#{pc}")
+        vf = load_slot(a + 3)
+        ok = b.icmp(LLVM::IntPredicate::EQ, b.extract_value(vf, 0),
+          @i32.const_int(Layout.tag_fun))
+        ok = b.and(ok, b.icmp(LLVM::IntPredicate::EQ, b.extract_value(vf, 1),
+          @i64.const_int(fn.as(Void*).address.to_i64!)))
+        ho = b.load(@i32, tbl_fld(@interp, Layout.i_hook_on))
+        ok = b.and(ok, b.icmp(LLVM::IntPredicate::EQ, ho, @i32.const_int(0)))
+        go = new_block("tnfgo#{pc}")
+        b.cond(ok, go, slow)
+        b.position_at_end(go)
+        fptr = int2ptr(@i64.const_int(fn.as(Void*).address.to_i64!))
+        newstk = LLVM::Value.new LibLLVM.build_call2(b, @helper_types[:calln],
+          @helpers[:calln],
+          ([@interp, fptr, @base, @i32.const_int(a + 3), @i32.const_int(2),
+            @i32.const_int(cnt), @status_p] of LLVM::Value).to_unsafe.as(LibLLVM::ValueRef*), 7, "tnfstk")
+        b.store(newstk, @cur_stack) # the native may reallocate the stack
+        st = b.load(@i32, @status_p)
+        gbad = new_block("tnfbad#{pc}")
+        gok = new_block("tnfgok#{pc}")
+        b.cond(b.icmp(LLVM::IntPredicate::SLT, st, @i32.const_int(0)), gbad, gok)
+        b.position_at_end(gbad)
+        b.ret(st)
+        b.position_at_end(gok)
+        b.store(b.add(@base, @i32.const_int(a + 3 + {cnt, 0}.max)), @cur_top)
+        b.br(join)
+        b.position_at_end(slow)
+        newstk2 = call_fp(:dispatch, [@interp, @clp, @base, @i32.const_int(pc),
+          @i32.const_int(a + 3), @i32.const_int(2), @i32.const_int(cnt), @status_p])
+        b.store(newstk2, @cur_stack)
+        st2 = b.load(@i32, @status_p)
+        sbad = new_block("tnfbad2#{pc}")
+        sok = new_block("tnfsok#{pc}")
+        b.cond(b.icmp(LLVM::IntPredicate::SLT, st2, @i32.const_int(0)), sbad, sok)
+        b.position_at_end(sbad)
+        b.ret(st2)
+        b.position_at_end(sok)
+        # dispatch nil-fills missing results to `want`; top sits past them
+        b.store(b.add(@base, @i32.const_int(a + 3 + {cnt, 0}.max)), @cur_top)
+        b.br(join)
+        b.position_at_end(join)
+        kill_all # the native may have run arbitrary Lua
+        emit_tforcall_next(pc, a, off)
       end
 
       private def emit_loadk(pc : Int32, a : Int32, kb : Int32) : Nil
@@ -1315,6 +1395,11 @@ module Lua::JIT
           emit_call_fast1(pc, a, f1)
           return
         end
+        if bcount >= 0 && Compiler::NATIVE_CALL &&
+           (fnn = native_target(pc))
+          emit_call_native(pc, a, bcount, want_v, fnn)
+          return
+        end
         if bcount >= 0 && Compiler::FAST_CALL
           emit_call_fast(pc, a, bcount, want_v)
           return
@@ -1460,6 +1545,80 @@ module Lua::JIT
       private def fast1_target(pc : Int32) : LuaFunction?
         f = @cl.proto.fast1_fb.try(&.[pc]?) || return nil
         f.fast1 ? f : nil
+      end
+
+      # Recorded non-fast1 native builtin at this pc (M4): assert-style
+      # calls get the same identity-guard treatment as fast1, but hop into
+      # jit_call_native which stages args from the value stack and stores
+      # results per want — no dispatch, no call_value, no result-array
+      # detour.
+      private def native_target(pc : Int32) : LuaFunction?
+        f = @cl.proto.fast1_fb.try(&.[pc]?) || return nil
+        f.fast1 ? nil : f
+      end
+
+      # CALL of a recorded native builtin (M4): guard the LuaValue tag +
+      # object identity + hooks off (the interpreter's CALL fires the
+      # "call" hook event for natives — arming hooks must take the slow
+      # path), then a single C-ABI hop to jit_call_native. A guard miss
+      # (rebound global, hooks, variable arg count) falls to the generic
+      # dispatch, which is always correct. Results/nil-fill are stored by
+      # the helpers; the caller's provenance dies at the join (the native
+      # may run arbitrary Lua).
+      private def emit_call_native(pc : Int32, a : Int32, argn : Int32,
+                                   want_v : Int32, fn : LuaFunction) : Nil
+        b = @b
+        slow = new_block("nfslow#{pc}")
+        join = new_block("nfjoin#{pc}")
+        vf = load_slot(a)
+        ok = b.icmp(LLVM::IntPredicate::EQ, b.extract_value(vf, 0),
+          @i32.const_int(Layout.tag_fun))
+        ok = b.and(ok, b.icmp(LLVM::IntPredicate::EQ, b.extract_value(vf, 1),
+          @i64.const_int(fn.as(Void*).address.to_i64!)))
+        ho = b.load(@i32, tbl_fld(@interp, Layout.i_hook_on))
+        ok = b.and(ok, b.icmp(LLVM::IntPredicate::EQ, ho, @i32.const_int(0)))
+        go = new_block("nfgo#{pc}")
+        b.cond(ok, go, slow)
+        b.position_at_end(go)
+        fptr = int2ptr(@i64.const_int(fn.as(Void*).address.to_i64!))
+        newstk = LLVM::Value.new LibLLVM.build_call2(b, @helper_types[:calln],
+          @helpers[:calln],
+          ([@interp, fptr, @base, @i32.const_int(a), @i32.const_int(argn),
+            @i32.const_int(want_v), @status_p] of LLVM::Value).to_unsafe.as(LibLLVM::ValueRef*), 7, "nfstk")
+        b.store(newstk, @cur_stack) # the native may reallocate the stack
+        st = b.load(@i32, @status_p)
+        gbad = new_block("nfbad#{pc}")
+        gok = new_block("nfgok#{pc}")
+        b.cond(b.icmp(LLVM::IntPredicate::SLT, st, @i32.const_int(0)), gbad, gok)
+        b.position_at_end(gbad)
+        b.ret(st)
+        b.position_at_end(gok)
+        if want_v == -1
+          b.store(b.add(b.add(@base, @i32.const_int(a)), st), @cur_top)
+        else
+          b.store(b.add(@base, @i32.const_int(a + {want_v, 0}.max)), @cur_top)
+        end
+        b.br(join)
+        b.position_at_end(slow)
+        newstk2 = call_fp(:dispatch,
+          [@interp, @clp, @base, @i32.const_int(pc), @i32.const_int(a), @i32.const_int(argn), @i32.const_int(want_v), @status_p])
+        b.store(newstk2, @cur_stack)
+        st2 = b.load(@i32, @status_p)
+        sbad = new_block("nfbad2#{pc}")
+        sok = new_block("nfsok#{pc}")
+        b.cond(b.icmp(LLVM::IntPredicate::SLT, st2, @i32.const_int(0)), sbad, sok)
+        b.position_at_end(sbad)
+        b.ret(st2)
+        b.position_at_end(sok)
+        if want_v == -1
+          b.store(b.add(b.add(@base, @i32.const_int(a)), st2), @cur_top)
+        else
+          b.store(b.add(@base, @i32.const_int(a + {want_v, 0}.max)), @cur_top)
+        end
+        b.br(join)
+        b.position_at_end(join)
+        kill_all # the native may have run arbitrary Lua
+        br_next(pc)
       end
 
       # CALL of a recorded fast1 builtin (math.* style): guard the LuaValue
@@ -1968,6 +2127,45 @@ module Lua::JIT
       # provenance of other registers survives). Anything but a plain
       # hit (metatables, non-tables, long strings, probe miss) takes the
       # helper.
+      # GETGLOBAL A Bx: R[A] := Env[Const[Bx]]. The constant is a string
+      # key, so the flat SSlot probe answers it inline when the guards
+      # hold: closure env nil (setfenv'd closures take the helper),
+      # globals metatable nil, string table populated. A probe miss
+      # (absent global, hash-only key) and every guard miss go to the
+      # helper — never a deopt: there is no feedback bit that would widen,
+      # so a deopt here would just abandon machine code.
+      private def emit_str_getglobal(pc : Int32, a : Int32, kidx : Int32) : Nil
+        b = @b
+        k = @consts[kidx]?
+        unless k.is_a?(String) && k.bytesize <= Lua::SHORT_STR_MAX
+          call_fp(:getglobal, [@interp, @clp, @i32.const_int(kidx), @i32.const_int(pc), slot(a)])
+          br_next(pc)
+          return
+        end
+        slow = new_block("gg#{pc}slow")
+        # cl.env == nil? (nilable reference: null payload)
+        envp = b.load(@i64, tbl_fld(@clp, Layout.cl_env))
+        env_nil = new_block("gg#{pc}env")
+        b.cond(b.icmp(LLVM::IntPredicate::EQ, envp, @i64.const_int(0)), env_nil, slow)
+        b.position_at_end(env_nil)
+        # globals metatable nil? (same guard shape as guard_table)
+        g = b.load(@ptr, tbl_fld(@interp, Layout.i_globals))
+        mt = b.load(@i64, tbl_fld(g, Layout.tbl_mt))
+        mtok = new_block("gg#{pc}mt")
+        b.cond(b.icmp(LLVM::IntPredicate::EQ, mt, @i64.const_int(0)), mtok, slow)
+        b.position_at_end(mtok)
+        valp, miss = str_probe_begin(pc, g, Lua.intern(k).as(Void*).address, "gg")
+        b.store(b.load(@lv, valp), slot(a))
+        kill(a)
+        br_next(pc)
+        b.position_at_end(miss)
+        b.br(slow)
+        b.position_at_end(slow)
+        call_fp(:getglobal, [@interp, @clp, @i32.const_int(kidx), @i32.const_int(pc), slot(a)])
+        br_next(pc)
+        kill_all
+      end
+
       private def emit_str_gettable(pc : Int32, a : Int32, br : Int32, cr : Int32,
                                     kaddr : UInt64) : Nil
         b = @b
@@ -2504,6 +2702,7 @@ module Lua::JIT
         close:      {[ptr, i32, i32], void, "jit_close"},
         retclose:   {[ptr, i32], void, "jit_ret"},
         fast1:      {[ptr, f64], f64, "jit_fast1"},
+        calln:      {[ptr, ptr, i32, i32, i32, i32, ptr.pointer], lv_ptr, "jit_call_native"},
         weakcheck:  {[ptr, ptr], i32, "jit_weakcheck"},
         loopedge:   {[ptr, ptr, i32, i32], i32, "jit_loopedge"},
         arith:      {[ptr, ptr, i32, i32, i32, i32, i32, lv_ptr], void, "jit_arith"},

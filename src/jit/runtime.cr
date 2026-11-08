@@ -35,7 +35,9 @@ fun jit_dispatch_call(interp : Void*, cl : Void*, base : Int32, pc : Int32,
     case (fnv = it.stack[base + a]?)
     when Lua::LuaClosure   then ccl.proto.call_record(pc, fnv.proto)
     when Lua::LuaFunction
-      ccl.proto.fast1_record(pc, fnv) if fnv.fast1
+      # record ANY native (M4): the generic identity-guarded native call
+      # (emit_call_native) specializes on this, fast1 natives on fast1
+      ccl.proto.fast1_record(pc, fnv)
     end
   end
   n = it.jit_call_dispatch(base, a, argn, want)
@@ -58,6 +60,27 @@ end
 # caller's provenance survives, see emit_call_fast1).
 fun jit_fast1(fn : Void*, x : Float64) : Float64
   fn.as(Lua::LuaFunction).fast1.not_nil!.call(x)
+end
+
+# Guarded native builtin call from machine code (M4): the caller proved
+# tag + object identity + hooks off in a couple of inline loads, so this
+# is one C-ABI hop straight into the native — args staged from the value
+# stack, results stored per want. Same contract as jit_dispatch_call:
+# returns the CURRENT value-stack pointer, status through `status`.
+fun jit_call_native(interp : Void*, fn : Void*, base : Int32, a : Int32,
+                    argn : Int32, want : Int32, status : Int32*) : Void*
+  it = interp.as(Lua::Interp)
+  status.value = begin
+    it.jit_native_call(fn.as(Lua::LuaFunction), base, a, argn, want)
+  rescue e : Lua::LuaError
+    it.jit_err = e
+    -1
+  rescue e : Exception
+    e.inspect_with_backtrace(STDERR) if ENV["LUA5_JIT_DEBUG"]?
+    it.jit_err = Lua::LuaError.new("(crystal) jit call: #{e.class}: #{e.message || "error"}")
+    -1
+  end
+  it.stack.to_unsafe.as(Void*)
 end
 
 # GETUPVAL: open upvalues read through the stack, closed ones the cached
@@ -242,7 +265,7 @@ module Lua
     def jit_probe_offsets : NamedTuple(open_max: Int32, current_co: Int32,
                                        hook_on: Int32, jit_depth: Int32,
                                        jit_stack_hi: Int32, jit_stack_buf: Int32,
-                                       jit_stack_cap: Int32)
+                                       jit_stack_cap: Int32, globals: Int32)
       p = self.as(Void*).address
       {open_max:      (pointerof(@open_max).address - p).to_i32!,
        current_co:    (pointerof(@current_co).address - p).to_i32!,
@@ -250,7 +273,8 @@ module Lua
        jit_depth:     (pointerof(@jit_depth).address - p).to_i32!,
        jit_stack_hi:  (pointerof(@jit_stack_hi).address - p).to_i32!,
        jit_stack_buf: (pointerof(@jit_stack_buf).address - p).to_i32!,
-       jit_stack_cap: (pointerof(@jit_stack_cap).address - p).to_i32!}
+       jit_stack_cap: (pointerof(@jit_stack_cap).address - p).to_i32!,
+       globals:       (pointerof(@globals).address - p).to_i32!}
     end
 
     def stack : Array(LuaValue)
@@ -304,7 +328,13 @@ module Lua
           return 1
         end
         begin
-          jit_slow_call(fn, base, a, argn, want)
+          if fn.is_a?(LuaFunction)
+            # M4: collapse the native path — the generic jit_slow_call
+            # routes through call_value + a separate result-array copy
+            jit_native_call(fn, base, a, argn, want)
+          else
+            jit_slow_call(fn, base, a, argn, want)
+          end
         rescue e : LuaError
           @jit_err = e
           -1
@@ -313,6 +343,38 @@ module Lua
           @jit_err = LuaError.new("(crystal) jit call: #{e.class}: #{e.message || "error"}")
           -1
         end
+      end
+    end
+
+    # M4: native (LuaFunction) call from machine code without the generic
+    # call_value dispatch and result-array detour — args are staged from
+    # the value stack into the pooled per-depth buffer, call_native keeps
+    # the exact native semantics (C-frame registration for level walks,
+    # error wrapping), results are stored straight into the caller's
+    # window per `want` (nil-filling missing fixed results, like
+    # jit_store_results).
+    def jit_native_call(fn : LuaFunction, base : Int32, a : Int32, argn : Int32, want : Int32) : Int32
+      ra = base + a
+      r = call_native(fn, arg_buf(ra, argn))
+      if want == -1
+        n = r.size
+        ensure_stack(ra + n + 4)
+        i = 0
+        while i < n
+          @stack[ra + i] = r[i]
+          i += 1
+        end
+        n
+      elsif want == 0
+        0
+      else
+        ensure_stack(ra + want + 4)
+        i = 0
+        while i < want
+          @stack[ra + i] = r[i]?
+          i += 1
+        end
+        want
       end
     end
 
@@ -573,7 +635,35 @@ module Lua
         # single speculative miss. Without a recompile the block stays —
         # re-entering the same code would deopt-loop forever.
         tf.pc = pc
-        tf.osr_blocked = !JIT.recompile_widened(self, cl)
+        # OSR futility (JIT::FUTILE_*): a generation that died faster than
+        # a compile costs more than it saved — the widening chain on
+        # late-arriving shapes pays full compile price per deopt forever.
+        # FUTILE_MAX consecutive short-lived generations plus a cumulative
+        # compile spend over the budget means the JIT is not paying off:
+        # the frame stays interpreted for good (osr_dead). A long-lived
+        # generation resets the run.
+        if (t0 = cl.osr_at) &&
+           (Time.instant - t0).total_milliseconds < JIT::FUTILE_GEN_MS
+          cl.futile_osr += 1
+        else
+          cl.futile_osr = 0
+        end
+        cl.osr_at = nil
+        tf.osr_wait = 0
+        if JIT::FUTILE_MAX > 0 && cl.futile_osr >= JIT::FUTILE_MAX &&
+           cl.compile_ms >= JIT::FUTILE_BUDGET_MS
+          tf.osr_blocked = true
+          tf.osr_dead = true
+        else
+          # Lap-batching: do NOT recompile here — the interpreted
+          # continuation runs JIT::OSR_LAP_EDGES back-edges first (the
+          # interpreter samples every polymorphic site of the loop body),
+          # then osr_lap_wait fires ONE widening recompile that absorbs
+          # the whole lap. Immediate recompiles discovered shapes one
+          # deopt per generation (veclib: 11 gens/605ms compile).
+          tf.osr_blocked = true
+          tf.osr_dead = false
+        end
         vals = run_frames(@fsize - 1, base)
         @fsize += 1 # run_frames' ensure retired the entry frame; restore it
         # the JIT entry contract wants results at stack[base..]

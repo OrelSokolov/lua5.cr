@@ -70,7 +70,7 @@ module Lua::Stdlib
         lt : LuaValue, LuaValue -> Bool
         if has_comp
           lt = ->(a : LuaValue, b : LuaValue) : Bool {
-            r = i2.call(comp.not_nil!, [a, b])[0]?
+            r = i2.call2(comp.not_nil!, a, b)
             Lua.truthy(r)
           }
         else
@@ -142,27 +142,48 @@ module Lua::Stdlib
 
     # Stable merge sort (Lua's sort is unstable, but order of equal elements
     # is unspecified anyway; stability keeps differential tests friendly).
+    # Bottom-up (iterative): one scratch buffer of size n per table.sort
+    # call instead of a copy per recursion level — the recursive version
+    # allocated ~10M arrays per merge_sort(2000) run and half the profile
+    # was Boehm marking that garbage (NBF3). Taking the right run only on a
+    # strict less keeps the merge stable, same as the top-down form.
     def self.merge_sort(i2 : Interp, vals : Array(LuaValue), lt : LuaValue, LuaValue -> Bool) : Array(LuaValue)
-      return vals if vals.size <= 1
-      mid = vals.size // 2
-      left = merge_sort(i2, vals[0, mid], lt)
-      right = merge_sort(i2, vals[mid..], lt)
-      out = Array(LuaValue).new(vals.size)
-      li = 0
-      ri = 0
-      while li < left.size && ri < right.size
-        # right < left => take right (strict less keeps stability)
-        if lt.call(right[ri], left[li])
-          out << right[ri]
-          ri += 1
-        else
-          out << left[li]
-          li += 1
+      n = vals.size
+      return vals if n <= 1
+      src = vals
+      dst = Array(LuaValue).new(n)
+      width = 1
+      while width < n
+        dst.clear
+        i = 0
+        while i < n
+          mid = {i + width, n}.min
+          fin = {i + width * 2, n}.min
+          li = i
+          ri = mid
+          while li < mid && ri < fin
+            if lt.call(src[ri], src[li])
+              dst << src[ri]
+              ri += 1
+            else
+              dst << src[li]
+              li += 1
+            end
+          end
+          while li < mid
+            dst << src[li]
+            li += 1
+          end
+          while ri < fin
+            dst << src[ri]
+            ri += 1
+          end
+          i = fin
         end
+        src, dst = dst, src
+        width *= 2
       end
-      out.concat(left[li..]) if li < left.size
-      out.concat(right[ri..]) if ri < right.size
-      out
+      src
     end
   end
 end

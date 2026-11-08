@@ -28,7 +28,10 @@ describe "JIT hotness" do
 
   it "does not tier up below the threshold" do
     Lua::JIT.compiled_count = 0
-    lua_run("local function f() end for i = 1, #{Lua::JIT::THRESHOLD - 1} do f() end")
+    # NBF1: Interp#call (native→Lua entry, incl. the chunk's own entry via
+    # Interp#run) bumps hotness too, so the chunk has 1 call + N back-edges;
+    # keep both the chunk and f strictly under THRESHOLD.
+    lua_run("local function f() end for i = 1, #{Lua::JIT::THRESHOLD - 2} do f() end")
     Lua::JIT.compiled_count.should eq(0)
   end
 

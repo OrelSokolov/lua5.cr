@@ -1050,6 +1050,8 @@ module Lua
       nf.want = want
       nf.tail_calls = 0
       nf.osr_blocked = false
+      nf.osr_dead = false
+      nf.osr_wait = 0
       nf.old_pc = -1
       @fsize += 1
     end
@@ -1113,6 +1115,20 @@ module Lua
         @current_co.nil? && @jit_depth < 512
     end
 
+    # Lap-batching (JIT::OSR_LAP_EDGES): on a deopt-blocked frame count
+    # interpreted back-edges; after one lap of the loop body the
+    # interpreter has sampled every polymorphic site — a single widening
+    # recompile absorbs them all and un-blocks re-OSR. Called from the
+    # back-edge handlers alongside the hotness bump.
+    private def osr_lap_wait(frame : Frame, cl : LuaClosure) : Nil
+      return unless frame.osr_blocked? && !frame.osr_dead?
+      frame.osr_wait += 1
+      if frame.osr_wait >= JIT::OSR_LAP_EDGES
+        frame.osr_wait = 0
+        frame.osr_blocked = !JIT.recompile_widened(self, cl)
+      end
+    end
+
     # Enter the compiled code at `start_pc` (a loop head). Runs the rest of
     # the frame; on return completes the frame's RETURN to its caller.
     # Returns the run_frames results when this was the entry frame (the
@@ -1120,6 +1136,7 @@ module Lua
     # re-fetches). Raises LuaError unchanged.
     private def osr_run(frame : Frame, cl : LuaClosure, proto : Proto,
                         base : Int32, start_pc : Int32) : Array(LuaValue)?
+      cl.osr_at = Time.instant
       @jit_depth += 1
       prev_hi = @jit_stack_hi
       win = base + proto.max_stack
@@ -1328,6 +1345,16 @@ module Lua
               o = sp[base + b]
               k = sp[base + c]
               if o.is_a?(LuaTable) && o.metatable.nil?
+                # type feedback (M3.6, mirror of the M7.2 SETTABLE
+                # sampler): numeric reads outside the JIT spec form (hash
+                # keys, non-integral, out of array window) record FB_TMISS
+                # — the first compile is already polymorphic and a
+                # post-deopt interpreted lap samples every shape for ONE
+                # widening recompile. String keys never sample (the inline
+                # identity probe keeps them speculative).
+                if k.is_a?(Float64) && !o.fast_num_key?(k)
+                  proto.fb_record(pc - 1, Lua::FB_TMISS)
+                end
                 sp[base + a] = o.raw_get(k)
               else
                 @line = lines[pc - 1]
@@ -1490,6 +1517,7 @@ module Lua
                   end
                 end
                 JIT.on_call(self, cl) # back-edge hotness: OSR tier-up (see osr_run)
+                osr_lap_wait(frame, cl)
                 if osr_ready?(frame, cl)
                   rs = osr_run(frame, cl, proto, base, pc)
                   if rs
@@ -1565,6 +1593,7 @@ module Lua
                   end
                 end
                 JIT.on_call(self, cl) # back-edge hotness: OSR tier-up (see osr_run)
+                osr_lap_wait(frame, cl)
                 if osr_ready?(frame, cl)
                   rs = osr_run(frame, cl, proto, base, pc)
                   if rs
@@ -1621,6 +1650,7 @@ module Lua
                     # JMP/FORLOOP handlers, so without this bump a hot
                     # for-in main chunk stays interpreted forever
                     JIT.on_call(self, cl)
+                    osr_lap_wait(frame, cl)
                     if osr_ready?(frame, cl)
                       rs = osr_run(frame, cl, proto, base, pc)
                       if rs
@@ -1634,6 +1664,13 @@ module Lua
                 end
               end
               unless jit_done
+                # native-iterator feedback (M4): record the callee so the
+                # compiled TFORCALL can emit the identity-guarded hop — a
+                # pairs loop that OSRs before its first dispatch otherwise
+                # stays on the generic dispatch forever
+                if stack[base + a].is_a?(LuaFunction) && !@current_co
+                  proto.fast1_record(pc - 1, stack[base + a].as(LuaFunction))
+                end
                 rets = call(stack[base + a], [stack[base + a + 1], stack[base + a + 2]] of LuaValue)
                 first = rets[0]?
                 unless first.nil?
@@ -1646,6 +1683,7 @@ module Lua
                   stack[base + a + 2] = first
                   pc += b
                   JIT.on_call(self, cl) # back-edge hotness (see above)
+                  osr_lap_wait(frame, cl)
                   if osr_ready?(frame, cl)
                     rs = osr_run(frame, cl, proto, base, pc)
                     if rs
@@ -1749,9 +1787,13 @@ module Lua
               else
                 @line = lines[pc - 1]
                 @vi_pc = pc - 1
-                # call-site feedback (M5): single-arg numeric builtins get
-                # an identity-guarded inline call (emit_call_fast1)
-                if fn.is_a?(LuaFunction) && fn.fast1 && b >= 0
+                # call-site feedback (M5): natives record here for the
+                # identity-guarded inline paths — fast1 (emit_call_fast1)
+                # and the generic native call (M4, emit_call_native).
+                # Skipped inside coroutines: their frames can never enter
+                # the JIT (entry guards), so recording there is pure
+                # per-call overhead on hot interpreter loops (coro-mgr).
+                if fn.is_a?(LuaFunction) && b >= 0 && !@current_co
                   proto.fast1_record(pc - 1, fn)
                 end
                 frame.pc = pc # call position while the native runs (getinfo)

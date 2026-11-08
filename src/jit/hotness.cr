@@ -9,6 +9,28 @@ module Lua::JIT
   # Tier-up threshold in calls (JIT.md 1.2), overridable for tests/benches.
   THRESHOLD = (ENV["LUA5_JIT_THRESHOLD"]? || "500").to_i
 
+  # OSR futility — EXPERIMENTAL, OFF by default (negative result
+  # 2026-11-08): blocking a frame whose OSR generations keep dying young
+  # sounds economical (xr-update: JIT exec only 1.4x faster than the
+  # interpreter, one widening per late shape forever — blocking is worth
+  # ~0.05s), but the winners are indistinguishable ex-ante: veclib's
+  # chain converges on its LAST generation (7 short-lived gens, then the
+  # final one carries the whole benchmark), so every threshold that
+  # catches xr-update also kills veclib one generation early (4.6s vs
+  # 1.6s). The root cause of the churn was fixed instead: the GETTABLE
+  # runtime sampler + lap-batching collapse chains at the source. Enable
+  # only with clear evidence for a specific workload.
+  FUTILE_GEN_MS    = (ENV["LUA5_JIT_FUTILE_MS"]? || "50").to_f64
+  FUTILE_MAX       = (ENV["LUA5_JIT_FUTILE_MAX"]? || "0").to_i # 0 = off
+  FUTILE_BUDGET_MS = (ENV["LUA5_JIT_FUTILE_BUDGET"]? || "300").to_f64
+
+  # Lap-batching of widening recompiles: interpreted back-edges to wait
+  # after an OSR deopt before recompiling — one lap of the loop body lets
+  # the interpreter's slow-path sampling record every polymorphic site,
+  # so ONE recompile absorbs the whole lap instead of the one-deopt-per-
+  # generation chain (veclib: 11 gens → ~3).
+  OSR_LAP_EDGES = (ENV["LUA5_JIT_LAP"]? || "50").to_i
+
   # JIT entry ABI (compiler.cr): C convention, never called through a
   # Crystal Proc boundary from machine code (jit_call_dispatch calls it
   # via raw_invoke to keep exceptions out of machine frames).
@@ -35,7 +57,9 @@ module Lua::JIT
   # the compile generation. Returns the machine-code entry (nil = failed).
   def self.compile(interp : Interp, cl : LuaClosure) : Pointer(Void)?
     @@compiled_count += 1
+    t0 = Time.instant
     addr = Compiler.compile(interp, cl)
+    cl.compile_ms += (Time.instant - t0).total_milliseconds
     if addr
       cl.compiled = addr
       cl.fb_snap = cl.proto.feedback.try(&.dup)

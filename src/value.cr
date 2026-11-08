@@ -573,6 +573,20 @@ module Lua
       t == key ? t.to_i32 : nil
     end
 
+    # JIT spec fast form for a numeric key: integral and inside the array
+    # window (the inline GETTABLE/SETTABLE guard shape). The interpreter's
+    # GETTABLE feedback sampler uses it to record FB_TMISS for every other
+    # numeric shape (hash keys, non-integral, out of window) so the first
+    # compile is polymorphic and a post-deopt lap batches all shapes into
+    # one recompile (the M7.2 SETTABLE sampler's mirror).
+    def fast_num_key?(k : Float64) : Bool
+      if i = int_key(k)
+        i >= @arr_base && i < @arr_base + @arr_len
+      else
+        false
+      end
+    end
+
     def raw_get(key : LuaValue) : LuaValue
       if wi = @weak
         wi.each do |(kb, vb)|
@@ -1075,7 +1089,9 @@ module Lua
     property feedback : Array(UInt8)? = nil
 
     def fb_record(pc : Int32, bits : UInt8) : Nil
-      (@feedback ||= Array(UInt8).new(packed.size, 0_u8))[pc] |= bits
+      fb = (@feedback ||= Array(UInt8).new(packed.size, 0_u8))
+      return if (fb[pc] & bits) == bits # already seen — hot loops resample
+      fb[pc] |= bits
     end
 
     # Call-site feedback (JIT M5): per-CALL-pc last-seen callee Proto,
@@ -1105,10 +1121,15 @@ module Lua
     # Same, for single-argument numeric builtins (math.* with fast1):
     # records the LuaFunction OBJECT — the inline fast1 call guards on its
     # identity, so a rebound site simply misses and takes the slow path.
+    # M4: any native records here (emit_call_native); an unchanged target
+    # early-returns — interpreter hot loops call the same natives over and
+    # over and the per-call union store showed up in coro-mgr's profile.
     property fast1_fb : Array(LuaFunction?)? = nil
 
     def fast1_record(pc : Int32, target : LuaFunction) : Nil
-      (@fast1_fb ||= Array(LuaFunction?).new(packed.size, nil))[pc] = target
+      fb = (@fast1_fb ||= Array(LuaFunction?).new(packed.size, nil))
+      return if fb[pc]? == target
+      fb[pc] = target
     end
 
     def initialize(@chunkname)
@@ -1163,6 +1184,13 @@ module Lua
     # (Lua::JIT.on_deopt).
     property fb_snap : Array(UInt8)? = nil
     property fb_gen : Int32 = 0
+    # OSR futility tracking (JIT::FUTILE_GEN_MS): monotonic instant at the
+    # last OSR entry (nil = not running machine code via OSR), the run of
+    # consecutive short-lived generations, and the cumulative compile
+    # spend on this closure — see jit_deopt.
+    property osr_at : Time::Instant? = nil
+    property futile_osr : Int32 = 0
+    property compile_ms : Float64 = 0
     # M5 hot-call inline: callee protos this compile inlined, paired with
     # the callee feedback masks it specialized on (nil = no inlined
     # callees). A callee going polymorphic widens these snapshots and
@@ -1178,17 +1206,21 @@ module Lua
     # 16-byte union { i32 tag, payload } (not pointer-with-nil-0), so the
     # probe returns the payload offset plus the Pointer(Void) type id the
     # fast path must tag-check.
-    def probe_offsets : {proto: Int32, compiled: Int32, compiled_tag: Int32, upvals: Int32}
+    def probe_offsets : {proto: Int32, compiled: Int32, compiled_tag: Int32, upvals: Int32,
+                         env: Int32}
       base = self.as(UInt8*).address
       old = @compiled
       @compiled = Pointer(Void).new(0xDEADBEEF_u64)
       cell = pointerof(@compiled).as(Pointer(Int32))
       tag = cell.value
       @compiled = old
+      # env is a nilable reference (LuaTable?): 8 bytes, null = nil — the
+      # same shape as LuaTable#@metatable the tag-free mt guard relies on
       {proto:        (pointerof(@proto).address - base).to_i32!,
        compiled:     (pointerof(@compiled).address - base + 8).to_i32!,
        compiled_tag: tag,
-       upvals:       (pointerof(@upvals).address - base).to_i32!}
+       upvals:       (pointerof(@upvals).address - base).to_i32!,
+       env:          (pointerof(@env).address - base).to_i32!}
     end
 
     def gc_mark_children(m : GcMark) : Nil
@@ -1290,8 +1322,16 @@ module Lua
     property tail_calls : Int32 = 0
     # OSR: set while this frame's code continues in the interpreter after
     # a deopt from machine code entered via osr_run — the deopt session
-    # must not tier the same loop up again (infinite OSR/deopt cycle)
+    # must not tier the same loop up again (infinite OSR/deopt cycle).
+    # The wait counter batches the widening recompile: OSR_LAP_EDGES
+    # interpreted back-edges after a deopt let the interpreter sample
+    # every polymorphic site of the loop body, so ONE recompile absorbs
+    # the whole lap's feedback instead of discovering shapes one deopt
+    # per generation. osr_dead is the futility give-up (JIT::FUTILE_*):
+    # no further recompiles, the frame stays interpreted for good.
     property? osr_blocked : Bool = false
+    property? osr_dead : Bool = false
+    property osr_wait : Int32 = 0
     # pc of the last executed instruction, maintained while line hooks run
     # (5.1 L->savedpc): persists across a coroutine suspension.
     property old_pc : Int32 = -1

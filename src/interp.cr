@@ -116,6 +116,19 @@ module Lua
       @ret1
     end
 
+    # Same discipline for the 2-result pairs step (next): without it the
+    # hot path allocates a fresh [key, value] array per iteration —
+    # millions of short-lived arrays per benchmark, pure Boehm churn on
+    # every live set. next() never re-enters Lua and every caller copies
+    # the values out immediately.
+    @ret2 = [nil.as(LuaValue), nil.as(LuaValue)]
+
+    def ret2(k : LuaValue, v : LuaValue) : Array(LuaValue)
+      @ret2[0] = k
+      @ret2[1] = v
+      @ret2
+    end
+
     # The closure `level` VM frames out from a native call (1 = the Lua
     # function that called the native, 2 = its caller, ...). For setfenv/
     # getfenv level semantics and debug.getinfo.
@@ -307,7 +320,13 @@ module Lua
         when LuaFunction
           call_native(f, args)
         when LuaClosure
-          run_vm(f, args)
+          # NBF1: native→Lua calls (sort comparators, foreach, metamethods
+          # dispatched from Crystal) count toward tier-up — without this a
+          # closure only ever invoked through here stays interpreted forever
+          # (22M comparator calls, hot=0). Once compiled, run machine code
+          # instead of a full run_vm entry.
+          r = jit_call_compiled(f, args)
+          r || run_vm(f, args)
         when LuaTable
           if mm = metafield(f, "__call")
             call(mm, ([f] of LuaValue).concat(args))
@@ -328,6 +347,88 @@ module Lua
       ensure
         @call_depth -= 1
       end
+    end
+
+    # NBF1: JIT fast path for a native→Lua closure call. Returns the results
+    # array when the closure ran as machine code, nil to fall back to run_vm
+    # (semantics unchanged: hooks, coroutines, varargs, arity mismatch and
+    # deep JIT nesting keep the interpreter path). Guards mirror the VM's
+    # CALL fast path / jit_call_dispatch.
+    private def jit_call_compiled(f : LuaClosure, args : Array(LuaValue)) : Array(LuaValue)?
+      JIT.on_call(self, f)
+      cp = f.compiled
+      return nil unless cp
+      p = f.proto
+      return nil if @current_co || @hook_on != 0 || @jit_depth >= 512 ||
+                    p.num_params != args.size || p.vararg?
+      base = stack_hi
+      ensure_stack(base + {p.max_stack, args.size + 1}.max + args.size + 4)
+      stack = @stack
+      stack[base] = f
+      i = 0
+      while i < args.size
+        stack[base + 1 + i] = args[i]
+        i += 1
+      end
+      prev_hi = @jit_stack_hi
+      win = base + p.max_stack
+      @jit_stack_hi = win if win > prev_hi
+      begin
+        @jit_depth += 1
+        n = JIT.raw_invoke(cp, self, f, base, args.size, -1)
+      ensure
+        @jit_depth -= 1
+        @jit_stack_hi = prev_hi
+      end
+      if n < 0
+        e = @jit_err
+        @jit_err = nil
+        raise(e || LuaError.new("lua5 jit: negative status without error"))
+      end
+      res = Array(LuaValue).new(n)
+      i = 0
+      while i < n
+        res << stack[base + i]
+        i += 1
+      end
+      res
+    end
+
+    # NBF2: allocation-free fixed-arity callback entry (table.sort's
+    # comparator): arguments go straight onto the VM stack and one result is
+    # read back — no args/results arrays, no Frame when the closure is
+    # compiled. Falls back to the generic call path otherwise.
+    def call2(f : LuaValue, a : LuaValue, b : LuaValue) : LuaValue
+      if f.is_a?(LuaClosure)
+        JIT.on_call(self, f)
+        if (cp = f.compiled) && !@current_co && @hook_on == 0 &&
+           @jit_depth < 512 && f.proto.num_params == 2 && !f.proto.vararg?
+          p = f.proto
+          base = stack_hi
+          ensure_stack(base + {p.max_stack, 3}.max + 6)
+          stack = @stack
+          stack[base] = f
+          stack[base + 1] = a
+          stack[base + 2] = b
+          prev_hi = @jit_stack_hi
+          win = base + p.max_stack
+          @jit_stack_hi = win if win > prev_hi
+          begin
+            @jit_depth += 1
+            n = JIT.raw_invoke(cp, self, f, base, 2, 1)
+          ensure
+            @jit_depth -= 1
+            @jit_stack_hi = prev_hi
+          end
+          if n < 0
+            e = @jit_err
+            @jit_err = nil
+            raise(e || LuaError.new("lua5 jit: negative status without error"))
+          end
+          return n > 0 ? stack[base] : nil
+        end
+      end
+      call(f, [a, b] of LuaValue)[0]?
     end
 
     # Call a native (Crystal) function. Non-Lua Crystal exceptions raised

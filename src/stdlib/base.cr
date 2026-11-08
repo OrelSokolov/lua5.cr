@@ -88,7 +88,7 @@ module Lua::Stdlib
           unless val.nil?
             t.next_hint_key = key
             t.next_hint_idx = idx
-            return [key, val] of LuaValue
+            return i2.ret2(key, val) # scratch: no per-step allocation
           end
           idx += 1
         end
