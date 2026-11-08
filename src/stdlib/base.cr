@@ -50,10 +50,23 @@ module Lua::Stdlib
       nextfn = ->(i2 : Interp, args : Array(LuaValue)) {
         t = i2.table!(args, 0, "next")
         k = args[1]?
-        keys = t.raw_keys
+        # Key snapshot: built once per traversal, then each step is an
+        # O(1) advance (hint) + raw_get. Rebuilding raw_keys and linearly
+        # searching it on EVERY call made a pairs loop O(N²). Overwrites
+        # keep the snapshot; key-set changes drop it (iter_keys_reset!).
+        # Deleted keys may linger in it — raw_get skips them, which is
+        # exactly the 5.1 erase semantics. Never cached for weak tables.
+        keys = t.iter_keys
+        if keys.nil?
+          keys = t.raw_keys
+          t.iter_keys = keys unless t.weak_store?
+        end
         idx : Int32
         if k.nil?
           idx = 0
+        elsif !t.next_hint_key.nil? && t.next_hint_idx >= 0 &&
+              t.next_hint_idx < keys.size && i2.lua_eq(t.next_hint_key, k)
+          idx = t.next_hint_idx + 1 # sequential advance — the hot path
         else
           found = keys.index { |x| i2.lua_eq(x, k) }
           if found.nil?

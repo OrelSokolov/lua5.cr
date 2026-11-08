@@ -289,6 +289,24 @@ module Lua
     # the documented 5.1 use ("you may erase the key being visited").
     property next_hint_key : LuaValue = nil
     property next_hint_idx : Int32 = -1
+    # pairs/next key snapshot (stdlib/base.cr `next`): built once per
+    # traversal, then each step is an O(1) advance + raw_get. Without it
+    # every next() rebuilt raw_keys AND linearly searched it → O(N²) per
+    # pairs loop. Deleted keys may linger in it (raw_get skips them);
+    # value overwrites don't touch it. Dropped on any key-set change
+    # (iter_keys_reset!) so a traversal started later sees fresh keys —
+    # never cached for weak tables (their key set changes at GC sweep).
+    property iter_keys : Array(LuaValue)? = nil
+
+    def iter_keys_reset! : Nil
+      @iter_keys = nil
+      @next_hint_key = nil
+      @next_hint_idx = -1
+    end
+
+    def weak_store? : Bool
+      !@weak.nil?
+    end
     # Integer keys 1..n live in a flat raw buffer (the "array part", as in
     # PUC Lua); everything else — and integral keys past holes — in the hash.
     # Slots holding nil are holes: raw_get falls through to the hash part.
@@ -302,6 +320,15 @@ module Lua
     @arr_base : Int32 = 1
     @arr_len : Int32 = 0
     @arr_cap : Int32 = 0
+    # Unboxed variant of the array part (M7): a table whose array slots
+    # are ALL numbers stores bare f64s in @fbuf, allocated with
+    # GC.malloc_atomic — the conservative marker never scans it (no
+    # pseudo-pointer retention of number bit patterns, half the memory).
+    # One-way transitions: a fresh table becomes unboxed when its first
+    # array store is a number; the first non-conforming access (non-number
+    # value, nil store, weak mode) flips it to the boxed buffer for good.
+    @fbuf : Pointer(Float64) = Pointer(Float64).null
+    @unboxed : Bool = false
     @hash = Hash(LuaValue, LuaValue).new
     # String-key store: a flat identity-keyed open-addressing table (port
     # of luaH's string part) over canonical (interned) keys — the fast
@@ -371,6 +398,7 @@ module Lua
           ins.val = val
           @slots[j] = ins
           @scount += 1
+          iter_keys_reset! # new key: any cached pairs snapshot is stale
           return
         end
       end
@@ -460,7 +488,8 @@ module Lua
     # fixed per build; probed once per process.
     def probe_offsets : {mt: Int32, buf: Int32, base: Int32, len: Int32,
                          slots: Int32, smask: Int32,
-                         slot_size: Int32, slot_key: Int32, slot_val: Int32}
+                         slot_size: Int32, slot_key: Int32, slot_val: Int32,
+                         fbuf: Int32, unboxed: Int32}
       p = self.as(Void*).address
       so = SSlot.field_offsets
       {mt:    (pointerof(@metatable).address - p).to_i32!,
@@ -471,7 +500,9 @@ module Lua
        smask: (pointerof(@smask).address - p).to_i32!,
        slot_size: so[:size],
        slot_key:  so[:key],
-       slot_val:  so[:val]}
+       slot_val:  so[:val],
+       fbuf:   (pointerof(@fbuf).address - p).to_i32!,
+       unboxed: (pointerof(@unboxed).address - p).to_i32!}
     end
 
     def check_key(key : LuaValue)
@@ -485,25 +516,53 @@ module Lua
 
     private def arr_get(k : Int32) : LuaValue
       if k >= @arr_base && k < @arr_base + @arr_len
-        @buf[k - @arr_base]
+        @unboxed ? @fbuf[k - @arr_base].as(LuaValue) : @buf[k - @arr_base]
       else
         nil
       end
     end
 
-    # grow the raw buffer to hold at least `min` slots; new slots are
-    # nil-filled (unions must never hold garbage tags — the GC scans them)
-    private def buf_grow(min : Int32) : Nil
-      return if min <= @arr_cap
-      nc = {@arr_cap * 2, min, 8}.max
+    # Copy the unboxed f64 buffer into a conservative-scanned LuaValue
+    # buffer; one-way (a table never goes back to unboxed).
+    private def flip_to_boxed! : Nil
+      return unless @unboxed
+      nc = {@arr_cap, @arr_len, 8}.max
       nb = Pointer(LuaValue).malloc(nc)
-      @buf.copy_to(nb, @arr_len)
-      i = @arr_len
+      i = 0
+      while i < @arr_len
+        nb[i] = @fbuf[i].as(LuaValue)
+        i += 1
+      end
       while i < nc
         nb[i] = nil.as(LuaValue)
         i += 1
       end
       @buf = nb
+      @arr_cap = nc
+      @fbuf = Pointer(Float64).null
+      @unboxed = false
+    end
+
+    # grow the raw buffer to hold at least `min` slots; boxed slots are
+    # nil-filled (unions must never hold garbage tags — the GC scans
+    # them); the atomic f64 buffer needs no fill (nothing scans it)
+    private def buf_grow(min : Int32) : Nil
+      return if min <= @arr_cap
+      nc = {@arr_cap * 2, min, 8}.max
+      if @unboxed
+        nf = Pointer(Float64).new(GC.malloc_atomic(nc * 8).address)
+        @fbuf.copy_to(nf, @arr_len)
+        @fbuf = nf
+      else
+        nb = Pointer(LuaValue).malloc(nc)
+        @buf.copy_to(nb, @arr_len)
+        i = @arr_len
+        while i < nc
+          nb[i] = nil.as(LuaValue)
+          i += 1
+        end
+        @buf = nb
+      end
       @arr_cap = nc
     end
 
@@ -555,13 +614,21 @@ module Lua
       v.nil? ? nil : v
     end
 
-    def raw_set(key : LuaValue, val : LuaValue) : Nil
+    # Returns true ONLY for the shape the JIT spec fast path handles
+    # (in-bounds store into the array part, non-nil value): the VM's
+    # SETTABLE samples FB_TMISS on numeric stores that return false, so
+    # the first JIT compile already emits the polymorphic helper variant
+    # instead of learning shape-by-shape through deopt churn (fasta's
+    # bisect code: ~15 speculative SETTABLE pcs = 15 deopt/recompile
+    # rounds before this). String-key shapes never sample here (the
+    # inline identity probe keeps them speculative).
+    def raw_set(key : LuaValue, val : LuaValue) : Bool
       check_key(key)
       if wi = @weak
         idx = wi.index { |(kb, _vb)| Lua.weak_key_eq(kb.v, key) }
         if val.nil?
           wi.delete_at(idx) if idx
-          return
+          return false
         end
         item = {WCell.new(key), WCell.new(val)}
         if idx
@@ -569,7 +636,7 @@ module Lua
         else
           wi << item
         end
-        return
+        return false
       end
       if key.is_a?(String)
         # long strings stay by-value (not interned — see @slots comment)
@@ -577,9 +644,10 @@ module Lua
           if val.nil?
             @hash.delete(key)
           else
+            iter_keys_reset! unless @hash.has_key?(key)
             @hash[key] = val
           end
-          return
+          return false
         end
         if @smask == 0
           # first string-key insert: pull by-value string keys already
@@ -594,44 +662,69 @@ module Lua
         end
         if val.nil?
           str_del(key)
-          return
+          return false
         end
         str_set(key, val)
-        return
+        return false
       end
       if key.is_a?(Float64) && (k = int_key(key))
         @len_cache = k - 1 if val.nil? && k <= @len_cache
         if @arr_len > 0
           if k >= @arr_base && k < @arr_base + @arr_len
+            if @unboxed && (fv = val.as?(Float64))
+              @fbuf[k - @arr_base] = fv
+              return true
+            end
+            flip_to_boxed! if @unboxed # non-number (or nil) into an unboxed array
             @buf[k - @arr_base] = val # val may be nil: stays as a hole
-            return
+            return !val.nil? # nil stores update len_cache — helper shape
           elsif k == @arr_base + @arr_len && !val.nil?
-            buf_grow(@arr_len + 1)
-            @buf[@arr_len] = val
+            if @unboxed && (fv = val.as?(Float64))
+              buf_grow(@arr_len + 1)
+              @fbuf[@arr_len] = fv
+            else
+              flip_to_boxed! if @unboxed
+              buf_grow(@arr_len + 1)
+              @buf[@arr_len] = val
+            end
             @arr_len += 1
+            iter_keys_reset! # array part grew: a new integer key is covered
             migrate_from_hash
-            return
+            return false # append: spec deopts, sample it
           end
           if val.nil?
             @hash.delete(key) # (can only be absent)
-            return
+            return false
           end
         else
           if !val.nil?
+            if !@unboxed && @buf.null?
+              # fresh table: a numeric first store makes it unboxed
+              @unboxed = val.is_a?(Float64)
+            elsif @unboxed && !val.is_a?(Float64)
+              flip_to_boxed!
+            end
             buf_grow(1)
-            @buf[0] = val
+            if (fv = val.as?(Float64)) && @unboxed
+              @fbuf[0] = fv
+            else
+              @buf[0] = val
+            end
             @arr_len = 1
             @arr_base = k
+            iter_keys_reset! # first array key
             migrate_from_hash
-            return
+            return false # first element: spec deopts, sample it
           end
         end
       end
       if val.nil?
         @hash.delete(key)
       else
+        iter_keys_reset! unless @hash.has_key?(key)
         @hash[key] = val
       end
+      false
     end
 
     # Pull consecutive integer keys that were parked in the hash (set before
@@ -642,8 +735,14 @@ module Lua
         v = @hash[k]?
         break if v.nil?
         @hash.delete(k)
-        buf_grow(@arr_len + 1)
-        @buf[@arr_len] = v
+        if @unboxed && (fv = v.as?(Float64))
+          buf_grow(@arr_len + 1)
+          @fbuf[@arr_len] = fv
+        else
+          flip_to_boxed! if @unboxed
+          buf_grow(@arr_len + 1)
+          @buf[@arr_len] = v
+        end
         @arr_len += 1
       end
     end
@@ -657,14 +756,35 @@ module Lua
         return
       end
       if @arr_len > 0 && start == @arr_base + @arr_len
+        flip_to_boxed! if @unboxed && vals.any? { |v| !v.is_a?(Float64) }
         buf_grow(@arr_len + vals.size)
-        vals.each { |v| @buf[@arr_len] = v; @arr_len += 1 }
+        vals.each do |v|
+          if @unboxed && (fv = v.as?(Float64))
+            @fbuf[@arr_len] = fv
+          else
+            @buf[@arr_len] = v
+          end
+          @arr_len += 1
+        end
+        iter_keys_reset! # array part grew: new integer keys covered
         migrate_from_hash
       elsif @arr_len == 0 && start >= 1
+        if !@unboxed && @buf.null?
+          @unboxed = vals.all? { |v| v.is_a?(Float64) }
+        elsif @unboxed && vals.any? { |v| !v.is_a?(Float64) }
+          flip_to_boxed!
+        end
         buf_grow(vals.size)
-        vals.each_with_index { |v, i| @buf[i] = v }
+        vals.each_with_index do |v, i|
+          if @unboxed && (fv = v.as?(Float64))
+            @fbuf[i] = fv
+          else
+            @buf[i] = v
+          end
+        end
         @arr_len = vals.size
         @arr_base = start
+        iter_keys_reset! # array part created: new integer keys covered
         migrate_from_hash
       else
         vals.each_with_index { |v, i| raw_set((start + i).to_f64, v) }
@@ -720,7 +840,7 @@ module Lua
 
     private def slot_filled?(k : Int32) : Bool
       if k >= @arr_base && k < @arr_base + @arr_len
-        !@buf[k - @arr_base].nil?
+        @unboxed ? true : !@buf[k - @arr_base].nil?
       else
         @hash.has_key?(k.to_f64)
       end
@@ -733,7 +853,11 @@ module Lua
         return keys
       end
       keys = Array(LuaValue).new(@arr_len + @hash.size)
-      @arr_len.times { |i| keys << (@arr_base + i).to_f64 unless @buf[i].nil? }
+      if @unboxed
+        @arr_len.times { |i| keys << (@arr_base + i).to_f64 }
+      else
+        @arr_len.times { |i| keys << (@arr_base + i).to_f64 unless @buf[i].nil? }
+      end
       if @smask > 0
         (@smask + 1).times do |i|
           k = @slots[i].key
@@ -756,6 +880,7 @@ module Lua
       wk = !mode.nil? && mode.not_nil!.includes?('k')
       wv = !mode.nil? && mode.not_nil!.includes?('v')
       if wk || wv
+        flip_to_boxed! # the weak representation stores boxed pairs
         items = [] of {WCell, WCell}
         if wi = @weak
           wi.each { |(kb, vb)| items << {kb, vb} }
@@ -809,7 +934,7 @@ module Lua
         end
         return
       end
-      @arr_len.times { |i| m.mark(@buf[i]) }
+      @arr_len.times { |i| m.mark(@buf[i]) } unless @unboxed # f64s: nothing to mark
       if @smask > 0
         (@smask + 1).times do |i|
           m.mark(@slots[i].val)

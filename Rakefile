@@ -27,6 +27,7 @@ REPO_ROOT = File.expand_path(__dir__)
 BENCH_DIR = File.join(REPO_ROOT, "bench")
 VENDOR    = File.join(BENCH_DIR, "vendor")
 SUITE     = File.join(VENDOR, "LuaJIT-test-cleanup", "bench")
+XRAY      = File.join(BENCH_DIR, "xray")
 RESULTS   = File.join(BENCH_DIR, "results")
 CLUA_BIN  = File.join(REPO_ROOT, "bin", "lua5")
 
@@ -45,6 +46,15 @@ BENCHES = [
   %w[array3d 300],
   %w[fasta 4000000],
   %w[scimark-fft 20000],
+  # bench/xray/*.lua — игровые сценарии по мотивам xray-16 (см. benchmark.md)
+  %w[xr-update 4000],
+  %w[events 20000],
+  %w[oop 5000],
+  %w[spawn 24000],
+  %w[news 1000000],
+  %w[sort-queue 2000],
+  %w[veclib 3000],
+  %w[coro-mgr 80000],
 ].freeze
 
 VMS = {

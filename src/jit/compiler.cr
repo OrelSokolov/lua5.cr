@@ -61,6 +61,10 @@ module Lua::JIT
     class_getter slot_size : Int32 = -1
     class_getter slot_key : Int32 = -1
     class_getter slot_val : Int32 = -1
+    # unboxed array part (M7): f64 buffer + flag byte — the numeric fast
+    # paths branch on the flag and load bare doubles (no tag check)
+    class_getter tbl_fbuf : Int32 = -1
+    class_getter tbl_unboxed : Int32 = -1
     # LuaClosure tag + field offsets, Proto field offsets (direct-call fast
     # path), Interp field offsets (inline hook/coroutine/depth checks and
     # value-stack re-sync) and the static weak_seen flag address.
@@ -123,6 +127,8 @@ module Lua::JIT
       @@slot_size = o[:slot_size]
       @@slot_key = o[:slot_key]
       @@slot_val = o[:slot_val]
+      @@tbl_fbuf = o[:fbuf]
+      @@tbl_unboxed = o[:unboxed]
       c = cl.probe_offsets
       @@cl_proto = c[:proto]
       @@cl_compiled = c[:compiled]
@@ -210,22 +216,23 @@ module Lua::JIT
       p = cl.proto
       # `arg`-table protos bail: the implicit local is built by push_call at
       # frame entry, which the JIT entry does not do. A bare vararg flag is
-      # fine as long as the body never executes VARARG (jit_deopt cannot
-      # rebuild frame.varargs, so a mid-body VARARG must never enter JIT).
+      # fine: vararg frames are always entered through push_call (direct
+      # JIT entries exclude vararg protos), so the interpreter Frame with
+      # its varargs array exists for any deopt — and the VARARG opcode
+      # itself deopts wholesale (like TAILCALL), which re-runs the frame
+      # interpreted from that pc with varargs intact (fasta's loadstring'd
+      # chunks are all vararg; before this they never tiered up at all).
       return nil if p.needs_arg?
-      p.packed.each do |w|
-        return nil if (w & 0xFF).to_u8! == Op::VARARG.value
-      end
       return nil if p.code.size > 4096 # M1 sanity cap
 
       # OSR points: targets of backward jumps (numeric-for bodies, while/
-      # repeat loops). The entry function starts at blocks[start_pc] for
-      # these, blocks[0] otherwise (see gen).
+      # repeat loops, generic-for tests). The entry function starts at
+      # blocks[start_pc] for these, blocks[0] otherwise (see gen).
       heads = Set(Int32).new
       p.packed.each_with_index do |w, pc|
         op = (w & 0xFF).to_u8!.unsafe_as(Op)
         case op
-        when .jmp?, .jmpf?, .jmpt?, .forloop?
+        when .jmp?, .jmpf?, .jmpt?, .forloop?, .tforcall?
           off = ((w >> 24).to_i64! << 44 >> 44).to_i32!
           heads << (pc + 1 + off) if off < 0
         end
@@ -249,7 +256,10 @@ module Lua::JIT
         when .forloop?
           edge.call(pc + 1 + off)
           edge.call(pc + 1)
-        when .tailcall?, .tforcall?, .vararg?, .return?
+        when .tforcall?
+          edge.call(pc + 1 + off)
+          edge.call(pc + 1)
+        when .tailcall?, .vararg?, .return?
           # terminal: machine code returns control
         else
           edge.call(pc + 1)
@@ -682,6 +692,12 @@ module Lua::JIT
             hp = @phi_head[pc].not_nil!
             @nums[a], @nums[a + 1], @nums[a + 2] = hp
           end
+          if ENV["LUA5_JIT"]? == "trace" && (dbg = ENV["LUA5_JIT_DBGPC"]?)
+            dlo, dhi = dbg.split('-').map(&.to_i)
+            if pc >= dlo && pc <= dhi
+              puts "emit pc#{pc} preds=#{@preds[pc]?} rp=#{@real_preds[pc]?.try(&.inspect)} mp=#{@merge_phi[pc]?.try(&.keys)} nums=#{@nums.keys.sort} tabs=#{@tabs.keys.sort}"
+            end
+          end
           emit(pc)
           pc += 1
         end
@@ -807,12 +823,13 @@ module Lua::JIT
           emit_forprep(pc, a, bb)
         when .forloop?
           emit_forloop(pc, a, bb)
-        when .tailcall?, .tforcall?, .vararg?
+        when .tailcall?, .vararg?
           # deopt wholesale: the interpreter runs the rest of the function
-          # (TAILCALL slides the frame; TFORCALL re-enters; VARARG can't
-          # appear — vararg protos bail the compile)
+          # (TAILCALL slides the frame; VARARG re-runs with frame.varargs)
           st = call_fp(:deopt, [@interp, @clp, @base, @i32.const_int(pc), @want])
           b.ret(st)
+        when .tforcall?
+          emit_tforcall(pc, a, bb, cc)
         when .call?     then emit_call(pc, a, bb, cc)
         when .return?
           # Contract: results must end at stack[base..] (the closure slot).
@@ -854,6 +871,62 @@ module Lua::JIT
         else
           raise CompileBail.new("unsupported op #{op} at pc #{pc}")
         end
+      end
+
+      # TFORCALL A B C: generic-for step — call the iterator R[A] with
+      # (state R[A+1], control R[A+2]), place C results at R[A+3..]; a
+      # non-nil FIRST result updates the control R[A+2] and jumps B to the
+      # loop test, nil falls through (loop done). Emitted as a dispatch
+      # CALL on a staging window at A+3 (the interpreter's fast-path
+      # shape), so for-in hot loops stay in machine code — TFORCALL used
+      # to deopt wholesale, leaving every generic-for loop interpreted
+      # (array3d: 27M iterator calls through call_value per run).
+      private def emit_tforcall(pc : Int32, a : Int32, off : Int32, cnt : Int32) : Nil
+        b = @b
+        # stage func/state/control at a+3 (the results window — func and
+        # args sit exactly where the callee frame expects them)
+        3.times { |i| b.store(load_slot(a + i), slot(a + 3 + i)) }
+        if Compiler::FAST_CALL
+          # direct JIT->JIT for a compiled iterator (the guard chain),
+          # dispatch helper otherwise — 27M-iteration for-in loops pay the
+          # helper hop otherwise
+          emit_call_fast_to(pc, a + 3, 2, cnt) do
+            emit_tforcall_next(pc, a, off)
+          end
+        else
+          newstk = call_fp(:dispatch, [@interp, @clp, @base, @i32.const_int(pc),
+            @i32.const_int(a + 3), @i32.const_int(2), @i32.const_int(cnt), @status_p])
+          b.store(newstk, @cur_stack)
+          st = b.load(@i32, @status_p)
+          bad = new_block("tfcbad#{pc}")
+          cont = new_block("tfccont#{pc}")
+          b.cond(b.icmp(LLVM::IntPredicate::SLT, st, @i32.const_int(0)), bad, cont)
+          b.position_at_end(bad)
+          b.ret(st)
+          b.position_at_end(cont)
+          kill_all
+          # dispatch nil-fills missing results to `want`; top sits past them
+          b.store(b.add(@base, @i32.const_int(a + 3 + {cnt, 0}.max)), @cur_top)
+          emit_tforcall_next(pc, a, off)
+        end
+      end
+
+      # TFORCALL continuation: a non-nil first result updates the control
+      # R[A+2] and jumps to the loop test; nil falls through (loop done)
+      private def emit_tforcall_next(pc : Int32, a : Int32, off : Int32) : Nil
+        b = @b
+        first = load_slot(a + 3)
+        go = new_block("tfcgo#{pc}")
+        done = new_block("tfcdone#{pc}")
+        b.cond(b.icmp(LLVM::IntPredicate::NE, b.extract_value(first, 0),
+          @i32.const_int(0)), go, done)
+        b.position_at_end(go)
+        b.store(first, slot(a + 2))
+        wire_forloop_edge(dest(pc, off))
+        wire_gen_edge(dest(pc, off))
+        b.br(@blocks[dest(pc, off)])
+        b.position_at_end(done)
+        br_next(pc)
       end
 
       private def emit_loadk(pc : Int32, a : Int32, kb : Int32) : Nil
@@ -1270,8 +1343,15 @@ module Lua::JIT
       # budget, stack window) becomes cheap inline loads; the helper stays
       # as the slow path for everything else. Results follow the same
       # contract: count in the return value, slots at stack[base+a..],
-      # missing fixed results nil-filled here.
+      # missing fixed results nil-filled here. The block yields with the
+      # builder positioned at the shared continuation — callers emit their
+      # own next-edge (CALL falls through; TFORCALL branches on the first
+      # result).
       private def emit_call_fast(pc : Int32, a : Int32, argn : Int32, want_v : Int32) : Nil
+        emit_call_fast_to(pc, a, argn, want_v) { br_next(pc) }
+      end
+
+      private def emit_call_fast_to(pc : Int32, a : Int32, argn : Int32, want_v : Int32, & : -> Nil) : Nil
         b = @b
         slow = new_block("cslow#{pc}")
         vf = load_slot(a)
@@ -1351,8 +1431,8 @@ module Lua::JIT
         else
           b.store(b.add(@base, @i32.const_int(a + {want_v, 0}.max)), @cur_top)
         end
-        kill_all
-        br_next(pc)
+        join = new_block("cjoin#{pc}")
+        b.br(join)
         b.position_at_end(slow)
         newstk = call_fp(:dispatch,
           [@interp, @clp, @base, @i32.const_int(pc), @i32.const_int(a), @i32.const_int(argn), @i32.const_int(want_v), @status_p])
@@ -1369,7 +1449,10 @@ module Lua::JIT
         else
           b.store(b.add(@base, @i32.const_int(a + {want_v, 0}.max)), @cur_top)
         end
-        br_next(pc)
+        b.br(join)
+        b.position_at_end(join)
+        kill_all
+        yield
       end
 
       # Recorded single-arg numeric builtin at this pc (M5.1): an identity
@@ -1768,6 +1851,20 @@ module Lua::JIT
         b.cond(b.and(b.icmp(LLVM::IntPredicate::SGE, k32, ab),
           b.icmp(LLVM::IntPredicate::SLT, k32, b.add(ab, al))), ok, slow)
         b.position_at_end(ok)
+        # unboxed array part (M7): bare f64 buffer — no tag check, and the
+        # loaded value is a number by construction (numeric fact)
+        unf = new_block("gt#{pc}u")
+        bxf = new_block("gt#{pc}bx")
+        b.cond(b.icmp(LLVM::IntPredicate::NE,
+          b.load(@i8, tbl_fld(tbl, Layout.tbl_unboxed)), @i8.const_int(0)),
+          unf, bxf)
+        b.position_at_end(unf)
+        fbuf = b.load(@ptr, tbl_fld(tbl, Layout.tbl_fbuf))
+        fv = b.load(@f64, b.gep(@f64, fbuf, b.sub(k32, ab)))
+        store_num(slot(a), fv)
+        kill(a)
+        br_next(pc)
+        b.position_at_end(bxf)
         bufp = b.load(@lv_ptr, tbl_fld(tbl, Layout.tbl_buf))
         v = b.load(@lv, b.gep(@lv, bufp, b.sub(k32, ab)))
         # nil slot = hole, but the hash part may still hold the key → helper
@@ -1833,9 +1930,24 @@ module Lua::JIT
         b.cond(b.and(b.icmp(LLVM::IntPredicate::SGE, k32, ab),
           b.icmp(LLVM::IntPredicate::SLT, k32, b.add(ab, al))), ok, slow)
         b.position_at_end(ok)
+        vv = load_slot(cr)
+        # unboxed array part (M7): only number values fit — anything else
+        # (string/table/nil) must flip the table, the helper's job
+        unf = new_block("st#{pc}u")
+        bxf = new_block("st#{pc}bx")
+        b.cond(b.icmp(LLVM::IntPredicate::NE,
+          b.load(@i8, tbl_fld(tbl, Layout.tbl_unboxed)), @i8.const_int(0)),
+          unf, bxf)
+        b.position_at_end(unf)
+        okn = new_block("st#{pc}un")
+        b.cond(tag_is(vv, Layout.tag_num), okn, slow)
+        b.position_at_end(okn)
+        fbuf = b.load(@ptr, tbl_fld(tbl, Layout.tbl_fbuf))
+        b.store(b.extract_value(vv, 1), b.gep(@f64, fbuf, b.sub(k32, ab)))
+        br_next(pc)
+        b.position_at_end(bxf)
         # nil store must update @len_cache (raw_set: k-1 if k <= cache) —
         # route it to the helper; nil writes are cold in hot loops
-        vv = load_slot(cr)
         ok = new_block("st#{pc}nn")
         b.cond(b.icmp(LLVM::IntPredicate::EQ, b.extract_value(vv, 0), @i32.const_int(0)),
           slow, ok)
@@ -2056,7 +2168,8 @@ module Lua::JIT
                  when .jmpf?, .jmpt?, .forloop?
                    {pc + 1 + off, pc + 1}
                  when .forprep?    then {pc + 1 + off}
-                 when .tailcall?, .tforcall?, .vararg?, .return?
+                 when .tforcall?   then {pc + 1 + off, pc + 1} # jumps only on non-nil
+                 when .tailcall?, .vararg?, .return?
                    {-1} # terminal
                  else                  {pc + 1}
                  end
@@ -2144,7 +2257,8 @@ module Lua::JIT
           if v = @nums[r]?
             phi_add(phi, v, current_block)
           else
-            raise CompileBail.new("merge phi hole: pc#{tgt} r#{r} src=#{current_block.name} fb=#{@fb.inspect}")
+            in_s = @in_nums[tgt]?
+            raise CompileBail.new("merge phi hole: pc#{tgt} r#{r} src=#{current_block.name} nums=#{@nums.keys.sort} in=#{in_s.try(&.to_a).try(&.sort)} preds=#{@real_preds[tgt]?.try(&.inspect)} fb=#{@fb.inspect}")
           end
         end
       end

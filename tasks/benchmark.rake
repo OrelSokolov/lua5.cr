@@ -62,6 +62,10 @@ def startup_overhead(vm) # min of 5 empty runs, subtracted from every bench
   end.min
 end
 
+def bench_path(name) # kernel'ы — в vendor-наборе, игровые — в bench/xray
+  [File.join(SUITE, "#{name}.lua"), File.join(XRAY, "#{name}.lua")].find { |p| File.exist?(p) }
+end
+
 def run_suite(vm, filter = nil)
   conf = VMS.fetch(vm)
   cmd  = conf[:bin]
@@ -77,7 +81,7 @@ def run_suite(vm, filter = nil)
 
   results = {}
   benches.each do |name, param|
-    file = File.join(SUITE, "#{name}.lua")
+    file = bench_path(name) or abort "Bench script for '#{name}' not found in #{SUITE} nor #{XRAY}"
     times, sha, status = [], nil, "ok"
     reps.times do
       t0 = Process.clock_gettime(Process::CLOCK_MONOTONIC)

@@ -1343,7 +1343,15 @@ module Lua
                   @vi_pc = pc - 1
                   raise_lua(k.nil? ? "table index is nil" : "table index is NaN")
                 end
-                t.raw_set(k, sp[base + c])
+                # type feedback (M3.6): numeric stores the JIT spec path
+                # cannot handle (appends, first elements, hash keys, nil
+                # stores) record FB_TMISS here — the interpreter is the
+                # sampler, so the FIRST compile is already polymorphic
+                # instead of deopt-churning one pc at a time. String keys
+                # never sample (the inline identity probe keeps them
+                # speculative — see raw_set).
+                fast = t.raw_set(k, sp[base + c])
+                proto.fb_record(pc - 1, Lua::FB_TMISS) if !fast && k.is_a?(Float64)
               else
                 @line = lines[pc - 1]
                 @vi_pc = pc - 1
@@ -1609,6 +1617,18 @@ module Lua
                     end
                     stack[base + a + 2] = first
                     pc += b
+                    # back-edge hotness: generic-for loops never run the
+                    # JMP/FORLOOP handlers, so without this bump a hot
+                    # for-in main chunk stays interpreted forever
+                    JIT.on_call(self, cl)
+                    if osr_ready?(frame, cl)
+                      rs = osr_run(frame, cl, proto, base, pc)
+                      if rs
+                        results = rs
+                        done = true
+                      end
+                      break # entry frame done / re-fetch the caller frame
+                    end
                   end
                   jit_done = true
                 end
@@ -1625,6 +1645,15 @@ module Lua
                   end
                   stack[base + a + 2] = first
                   pc += b
+                  JIT.on_call(self, cl) # back-edge hotness (see above)
+                  if osr_ready?(frame, cl)
+                    rs = osr_run(frame, cl, proto, base, pc)
+                    if rs
+                      results = rs
+                      done = true
+                    end
+                    break # entry frame done / re-fetch the caller frame
+                  end
                 end
               end
             when .call?
@@ -1921,7 +1950,11 @@ module Lua
         raise_lua("attempt to yield across a Crystal call boundary (not supported)")
       end
       @suspending = true
-      raise YieldSignal.new(args)
+      # no backtrace: YieldSignal never surfaces to the user, and
+      # CallStack.unwind walks the whole stack per yield (very hot)
+      e = YieldSignal.new(args)
+      e.callstack = Exception::CallStack.empty
+      raise e
       [] of LuaValue # unreachable: keeps the return type non-NoReturn
     end
 
