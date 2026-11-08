@@ -2,18 +2,6 @@
 # Runtime/. Execution itself lives in vm.cr (bytecode VM); this file keeps
 # the shared runtime operations the VM, stdlib and interop all use.
 module Lua
-  # Raised by coroutine.yield to unwind to the resume boundary, carrying the
-  # yielded values. Never a LuaError, so pcall/err handlers do not catch it;
-  # the CALL/TAILCALL handlers in the VM intercept it (vm.cr) and stash the
-  # suspended context for the next resume.
-  class YieldSignal < Exception
-    getter values : Array(LuaValue)
-
-    def initialize(@values)
-      super("yield")
-    end
-  end
-
   class Interp
     property globals : LuaTable
     getter string_lib : LuaTable
@@ -83,7 +71,7 @@ module Lua
     # the thread-global env (5.1: what setfenv(0, t) changes).
     def compile(src : String, chunkname : String = "chunk") : LuaClosure
       @chunkname = chunkname
-      block = Parser.new(Lexer.new(src, chunkname).tokens, chunkname).parse_chunk
+      block = Parser.new(Lexer.new(src, chunkname), chunkname).parse_chunk
       proto = Compiler.new(chunkname, src).compile_main(block)
       cl = LuaClosure.new(proto, [] of UpValue)
       cl.env = @default_env
@@ -441,8 +429,6 @@ module Lua
       begin
         f.fn.call(self, args)
       rescue e : LuaError
-        raise e
-      rescue e : YieldSignal
         raise e
       rescue e : Exception
         raise LuaError.new("(crystal) #{f.name}: #{e.class}: #{e.message || "error"}")

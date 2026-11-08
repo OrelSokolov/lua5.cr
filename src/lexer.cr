@@ -27,11 +27,11 @@ module Lua
       @pos = 0
       @line = 1
       @eol_tail = false
+      @started = false
     end
 
     def tokens : Array(Token)
       out = [] of Token
-      skip_shebang
       loop do
         t = next_token
         out << t
@@ -174,7 +174,15 @@ module Lua
       end
     end
 
-    private def next_token : Token
+    # Public + self-starting: the parser pulls tokens as it parses (see
+    # TokenStream in parser.cr), so a lexical error past the parse
+    # failure point cannot preempt a syntax error earlier in the source —
+    # the way LuaJIT's streaming lexer/parser pair behaves.
+    def next_token : Token
+      unless @started
+        skip_shebang
+        @started = true
+      end
       skip_ws_and_comments
       line = @line
       ch = c
@@ -270,7 +278,10 @@ module Lua
     end
 
     private def name_start?(ch : Int32) : Bool
-      (ch >= 0x61 && ch <= 0x7A) || (ch >= 0x41 && ch <= 0x5A) || ch == 0x5F
+      # lj_char.c: all bytes 0x80-0xFF carry LJ_CHAR_IDENT (ident, not
+      # alpha) — cp1251 text lexes as a name, matching the engine oracle
+      # ("copy of _test.script": "\xEF\xF0\xE8\xE2\xE5\xF2" is a NAME).
+      (ch >= 0x61 && ch <= 0x7A) || (ch >= 0x41 && ch <= 0x5A) || ch == 0x5F || ch >= 0x80
     end
 
     private def name_char?(ch : Int32) : Bool

@@ -27,7 +27,49 @@ module Lua
       end
     end
 
-    def initialize(@toks : Array(Token), @chunkname : String = "chunk")
+    # Tokens pulled from the lexer on demand. LuaJIT's parser drives the
+    # lexer, so errors surface in source order; lexing the whole chunk
+    # upfront would let a lexer error late in the file preempt a syntax
+    # error earlier (engine oracle "gulag_radar_u.script": parser stops
+    # at line 1 on the leading ';' even though an invalid '@' sits at
+    # line 4).
+    class TokenStream
+      def initialize(@lexer : Lexer)
+        @buf = [] of Token
+        @done = false
+      end
+
+      # nil only past the final eof token, which the parser never reads
+      def []?(i : Int32) : Token?
+        if i < 0 # mirror Array: negative index counts from the end
+          fill_to_end
+          @buf[i]?
+        else
+          while !@done && @buf.size <= i
+            t = @lexer.next_token
+            @buf << t
+            @done = true if t.kind.eof?
+          end
+          @buf[i]?
+        end
+      end
+
+      def last : Token
+        fill_to_end
+        @buf.last
+      end
+
+      private def fill_to_end : Nil
+        until @done
+          t = @lexer.next_token
+          @buf << t
+          @done = true if t.kind.eof?
+        end
+      end
+    end
+
+    def initialize(@lexer : Lexer, @chunkname : String = "chunk")
+      @toks = TokenStream.new(@lexer)
       @pos = 0
       @last_line = 1
       @fnscopes = [FnScope.new(0)]
@@ -78,7 +120,8 @@ module Lua
     end
 
     private def cur : Token
-      @toks[@pos]
+      # adv never moves past the eof token, so this always has a token
+      @toks[@pos]?.not_nil!
     end
 
     private def peek : Token
@@ -86,7 +129,7 @@ module Lua
     end
 
     private def adv : Token
-      t = @toks[@pos]
+      t = @toks[@pos]?.not_nil!
       @last_line = t.line
       @pos += 1 unless t.kind.eof?
       t
@@ -136,7 +179,8 @@ module Lua
     end
 
     private def expect_name : String
-      err("<name> expected near '#{cur.describe}'") unless check(Tk::Name)
+      # token2str(TK_name) = "<name>", quoted by the '%s expected' format
+      err("'<name>' expected near '#{cur.describe}'") unless check(Tk::Name)
       adv.text
     end
 
@@ -236,25 +280,25 @@ module Lua
           st.at(line)
         end
       else
-        # expression statement: only a call is valid
+        # Expression statement / assignment — lj_parse.c parse_call_assign
+        # + parse_assignment: a suffixed expression that is not a call
+        # must begin an assignment, each target is checked as it is
+        # collected ("syntax error" at the ','/'=' token), and a missing
+        # '=' reports "'=' expected" at the offending token.
         e = parse_suffixed
-        if check(Tk::Assign) || check(Tk::Comma)
-          targets = [e] of AST::Expr
-          while accept(Tk::Comma)
-            targets << parse_suffixed
-          end
-          expect(Tk::Assign)
-          exps = parse_explist
-          targets.each do |t|
-            unless t.is_a?(AST::NameE) || t.is_a?(AST::IndexE)
-              err("syntax error near '#{cur.describe}'")
-            end
-          end
-          AST::AssignStat.new(targets, exps).at(line)
-        elsif e.is_a?(AST::CallE) || e.is_a?(AST::MethodCallE)
+        if e.is_a?(AST::CallE) || e.is_a?(AST::MethodCallE)
           AST::ExprStat.new(e).at(line)
         else
-          err("syntax error near '#{cur.describe}'")
+          targets = [e] of AST::Expr
+          loop do
+            unless targets.last.is_a?(AST::NameE) || targets.last.is_a?(AST::IndexE)
+              err("syntax error near '#{cur.describe}'")
+            end
+            break unless accept(Tk::Comma)
+            targets << parse_suffixed
+          end
+          expect(Tk::Assign, "=")
+          AST::AssignStat.new(targets, parse_explist).at(line)
         end
       end
     end
