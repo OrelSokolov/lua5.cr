@@ -871,10 +871,13 @@ module Lua
     # run_frames entry points (frame counts) — one per nested VM re-entry.
     # coroutine.yield is only legal at depth 1 of the running coroutine.
     @entry_stack = [] of Int32
-    # The CALL/TAILCALL site that raised YieldSignal: frame, abs result
+    # The CALL/TAILCALL site that suspended on a yield: frame, abs result
     # register (-1 for a tail call), CALL C operand, tail-call flag.
     @yield_call : {Frame, Int32, Int32, Bool}? = nil
     @suspending = false
+    # The values passed to coroutine.yield while @suspending — consumed by
+    # resume_co on its way out (return-based yield transport, no exception).
+    @yield_values : Array(LuaValue) = Lua::EMPTY_VALS
     # loop back-edge counter for the weak-gated automatic GC
     @gc_tick = 0
     # Crystal-mediated Lua calls made from inside the current run_frames
@@ -1800,13 +1803,14 @@ module Lua
                 if (vf = call_target(fn)) && (@hook_on & HOOK_CALL) != 0
                   fire_hook("call", nil, vf)
                 end
-                r = begin
-                  call_value(fn, base + a, argn, a)
-                rescue e : YieldSignal
+                r = call_value(fn, base + a, argn, a)
+                if @suspending
                   # coroutine.yield: the CALL resumes later with the
                   # yielded values as its results
                   @yield_call = {frame, base + a, c, false}
-                  raise e
+                  results = @yield_values
+                  done = true
+                  break
                 end
                 frame.pc = pc
                 if vf && (@hook_on & HOOK_RET) != 0
@@ -1865,12 +1869,13 @@ module Lua
                 if (vf = call_target(fn)) && (@hook_on & HOOK_CALL) != 0
                   fire_hook("call", nil, vf)
                 end
-                r = begin
-                  call_value(fn, base + a, argn, a)
-                rescue e : YieldSignal
+                r = call_value(fn, base + a, argn, a)
+                if @suspending
                   # tail call to yield: completes as this frame's return
                   @yield_call = {frame, -1, 0, true}
-                  raise e
+                  results = @yield_values
+                  done = true
+                  break
                 end
                 if vf && (@hook_on & HOOK_RET) != 0
                   fire_hook("return", nil, vf)
@@ -1981,8 +1986,10 @@ module Lua
 
     # --- coroutines ---
 
-    # coroutine.yield: unwind to the resume boundary via YieldSignal. Legal
-    # only in the running coroutine's own bytecode — no deeper run_frames
+    # coroutine.yield: mark the VM suspending and return — the CALL/TAILCALL
+    # handler propagates to the resume boundary without an exception (a
+    # Crystal raise costs ~16µs of unwind per yield; coro-mgr was 60% unwind).
+    # Legal only in the running coroutine's own bytecode — no deeper run_frames
     # entry (a sort comparator, pcall'ed closure, metamethod) and no
     # Crystal-mediated call in between (pcall/native chains); Lua 5.1
     # rejects those the same way.
@@ -1992,12 +1999,8 @@ module Lua
         raise_lua("attempt to yield across a Crystal call boundary (not supported)")
       end
       @suspending = true
-      # no backtrace: YieldSignal never surfaces to the user, and
-      # CallStack.unwind walks the whole stack per yield (very hot)
-      e = YieldSignal.new(args)
-      e.callstack = Exception::CallStack.empty
-      raise e
-      [] of LuaValue # unreachable: keeps the return type non-NoReturn
+      @yield_values = args
+      Lua::EMPTY_VALS
     end
 
     # Resume a coroutine: swap its saved stacks in, run its body (first
@@ -2047,9 +2050,6 @@ module Lua
         if co.first_resume?
           co.first_resume = false
           res = call(co.fn, args)
-          co.status = LuaCoroutine::Status::Dead
-          co.release
-          ([true] of LuaValue).concat(res)
         else
           yf, yra, yc, _tail = co.yield_call.not_nil!
           co.yield_call = nil
@@ -2069,22 +2069,26 @@ module Lua
           # frames above (e.g. the function the yield happened in) must
           # return into the body, not end the resume
           res = run_frames(0, @frames[0].base)
+        end
+        if @suspending
+          # coroutine.yield: return-transport unwind reached the boundary —
+          # park the state (the same save the old YieldSignal rescue did)
+          @suspending = false
+          co.status = LuaCoroutine::Status::Suspended
+          co.stack, co.frames, co.fsize = @stack, @frames, @fsize
+          co.entries = @entry_stack
+          co.open_upvals = @open_upvals
+          co.open_max = @open_max
+          co.native_stack = @native_stack
+          co.hook, co.hook_mask, co.hook_count, co.hook_countdown = @hook_fn, @hook_mask, @hook_count, @hook_countdown
+          co.yield_call = @yield_call
+          @yield_call = nil
+          ([true] of LuaValue).concat(@yield_values)
+        else
           co.status = LuaCoroutine::Status::Dead
           co.release
           ([true] of LuaValue).concat(res)
         end
-      rescue e : YieldSignal
-        @suspending = false
-        co.status = LuaCoroutine::Status::Suspended
-        co.stack, co.frames, co.fsize = @stack, @frames, @fsize
-        co.entries = @entry_stack
-        co.open_upvals = @open_upvals
-        co.open_max = @open_max
-        co.native_stack = @native_stack
-        co.hook, co.hook_mask, co.hook_count, co.hook_countdown = @hook_fn, @hook_mask, @hook_count, @hook_countdown
-        co.yield_call = @yield_call
-        @yield_call = nil
-        ([true] of LuaValue).concat(e.values)
       rescue e : LuaError
         co.status = LuaCoroutine::Status::Dead
         # 5.1 abandons the ci's of an erroring coroutine: keep the frames

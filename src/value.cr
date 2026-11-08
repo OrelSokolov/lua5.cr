@@ -1263,8 +1263,9 @@ module Lua
     # swapped with the stacks on resume (the resumer's natives belong to
     # the parent state, not to the coroutine's level walks).
     property native_stack = [] of NativeEntry
-    # The CALL/TAILCALL site that raised YieldSignal (vm.cr), saved on
-    # suspend: {frame, abs result register (-1: tail call), CALL C, tail?}.
+    # The CALL/TAILCALL site that suspended on a yield (@suspending return
+    # transport, vm.cr): frame, abs result register (-1 for a tail call),
+    # CALL C operand, tail-call flag.
     property yield_call : {Frame, Int32, Int32, Bool}? = nil
     property? first_resume = true
     # Hooks are per-state (5.1 lua_sethook/getthread): swapped with the

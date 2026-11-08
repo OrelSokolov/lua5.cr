@@ -1,6 +1,6 @@
 # coroutine library. Port of lcorolib.c (Lua 5.1 semantics: resume returns
 # [false, err] on error; wrap re-raises). The mechanism lives in vm.cr
-# (YieldSignal unwinding + resume_co state swap).
+# (return-based yield transport + resume_co state swap).
 module Lua::Stdlib
   module Coroutine
     def self.install(i : Interp)
