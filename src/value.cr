@@ -953,6 +953,25 @@ module Lua
       (@feedback ||= Array(UInt8).new(packed.size, 0_u8))[pc] |= bits
     end
 
+    # Call-site feedback (JIT M5): per-CALL-pc last-seen callee Proto,
+    # recorded by the interpreter's CALL handler. A monomorphic site lets
+    # the JIT inline the callee body behind a closure-identity guard; a
+    # polymorphic site just misses the guard and takes the normal call.
+    property call_fb : Array(Proto?)? = nil
+
+    def call_record(pc : Int32, target : Proto) : Nil
+      (@call_fb ||= Array(Proto?).new(packed.size, nil))[pc] = target
+    end
+
+    # Same, for single-argument numeric builtins (math.* with fast1):
+    # records the LuaFunction OBJECT — the inline fast1 call guards on its
+    # identity, so a rebound site simply misses and takes the slow path.
+    property fast1_fb : Array(LuaFunction?)? = nil
+
+    def fast1_record(pc : Int32, target : LuaFunction) : Nil
+      (@fast1_fb ||= Array(LuaFunction?).new(packed.size, nil))[pc] = target
+    end
+
     def initialize(@chunkname)
     end
 
@@ -975,6 +994,18 @@ module Lua
 
     def initialize(@stack, @idx)
     end
+
+    # JIT layout probe (jit/compiler.cr Layout): byte offsets of the cell
+    # fields for the inlined GETUPVAL. @stack is a nilable REFERENCE —
+    # Crystal stores reference-or-Nil as a plain pointer with nil = 0 (no
+    # union tag), so machine code compares it against null and branches:
+    # open cells read the shared value stack, closed ones the cached value.
+    def probe_offsets : {stack: Int32, idx: Int32, value: Int32}
+      base = self.as(UInt8*).address
+      {stack: (pointerof(@stack).address - base).to_i32!,
+       idx:   (pointerof(@idx).address - base).to_i32!,
+       value: (pointerof(@value).address - base).to_i32!}
+    end
   end
 
   class LuaClosure
@@ -993,6 +1024,11 @@ module Lua
     # (Lua::JIT.on_deopt).
     property fb_snap : Array(UInt8)? = nil
     property fb_gen : Int32 = 0
+    # M5 hot-call inline: callee protos this compile inlined, paired with
+    # the callee feedback masks it specialized on (nil = no inlined
+    # callees). A callee going polymorphic widens these snapshots and
+    # forces a recompile that drops the inline (see JIT.feedback_widened?).
+    property inline_snaps : Array({Proto, Array(UInt8)})? = nil
 
     def initialize(@proto, @upvals)
     end
@@ -1003,7 +1039,7 @@ module Lua
     # 16-byte union { i32 tag, payload } (not pointer-with-nil-0), so the
     # probe returns the payload offset plus the Pointer(Void) type id the
     # fast path must tag-check.
-    def probe_offsets : {proto: Int32, compiled: Int32, compiled_tag: Int32}
+    def probe_offsets : {proto: Int32, compiled: Int32, compiled_tag: Int32, upvals: Int32}
       base = self.as(UInt8*).address
       old = @compiled
       @compiled = Pointer(Void).new(0xDEADBEEF_u64)
@@ -1012,7 +1048,8 @@ module Lua
       @compiled = old
       {proto:        (pointerof(@proto).address - base).to_i32!,
        compiled:     (pointerof(@compiled).address - base + 8).to_i32!,
-       compiled_tag: tag}
+       compiled_tag: tag,
+       upvals:       (pointerof(@upvals).address - base).to_i32!}
     end
 
     def gc_mark_children(m : GcMark) : Nil

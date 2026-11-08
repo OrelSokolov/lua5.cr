@@ -1634,6 +1634,9 @@ module Lua
                 JIT.on_call(self, fn) # M0 hotness (JIT.md 1.2): bump + threshold check
                 frame.pc = pc
                 p = fn.proto
+                # call-site feedback (M5): the compiler inlines a recorded
+                # monomorphic callee behind a closure-identity guard
+                proto.call_record(pc - 1, p)
                 # fast path: exact args, no varargs, stack already sized —
                 # push the frame inline and switch without leaving the loop
                 if p.num_params == argn && !p.vararg?
@@ -1717,6 +1720,11 @@ module Lua
               else
                 @line = lines[pc - 1]
                 @vi_pc = pc - 1
+                # call-site feedback (M5): single-arg numeric builtins get
+                # an identity-guarded inline call (emit_call_fast1)
+                if fn.is_a?(LuaFunction) && fn.fast1 && b >= 0
+                  proto.fast1_record(pc - 1, fn)
+                end
                 frame.pc = pc # call position while the native runs (getinfo)
                 if (vf = call_target(fn)) && (@hook_on & HOOK_CALL) != 0
                   fire_hook("call", nil, vf)

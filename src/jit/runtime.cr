@@ -20,13 +20,27 @@
 # coroutines are off), the interpreter otherwise. Results end up at
 # stack[base+a] per `want` (missing ones nil-filled); returns the CURRENT
 # value-stack pointer — the interpreter may have reallocated it — and
-# writes the status through `status`.
-fun jit_dispatch_call(interp : Void*, base : Int32, a : Int32, argn : Int32,
+# writes the status through `status`. `cl`/`pc` identify the CALLING
+# closure and its CALL instruction: the call-site feedback for hot-call
+# inlining (M5) is recorded here too — calls from JIT code never pass
+# through the interpreter's CALL handler, and without this record a
+# caller that tiered up before its first call would never inline.
+fun jit_dispatch_call(interp : Void*, cl : Void*, base : Int32, pc : Int32,
+                      a : Int32, argn : Int32,
                       want : Int32, status : Int32*) : Void*
-  i = interp.as(Lua::Interp)
-  n = i.jit_call_dispatch(base, a, argn, want)
+  Lua.dispatch_count += 1 if Lua::DEBUG_COUNT
+  it = interp.as(Lua::Interp)
+  ccl = cl.as(Lua::LuaClosure)
+  if pc >= 0 && pc < ccl.proto.packed.size
+    case (fnv = it.stack[base + a]?)
+    when Lua::LuaClosure   then ccl.proto.call_record(pc, fnv.proto)
+    when Lua::LuaFunction
+      ccl.proto.fast1_record(pc, fnv) if fnv.fast1
+    end
+  end
+  n = it.jit_call_dispatch(base, a, argn, want)
   status.value = n
-  i.stack.to_unsafe.as(Void*)
+  it.stack.to_unsafe.as(Void*)
 end
 
 # Guard failure / unsupported path inside machine code: re-establish the
@@ -36,6 +50,14 @@ end
 fun jit_deopt(interp : Void*, cl : Void*, base : Int32,
               pc : Int32, want : Int32) : Int32
   interp.as(Lua::Interp).jit_deopt(cl.as(Lua::LuaClosure), base, pc, want)
+end
+
+# Single-argument numeric builtin (math.* with fast1) called from inlined
+# machine code: one C-ABI hop instead of the full dispatch (the fast1 proc
+# itself is pure math by construction — no Lua, no allocation — so the
+# caller's provenance survives, see emit_call_fast1).
+fun jit_fast1(fn : Void*, x : Float64) : Float64
+  fn.as(Lua::LuaFunction).fast1.not_nil!.call(x)
 end
 
 # GETUPVAL: open upvalues read through the stack, closed ones the cached
@@ -168,14 +190,21 @@ fun jit_ret(interp : Void*, base : Int32) : Void
   i.close_upvals(base) if i.open_max >= base
 end
 
-# Backward JMP (while/repeat back-edge): 1 = weak tables active — the
-# caller deopts so the interpreter drives its loop-edge GC (the loop may
-# be *waiting* for a weak-table sweep to finish, which only gc_full does)
+# Backward JMP (while/repeat back-edge): runs the weak-GC tick (same as
+# the interpreter's back-edge handler) and returns 0 to stay in machine
+# code; -1 = pending error in interp.jit_err (a __gc finalizer raised).
 fun jit_weakcheck(interp : Void*) : Int32
-  Lua.weak_active? ? 1 : 0
+  interp.as(Lua::Interp).jit_weakcheck
 end
 
 module Lua
+  # Debug counter (LUA5_JIT_DEBUG=count): how many CALLs took the dispatch
+  # helper — measures whether the inline fast paths actually engage.
+  # Resolved ONCE: an ENV lookup in jit_dispatch_call cost ~70ns per call
+  # (16M dispatches on series = +1.1s — found by bisection after the fact)
+  DEBUG_COUNT = ENV["LUA5_JIT_DEBUG"]? == "count"
+  class_property dispatch_count = 0
+
   # Opcodes whose mono-numeric guard failure records an operand-shape
   # feedback bit in jit_deopt (mirrors the interpreter slow-path sampling
   # that runs a moment later on the very same instruction).
@@ -428,7 +457,33 @@ module Lua
 
     def jit_loopedge(base : Int32, a : Int32) : Int32
       close_upvals(base + a) if @open_max >= base + a
-      Lua.weak_active? ? 1 : 0
+      weak_tick
+    end
+
+    # Weak-GC tick the interpreter's back-edge handlers run (vm.cr .jmp? /
+    # FORLOOP): bump @gc_tick while any weak table is alive and every 32nd
+    # edge clear stale registers + sweep weak tables/finalizers. Doing this
+    # here — instead of deopting the whole loop to the interpreter — keeps
+    # the loop in machine code; a finalizer may run Lua code (i.call), so
+    # an escaping exception is stashed as @jit_err and reported as -1
+    # (never unwound through machine frames).
+    def jit_weakcheck : Int32
+      weak_tick
+    end
+
+    private def weak_tick : Int32
+      return 0 unless Lua.weak_active?
+      @gc_tick &+= 1
+      if (@gc_tick & 31) == 0
+        begin
+          gc_clear_stale(false)
+          Lua.gc_full(self)
+        rescue e : Exception
+          @jit_err = e
+          return -1
+        end
+      end
+      0
     end
 
     # Polymorphic arithmetic fallback (see jit_arith above): the exact

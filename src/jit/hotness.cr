@@ -39,6 +39,8 @@ module Lua::JIT
     if addr
       cl.compiled = addr
       cl.fb_snap = cl.proto.feedback.try(&.dup)
+      snaps = Compiler.last_inline_snaps
+      cl.inline_snaps = snaps.empty? ? nil : snaps
       cl.fb_gen += 1
       Compiler.trace("compiled #{cl.proto.chunkname}:#{cl.proto.linedefined}")
     end
@@ -46,16 +48,28 @@ module Lua::JIT
   end
 
   # True when the proto's feedback table has bits the compile this closure
-  # is running never saw (the mask is monotone, so this converges).
+  # is running never saw (the mask is monotone, so this converges), or an
+  # inlined callee's feedback did (M5: the inline region is mono-numeric
+  # against the callee's clean table — a set bit there would deopt every
+  # call, so the caller must recompile without the inline).
   def self.feedback_widened?(cl : LuaClosure) : Bool
     fb = cl.proto.feedback
-    return false if fb.nil?
     snap = cl.fb_snap
-    if snap.nil?
-      fb.any? { |m| m != 0 }
-    else
-      fb.each_with_index.any? { |m, i| (m & ~(snap[i]? || 0_u8)) != 0 }
+    widened = if fb.nil?
+                false
+              elsif snap.nil?
+                fb.any? { |m| m != 0 }
+              else
+                fb.each_with_index.any? { |m, i| (m & ~(snap[i]? || 0_u8)) != 0 }
+              end
+    return true if widened
+    cl.inline_snaps.try &.each do |cp, sn|
+      if (f2 = cp.feedback) &&
+         f2.each_with_index.any? { |m, i| (m & ~(sn[i]? || 0_u8)) != 0 }
+        return true
+      end
     end
+    false
   end
 
   # Speculation drift check after a deopt (JIT.md §2): the deopt recorded
@@ -82,6 +96,7 @@ module Lua::JIT
       true
     else
       cl.fb_snap = cl.proto.feedback.try(&.dup)
+      cl.inline_snaps = nil # stop seeing callee widening too — never retry
       false
     end
   end

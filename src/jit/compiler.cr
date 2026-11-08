@@ -65,8 +65,18 @@ module Lua::JIT
     # path), Interp field offsets (inline hook/coroutine/depth checks and
     # value-stack re-sync) and the static weak_seen flag address.
     class_getter tag_closure : Int32 = -1
+    class_getter tag_fun : Int32 = -1
     class_getter cl_proto : Int32 = -1
     class_getter cl_compiled : Int32 = -1
+    # GETUPVAL inline (M5.1): @upvals buffer offset on LuaClosure, the
+    # byte offset of an Array's @buffer field (identical for every Array(T):
+    # fields are i32 size/capacity + pointer buffer), and the UpValue cell
+    # field offsets
+    class_getter cl_upvs : Int32 = -1
+    class_getter arr_buf : Int32 = -1
+    class_getter uv_stack : Int32 = -1
+    class_getter uv_idx : Int32 = -1
+    class_getter uv_value : Int32 = -1
     # Pointer(Void) type id: @compiled is a 16-byte nilable-pointer union
     # { i32 tag, ptr payload } — the tag gates the payload load
     class_getter cl_compiled_tag : Int32 = -1
@@ -100,6 +110,9 @@ module Lua::JIT
       # reuse slot 0 for the closure tag (after the numeric tag was read!)
       buf[0] = cl
       @@tag_closure = tags[0]
+      f1 = LuaFunction.new("probe", ->(i2 : Interp, xs : Array(LuaValue)) { xs })
+      buf[0] = f1
+      @@tag_fun = tags[0]
       o = tbl.probe_offsets
       @@tbl_mt = o[:mt]
       @@tbl_buf = o[:buf]
@@ -114,6 +127,25 @@ module Lua::JIT
       @@cl_proto = c[:proto]
       @@cl_compiled = c[:compiled]
       @@cl_compiled_tag = c[:compiled_tag]
+      @@cl_upvs = c[:upvals]
+      # Array @buffer field offset: identical for every Array(T)
+      # instantiation (i32 size/capacity + pointer buffer). Match by VALUE
+      # (arr.to_unsafe) — no candidate pointer is ever dereferenced: the
+      # object is only ~24 bytes, so reads past its fields hit the next
+      # heap object's header (a false positive there segfaulted the scan).
+      u1 = UpValue.new(nil, 0)
+      u2 = UpValue.new(nil, 1)
+      arr = [u1, u2] of UpValue
+      abase = arr.as(UInt8*)
+      bufp = arr.to_unsafe.address
+      {8, 16, 24}.each do |off|
+        @@arr_buf = off if (abase + off).as(Pointer(UInt64)).value == bufp
+      end
+      raise "JIT layout probe: Array @buffer not found" if @@arr_buf < 0
+      uo = u1.probe_offsets
+      @@uv_stack = uo[:stack]
+      @@uv_idx = uo[:idx]
+      @@uv_value = uo[:value]
       pr = cl.proto.probe_offsets
       @@pr_params = pr[:num_params]
       @@pr_vararg = pr[:vararg]
@@ -150,6 +182,14 @@ module Lua::JIT
     INLINE_EDGE = ENV["LUA5_JIT_EDGE"]? != "0"
     # cross-block numeric SSA (merge phis) — M3.7
     PHIMERGE = ENV["LUA5_JIT_PHIMERGE"]? != "0"
+    # hot-call inlining (M5); INLINE_MAX_OPS bounds the callee body
+    INLINE_CALL = ENV["LUA5_JIT_INLINE"]? != "0"
+    INLINE_MAX_OPS = 64
+    # inline fast1 builtin calls (M5.1) — kill-switch for bisection
+    FAST1_CALL = ENV["LUA5_JIT_FAST1"]? != "0"
+    # callee feedback snapshots of the last compile (M5): populated by gen,
+    # consumed by JIT.compile for the closure's drift detection
+    class_property last_inline_snaps = [] of {Proto, Array(UInt8)}
     @@tm : LLVM::TargetMachine? = nil
     # OSR entry points and block predecessor counts of the proto being
     # compiled (see compile)
@@ -165,6 +205,7 @@ module Lua::JIT
 
     # Compile `cl`; returns the machine-code entry or nil (unsupported).
     def self.compile(interp : Interp, cl : LuaClosure) : Pointer(Void)?
+      t0 = Time.monotonic if ENV["LUA5_JIT"]? == "trace"
       Layout.probe!(interp, cl)
       p = cl.proto
       # `arg`-table protos bail: the implicit local is built by push_call at
@@ -274,7 +315,13 @@ module Lua::JIT
       tm = target_machine
       mod.target = tm.triple
       mod.data_layout = tm.data_layout
+      @@last_inline_snaps = [] of {Proto, Array(UInt8)}
       gen(cl, ctx, mod, sym)
+      unless @@last_inline_snaps.empty?
+        trace("inline: #{@@last_inline_snaps.size} call site(s) in " \
+              "#{cl.proto.chunkname}:#{cl.proto.linedefined}: " \
+              "#{@@last_inline_snaps.map { |cp2, _| "#{cp2.chunkname}:#{cp2.linedefined}" }.join(",")}")
+      end
       if d = ENV["LUA5_JIT_DUMP"]?
         File.write("#{d}/#{@@sym}-pre.ll", mod.to_s)
       end
@@ -292,9 +339,14 @@ module Lua::JIT
       ts_mod = LLVM::Orc::ThreadSafeModule.new(mod, ts_ctx)
       engine.add_llvm_ir_module(engine.main_jit_dylib, ts_mod)
       @@keep << ts_ctx
+      if t0
+        trace("compile-time: #{cl.proto.chunkname}:#{cl.proto.linedefined} " \
+              "#{(Time.monotonic - t0.not_nil!).total_milliseconds.round(1)}ms")
+      end
       engine.lookup(sym)
     rescue e : CompileBail
-      trace("bail: #{cl.proto.chunkname}:#{cl.proto.linedefined} #{e.message}")
+      trace("bail: #{cl.proto.chunkname}:#{cl.proto.linedefined} #{e.message} " \
+            "(#{(Time.monotonic - t0.not_nil!).total_milliseconds.round(1)}ms)") if t0
       nil
     end
 
@@ -404,6 +456,9 @@ module Lua::JIT
       getter cl : LuaClosure
       getter code : Array(UInt64)
       getter consts : Array(LuaValue)
+      # M5: callee protos inlined so far this compile + their feedback
+      # snapshots (drift detection, see JIT.feedback_widened?)
+      getter inline_snaps = [] of {Proto, Array(UInt8)}
       # Numeric SSA: register -> f64 SSA value proven to equal the slot's
       # current content, valid within the current block only (cleared at
       # block boundaries and around any runtime call). Slots still receive
@@ -704,8 +759,7 @@ module Lua::JIT
           wire_gen_edge(dest(pc, bb))
           b.cond(truthy(a), @blocks[dest(pc, bb)], @blocks[pc + 1])
         when .getupval?
-          call_fp(:getupval, [@clp, @i32.const_int(bb), @scratch])
-          b.store(b.load(@lv, @scratch), slot(a))
+          emit_getupval(pc, a, bb, @clp)
           br_next(pc)
         when .getglobal?
           call_fp(:getglobal, [@interp, @clp, @i32.const_int(bb), @i32.const_int(pc), slot(a)])
@@ -963,7 +1017,7 @@ module Lua::JIT
           r = guard_num(pc, cr)
           t = case op
               when .eq?  then b.fcmp(LLVM::RealPredicate::OEQ, l, r)
-              when .neq? then b.fcmp(LLVM::RealPredicate::ONE, l, r)
+              when .neq? then b.fcmp(LLVM::RealPredicate::UNE, l, r) # Lua ~= is !(==): NaN ~= NaN is true; ONE would give false
               when .lt?  then b.fcmp(LLVM::RealPredicate::OLT, l, r)
               else            b.fcmp(LLVM::RealPredicate::OLE, l, r)
               end
@@ -984,7 +1038,7 @@ module Lua::JIT
         b.position_at_end(fast)
         t = case op
             when .eq?  then b.fcmp(LLVM::RealPredicate::OEQ, f64_of(vb), f64_of(vc))
-            when .neq? then b.fcmp(LLVM::RealPredicate::ONE, f64_of(vb), f64_of(vc))
+            when .neq? then b.fcmp(LLVM::RealPredicate::UNE, f64_of(vb), f64_of(vc))
             when .lt?  then b.fcmp(LLVM::RealPredicate::OLT, f64_of(vb), f64_of(vc))
             else            b.fcmp(LLVM::RealPredicate::OLE, f64_of(vb), f64_of(vc))
             end
@@ -1139,8 +1193,7 @@ module Lua::JIT
         weak = new_block("forweak#{pc}")
         b.cond(b.icmp(LLVM::IntPredicate::NE, st, @i32.const_int(0)), weak, go)
         b.position_at_end(weak)
-        d = call_fp_exit(:deopt, [@interp, @clp, @base, @i32.const_int(pc), @want])
-        b.ret(d)
+        b.ret(st) # -1: pending error from the weak-GC tick (finalizer)
         b.position_at_end(go)
         store_num(slot(a), ctrl)
         @skeys.delete(a)
@@ -1170,13 +1223,23 @@ module Lua::JIT
       end
 
       private def emit_call(pc : Int32, a : Int32, bcount : Int32, want_v : Int32) : Nil        b = @b
+        if bcount >= 0 && want_v >= 0 && Compiler::INLINE_CALL &&
+           (ctp = inline_target(pc, bcount))
+          emit_call_inline(pc, a, bcount, want_v, ctp)
+          return
+        end
+        if bcount == 1 && want_v == 1 && Compiler::FAST1_CALL &&
+           (f1 = fast1_target(pc))
+          emit_call_fast1(pc, a, f1)
+          return
+        end
         if bcount >= 0 && Compiler::FAST_CALL
           emit_call_fast(pc, a, bcount, want_v)
           return
         end
         argn = bcount == -1 ? b.sub(b.load(@i32, @cur_top), b.add(@base, @i32.const_int(a + 1))) : @i32.const_int(bcount)
         newstk = call_fp(:dispatch,
-          [@interp, @base, @i32.const_int(a), argn, @i32.const_int(want_v), @status_p])
+          [@interp, @clp, @base, @i32.const_int(pc), @i32.const_int(a), argn, @i32.const_int(want_v), @status_p])
         b.store(newstk, @cur_stack) # @stack may have been reallocated
         st = b.load(@i32, @status_p)
         bad = new_block("callbad#{pc}")
@@ -1283,7 +1346,7 @@ module Lua::JIT
         br_next(pc)
         b.position_at_end(slow)
         newstk = call_fp(:dispatch,
-          [@interp, @base, @i32.const_int(a), @i32.const_int(argn), @i32.const_int(want_v), @status_p])
+          [@interp, @clp, @base, @i32.const_int(pc), @i32.const_int(a), @i32.const_int(argn), @i32.const_int(want_v), @status_p])
         b.store(newstk, @cur_stack)
         st2 = b.load(@i32, @status_p)
         bad2 = new_block("callbad#{pc}")
@@ -1298,6 +1361,347 @@ module Lua::JIT
           b.store(b.add(@base, @i32.const_int(a + {want_v, 0}.max)), @cur_top)
         end
         br_next(pc)
+      end
+
+      # Recorded single-arg numeric builtin at this pc (M5.1): an identity
+      # guard replaces the whole dispatch for math.*-style calls
+      private def fast1_target(pc : Int32) : LuaFunction?
+        f = @cl.proto.fast1_fb.try(&.[pc]?) || return nil
+        f.fast1 ? f : nil
+      end
+
+      # CALL of a recorded fast1 builtin (math.* style): guard the LuaValue
+      # tag + object identity, prove the single argument numeric (a miss
+      # deopts at the CALL pc — the interpreter re-runs the call with the
+      # exact error semantics), then one C-ABI hop to the pure fast1 proc.
+      # No Lua runs and nothing allocates, so the caller's provenance
+      # survives; the result register becomes numeric.
+      private def emit_call_fast1(pc : Int32, a : Int32, fn1 : LuaFunction) : Nil
+        b = @b
+        slow = new_block("f1slow#{pc}")
+        cont = new_block("f1cont#{pc}")
+        vf = load_slot(a)
+        ok = b.icmp(LLVM::IntPredicate::EQ, b.extract_value(vf, 0),
+          @i32.const_int(Layout.tag_fun))
+        ok = b.and(ok, b.icmp(LLVM::IntPredicate::EQ, b.extract_value(vf, 1),
+          @i64.const_int(fn1.as(Void*).address.to_i64!)))
+        go = new_block("f1go#{pc}")
+        b.cond(ok, go, slow)
+        b.position_at_end(go)
+        v = guard_num(pc, a + 1) # deopt re-runs the CALL: exact errors
+        r = LLVM::Value.new LibLLVM.build_call2(b, @helper_types[:fast1],
+          @helpers[:fast1],
+          ([int2ptr(@i64.const_int(fn1.as(Void*).address.to_i64!)),
+            v] of LLVM::Value).to_unsafe.as(LibLLVM::ValueRef*), 2, "f1r")
+        store_num(slot(a), r)
+        kill(a)
+        @nums[a] = r
+        b.store(b.add(@base, @i32.const_int(a + 1)), @cur_top)
+        b.br(cont)
+        b.position_at_end(slow)
+        newstk = call_fp(:dispatch,
+          [@interp, @clp, @base, @i32.const_int(pc), @i32.const_int(a),
+           @i32.const_int(1), @i32.const_int(1), @status_p])
+        b.store(newstk, @cur_stack)
+        st2 = b.load(@i32, @status_p)
+        bad2 = new_block("f1bad#{pc}")
+        b.cond(b.icmp(LLVM::IntPredicate::SLT, st2, @i32.const_int(0)), bad2, cont)
+        b.position_at_end(bad2)
+        b.ret(st2)
+        b.position_at_end(cont)
+        kill_all # the slow merge ran arbitrary Lua
+        br_next(pc)
+      end
+
+      # Candidate callee for hot-call inlining (M5): the call-site feedback
+      # recorded a monomorphic LuaClosure target at this pc, its arity
+      # matches the fixed call, and the body is small, loop-free, purely
+      # register-numeric (no table/global/call ops — the inlined region
+      # runs no helpers except GETUPVAL, so no Lua and no allocation can
+      # happen between the CALL's arguments and its results; a guard deopt
+      # mid-region can therefore simply re-run the whole call) and has
+      # clean type feedback (mono-numeric with deopt guards only).
+      private def inline_target(pc : Int32, argn : Int32) : Proto?
+        cp = @cl.proto.call_fb.try(&.[pc]?)
+        if ENV["LUA5_JIT"]? == "trace" && !cp
+          Compiler.trace("inline-reject pc=#{pc}: no call_fb (size #{@cl.proto.call_fb.try(&.size)})")
+        end
+        return nil unless cp
+        return nil if cp.same?(@cl.proto) # direct recursion: body has CALLs anyway
+        return nil unless cp.num_params == argn
+        return nil if cp.needs_arg? || cp.vararg?
+        return nil if cp.packed.size > Compiler::INLINE_MAX_OPS
+        if (fb = cp.feedback) && fb.any? { |m| m != 0 }
+          return nil # callee went polymorphic somewhere — no mono-only inline
+        end
+        n = cp.packed.size
+        cp.packed.each_with_index do |w, pc2|
+          op = (w & 0xFF).to_u8!.unsafe_as(Op)
+          off = ((w >> 24).to_i64! << 44 >> 44).to_i32!
+          case op
+          when .loadk?, .loadnil?, .loadbool?, .move?, .add?, .sub?, .mul?,
+               .div?, .mod?, .pow?, .unm?, .not?, .eq?, .neq?, .lt?, .le?,
+               .getupval?
+            # pure register code
+          when .jmp?, .jmpf?, .jmpt?
+            return nil if off < 0 # loops stay out: no back-edge gates inline
+            t = pc2 + 1 + off
+            return nil if t < 0 || t >= n
+          when .return?
+            return nil if off < 0 # multi-feed return: frame-top semantics
+          else
+            return nil # table/global/call/allocation ops — normal call
+          end
+        end
+        cp
+      end
+
+      # Hot-call inlining (M5): emit the recorded callee body straight into
+      # the caller. Register convention: a callee frame's R0 is its closure
+      # slot and params start at R1, so the call's args at a+1..a+argn are
+      # already the callee's params. The inline region works in a SHADOW
+      # copy at w0 = a + max(argn, 1) (args copied up front) because the
+      # body may write its param registers — a guard deopt must find the
+      # call's arguments intact to re-run the CALL interpreted (the region
+      # cannot have side effects: it runs no Lua, and the slots it writes
+      # sit exactly where a real callee frame's window would). Results come
+      # back to a..a+want-1. Guard misses (other proto, hooks on, stack
+      # capacity) take the dispatch slow path, which is always-correct.
+      private def emit_call_inline(pc : Int32, a : Int32, argn : Int32,
+                                   want : Int32, cp : Proto) : Nil
+        b = @b
+        # callee R0 -> caller slot base + w0; args (R1..Rargn) shadow-copied
+        w0 = a + {argn, 1}.max
+        slow = new_block("icslow#{pc}")
+        cont = new_block("iccont#{pc}")
+        # guard: closure with the recorded proto, hooks off, window fits
+        vf = load_slot(a)
+        clb = new_block("iccl#{pc}")
+        b.cond(b.icmp(LLVM::IntPredicate::EQ, b.extract_value(vf, 0),
+          @i32.const_int(Layout.tag_closure)), clb, slow)
+        b.position_at_end(clb)
+        clp2 = payload_ptr(vf)
+        proto2 = b.load(@ptr, tbl_fld(clp2, Layout.cl_proto))
+        ok = b.icmp(LLVM::IntPredicate::EQ, proto2,
+          int2ptr(@i64.const_int(cp.as(Void*).address.to_i64!)))
+        ho = b.load(@i32, tbl_fld(@interp, Layout.i_hook_on))
+        ok = b.and(ok, b.icmp(LLVM::IntPredicate::EQ, ho, @i32.const_int(0)))
+        cap = b.load(@i32, tbl_fld(@interp, Layout.i_stack_cap))
+        # ensure_stack(n) guarantees size > n; the window needs
+        # base + w0 + callee max_stack + headroom for the deopt rebuild
+        need = b.add(@base, @i32.const_int(w0 + cp.max_stack + 4))
+        ok = b.and(ok, b.icmp(LLVM::IntPredicate::UGT, cap, need))
+        go = new_block("icgo#{pc}")
+        b.cond(ok, go, slow)
+        b.position_at_end(go)
+        # shadow-copy the args (callee params R1..Rargn) into the region
+        # window; numeric provenance travels with the value
+        i = 1
+        while i <= argn
+          b.store(load_slot(a + i), slot(w0 + i))
+          if v = @nums[a + i]?
+            @nums[w0 + i] = v
+          else
+            @nums.delete(w0 + i)
+          end
+          @skeys.delete(w0 + i)
+          @tabs.delete(w0 + i)
+          i += 1
+        end
+        # region blocks: one per callee pc (plus the merge `cont` above)
+        n2 = cp.packed.size
+        rblocks = Array(LLVM::BasicBlock).new(n2) { |i| new_block("ic#{pc}b#{i}") }
+        # region-local provenance discipline: kill at merge blocks and jump
+        # entries (the emitter is linear; see run for the caller analogue)
+        rp = Array(Int32).new(n2, 0)
+        jt = Set(Int32).new
+        cp.packed.each_with_index do |w, i|
+          op = (w & 0xFF).to_u8!.unsafe_as(Op)
+          off = ((w >> 24).to_i64! << 44 >> 44).to_i32!
+          case op
+          when .jmp?
+            jt << i + 1 + off
+            rp[i + 1 + off] += 1
+          when .jmpf?, .jmpt?
+            jt << i + 1 + off
+            rp[i + 1 + off] += 1
+            rp[i + 1] += 1
+          when .return? then # terminal
+          else
+            rp[i + 1] += 1 if i + 1 < n2
+          end
+        end
+        b.br(rblocks[0])
+        cconsts = cp.consts
+        pc2 = 0
+        while pc2 < n2
+          b.position_at_end(rblocks[pc2])
+          kill_all if pc2 > 0 && (rp[pc2] > 1 || jt.includes?(pc2))
+          w = cp.packed[pc2]
+          op = (w & 0xFF).to_u8!.unsafe_as(Op)
+          a2 = ((w >> 8).to_i64! << 48 >> 48).to_i32!
+          b2 = ((w >> 24).to_i64! << 44 >> 44).to_i32!
+          c2 = ((w >> 44).to_i64! << 44 >> 44).to_i32!
+          fall = pc2 + 1 < n2 ? rblocks[pc2 + 1] : cont
+          case op
+          when .loadk?
+            k = cconsts[b2]?
+            case k
+            when Float64
+              kill(w0 + a2)
+              store_num(slot(w0 + a2), @f64.const_double(k))
+              @nums[w0 + a2] = @f64.const_double(k)
+            when Bool
+              store_scalar(slot(w0 + a2), @i32.const_int(Layout.tag_bool),
+                @i64.const_int(k ? 1 : 0))
+              kill(w0 + a2)
+            when String
+              store_scalar(slot(w0 + a2), @i32.const_int(Layout.tag_str),
+                @i64.const_int(k.as(Void*).address.to_i64!))
+              kill(w0 + a2)
+            else
+              b.store(@nil_const, slot(w0 + a2))
+              kill(w0 + a2)
+            end
+            b.br(fall)
+          when .loadnil?
+            r = w0 + a2
+            while r <= w0 + a2 + b2
+              b.store(@nil_const, slot(r))
+              kill(r)
+              r += 1
+            end
+            b.br(fall)
+          when .loadbool?
+            store_scalar(slot(w0 + a2), @i32.const_int(Layout.tag_bool),
+              @i64.const_int(b2 != 0 ? 1 : 0))
+            kill(w0 + a2)
+            b.br(fall)
+          when .move?
+            if v = @nums[w0 + b2]?
+              @nums[w0 + a2] = v
+            else
+              @nums.delete(w0 + a2)
+            end
+            @skeys.delete(w0 + a2)
+            @tabs.delete(w0 + a2)
+            b.store(load_slot(w0 + b2), slot(w0 + a2))
+            b.br(fall)
+          when .add?, .sub?, .mul?, .div?, .mod?, .pow?
+            # mono-numeric only (callee feedback is clean by precondition):
+            # guard misses deopt at the CALL pc — the interpreter re-runs
+            # the call, sampling the callee's own feedback, and the drift
+            # check recompiles here without the inline
+            l = guard_num(pc, w0 + b2)
+            r = guard_num(pc, w0 + c2)
+            res = arith_fop(op, l, r)
+            store_num(slot(w0 + a2), res)
+            kill(w0 + a2)
+            @nums[w0 + a2] = res
+            b.br(fall)
+          when .unm?
+            v = guard_num(pc, w0 + b2)
+            res = b.fneg(v)
+            store_num(slot(w0 + a2), res)
+            kill(w0 + a2)
+            @nums[w0 + a2] = res
+            b.br(fall)
+          when .not?
+            store_bool(slot(w0 + a2), b.not(truthy(w0 + b2)))
+            kill(w0 + a2)
+            b.br(fall)
+          when .eq?, .neq?, .lt?, .le?
+            l = guard_num(pc, w0 + b2)
+            r = guard_num(pc, w0 + c2)
+            t = case op
+                when .eq?  then b.fcmp(LLVM::RealPredicate::OEQ, l, r)
+                when .neq? then b.fcmp(LLVM::RealPredicate::UNE, l, r) # NaN ~= NaN is true
+                when .lt?  then b.fcmp(LLVM::RealPredicate::OLT, l, r)
+                else            b.fcmp(LLVM::RealPredicate::OLE, l, r)
+                end
+            store_bool(slot(w0 + a2), t)
+            kill(w0 + a2)
+            b.br(fall)
+          when .jmp?     then b.br(rblocks[pc2 + 1 + b2])
+          when .jmpf?    then b.cond(truthy(w0 + a2), fall, rblocks[pc2 + 1 + b2])
+          when .jmpt?    then b.cond(truthy(w0 + a2), rblocks[pc2 + 1 + b2], fall)
+          when .getupval?
+            # reads the actual closure's upvalue cell, fully inlined (see
+            # emit_getupval) — pure loads, no Lua runs, no map kills
+            emit_getupval(pc, w0 + a2, b2, clp2)
+            b.br(fall)
+          when .return?
+            # results to the caller's window per `want`, nil-filled; fixed
+            # counts only (multi-feeds were rejected in inline_target)
+            j = 0
+            while j < want
+              if j < b2
+                b.store(load_slot(w0 + a2 + j), slot(a + j))
+              else
+                b.store(@nil_const, slot(a + j))
+              end
+              kill(a + j)
+              j += 1
+            end
+            b.br(cont)
+          else
+            raise CompileBail.new("inline op #{op} at pc #{pc2}")
+          end
+          pc2 += 1
+        end
+        # slow path: the plain dispatch call (same contract as emit_call)
+        b.position_at_end(slow)
+        newstk = call_fp(:dispatch,
+          [@interp, @clp, @base, @i32.const_int(pc), @i32.const_int(a),
+           @i32.const_int(argn), @i32.const_int(want), @status_p])
+        b.store(newstk, @cur_stack)
+        st2 = b.load(@i32, @status_p)
+        bad2 = new_block("icbad#{pc}")
+        b.cond(b.icmp(LLVM::IntPredicate::SLT, st2, @i32.const_int(0)), bad2, cont)
+        b.position_at_end(bad2)
+        b.ret(st2)
+        b.position_at_end(cont)
+        b.store(b.add(@base, @i32.const_int(a + {want, 0}.max)), @cur_top)
+        kill_all
+        br_next(pc)
+        @inline_snaps << {cp, cp.feedback.try(&.dup) ||
+          Array(UInt8).new(cp.packed.size, 0_u8)}
+      end
+
+
+      # GETUPVAL A B: R[A] := U[B] of closure `clp` — inlined to three
+      # dependent loads (closure -> upvals buffer -> cell) plus either the
+      # shared value-stack slot (open cell; nilable-reference @stack is a
+      # plain pointer, nil = 0) or the cell's cached value (closed). The
+      # two loads MUST stay on separate branches: a select would evaluate
+      # the open-path load through a null pointer when the cell is closed.
+      # Pure — no runtime call, so provenance of other registers survives
+      # (the old helper path killed everything; num_transfer mirrors this).
+      private def emit_getupval(pc : Int32, a : Int32, idx : Int32,
+                                clp : LLVM::Value) : Nil
+        b = @b
+        ups = b.load(@ptr, tbl_fld(clp, Layout.cl_upvs))
+        cells = b.load(@ptr, tbl_fld(ups, Layout.arr_buf))
+        # the buffer holds POINTERS to UpValue cells — load the element,
+        # then read its fields through it
+        cell = b.load(@ptr, tbl_fld(cells, idx &* 8))
+        stk = b.load(@ptr, tbl_fld(cell, Layout.uv_stack))
+        ob = new_block("uvop#{pc}#{a}")
+        cb = new_block("uvcl#{pc}#{a}")
+        mb = new_block("uvdn#{pc}#{a}")
+        b.cond(b.icmp(LLVM::IntPredicate::NE, stk, null_ptr), ob, cb)
+        b.position_at_end(ob)
+        lbuf = b.load(@lv_ptr, tbl_fld(stk, Layout.arr_buf))
+        iv = b.load(@i32, tbl_fld(cell, Layout.uv_idx))
+        ov = b.load(@lv, b.gep(@lv, lbuf, iv))
+        b.br(mb)
+        b.position_at_end(cb)
+        cv = b.load(@lv, tbl_fld(cell, Layout.uv_value))
+        b.br(mb)
+        b.position_at_end(mb)
+        v = b.phi(@lv, [ob, cb], [ov, cv])
+        b.store(v, slot(a))
+        kill(a)
       end
 
       # GETTABLE A B C: R[A] := R[B][R[C]] — numeric-key fast path. R[B] a
@@ -1713,6 +2117,7 @@ module Lua::JIT
           spec_clean?(pc) ? s : s.clear
         when .self?
           spec_clean?(pc) ? (s.delete(a); s.delete(a + 1)) : s.clear
+        when .getupval? then s.delete(a) # inlined: pure loads, no kill (M5.1)
         else s.clear # every helper-backed op: kill_all after the merge
         end
         s
@@ -1766,13 +2171,12 @@ module Lua::JIT
         end
       end
 
-      # Backward jump (loop back-edge): with weak tables around, deopt —
-      # the interpreter's back-edge handlers drive the Lua-graph GC, and a
-      # loop can be *waiting* for a weak-table sweep that only gc_full
-      # performs (repeat-until compiles to a backward JMPF, so all three
-      # jump ops take this guard). The weak flag load is inlined: the
-      # static byte is monotonic (never cleared), so flag==0 makes the
-      # helper call unnecessary.
+      # Backward jump (loop back-edge): with weak tables around, run the
+      # weak-GC tick (jit_weakcheck mirrors the interpreter's back-edge
+      # handler — stale-register clearing + weak sweep every 32nd edge, so
+      # a loop *waiting* for a weak-table sweep still makes progress) and
+      # stay in machine code. The weak flag load is inlined: the static
+      # byte is monotonic (never cleared), so flag==0 skips the helper.
       private def backedge(pc : Int32, off : Int32) : Nil
         return if off >= 0
         b = @b
@@ -1782,11 +2186,10 @@ module Lua::JIT
         b.cond(weak, slow, go)
         b.position_at_end(slow)
         st = call_fp_exit(:weakcheck, [@interp])
-        still = new_block("jmpweak2#{pc}")
-        b.cond(b.icmp(LLVM::IntPredicate::NE, st, @i32.const_int(0)), still, go)
-        b.position_at_end(still)
-        d = call_fp_exit(:deopt, [@interp, @clp, @base, @i32.const_int(pc), @want])
-        b.ret(d)
+        bad = new_block("jmpweak2#{pc}")
+        b.cond(b.icmp(LLVM::IntPredicate::NE, st, @i32.const_int(0)), bad, go)
+        b.position_at_end(bad)
+        b.ret(st) # -1: pending error (e.g. a __gc finalizer raised)
         b.position_at_end(go)
       end
 
@@ -1951,7 +2354,7 @@ module Lua::JIT
       void = ctx.void
       sigs = {
         deopt:      {[ptr, ptr, i32, i32, i32], i32, "jit_deopt"},
-        dispatch:   {[ptr, i32, i32, i32, i32, ptr.pointer], lv_ptr, "jit_dispatch_call"},
+        dispatch:   {[ptr, ptr, i32, i32, i32, i32, i32, ptr.pointer], lv_ptr, "jit_dispatch_call"},
         getupval:   {[ptr, i32, lv_ptr], void, "jit_getupval"},
         mod_fn:     {[f64, f64], f64, "jit_mod"},
         pow:        {[f64, f64], f64, "jit_pow"},
@@ -1968,6 +2371,7 @@ module Lua::JIT
         closure:    {[ptr, ptr, i32, i32, lv_ptr], void, "jit_closure"},
         close:      {[ptr, i32, i32], void, "jit_close"},
         retclose:   {[ptr, i32], void, "jit_ret"},
+        fast1:      {[ptr, f64], f64, "jit_fast1"},
         weakcheck:  {[ptr], i32, "jit_weakcheck"},
         loopedge:   {[ptr, i32, i32], i32, "jit_loopedge"},
         arith:      {[ptr, ptr, i32, i32, i32, i32, i32, lv_ptr], void, "jit_arith"},
@@ -1982,7 +2386,10 @@ module Lua::JIT
         helper_types[key] = LLVM::Type.function(sig[0], sig[1])
       end
 
-      Gen.new(cl, ctx, f, helpers, helper_types, blocks, entry, f.params[1], @@osr_heads, @@preds, @@forloops, cl.proto.feedback).run
+      g = Gen.new(cl, ctx, f, helpers, helper_types, blocks, entry, f.params[1],
+        @@osr_heads, @@preds, @@forloops, cl.proto.feedback)
+      g.run
+      Compiler.last_inline_snaps = g.inline_snaps
     end
   end
 end

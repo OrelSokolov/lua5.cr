@@ -4,10 +4,23 @@ require "./spec_helper"
 describe "JIT hotness" do
   it "hands a hot closure to the compiler" do
     Lua::JIT.compiled_count = 0
-    lua_run("local function f() end for i = 1, 600 do f() end")
+    # f's body has a GETGLOBAL — outside the M5 inline region — so f cannot
+    # be served by hot-call inlining and must tier up on its own counter.
+    lua_run("local function f(i) return math.floor(i) end " \
+            "for i = 1, 600 do f(i) end")
     # both tier up: the main chunk (back-edge hotness, OSR) and f itself
     # (calls from the OSR'd caller bump the callee counter too)
     Lua::JIT.compiled_count.should eq(2)
+  end
+
+  it "inlines a monomorphic callee instead of compiling it" do
+    Lua::JIT.compiled_count = 0
+    lua_run("local function f() end for i = 1, 600 do f() end")
+    # M5: the OSR'd main chunk inlines f at its single call site before
+    # f's own counter reaches the threshold; the inline serves every
+    # further call, so the callee never compiles on its own (verified by
+    # IR dump: zero jit_dispatch_call call sites in the compile).
+    Lua::JIT.compiled_count.should eq(1)
   end
 
   it "does not tier up below the threshold" do
@@ -191,5 +204,182 @@ describe "JIT hotness" do
       r[0].should eq(-5.0)
       r[1].should eq(-3.0)
     end
+  end
+
+  # M5 (JIT.md 5): hot-call inlining. A call-site's monomorphic callee is
+  # recorded by the interpreter (and by jit_dispatch_call for calls made
+  # from JIT code), and the compiler emits the callee body into the caller
+  # behind a closure-identity guard. Guard misses and guard deopts inside
+  # the region re-run the CALL interpreted, so every shape below must keep
+  # exact interpreter semantics.
+  describe "hot-call inlining" do
+    it "inlines a numeric helper and keeps results bit-exact" do
+      n = Lua::JIT::THRESHOLD + 100
+      r = lua_run(<<-LUA)
+        local function A(i, j)
+          local ij = i + j - 1
+          return 1.0 / (ij * (ij - 1) * 0.5 + i)
+        end
+        local s = 0
+        for i = 1, #{n} do s = s + A(i, 2) end
+        return s, A(3, 4)
+      LUA
+      exp = (1..n).sum { |i| ij = i.to_f64 + 2 - 1; 1.0 / (ij * (ij - 1) * 0.5 + i) }
+      r[0].should eq(exp)
+      ij = 3.0 + 4 - 1
+      r[1].should eq(1.0 / (ij * (ij - 1) * 0.5 + 3))
+    end
+
+    it "deopts and drops the inline when the callee goes polymorphic" do
+      n = Lua::JIT::THRESHOLD + 100
+      r = lua_run(<<-LUA)
+        local function add(a, b) return a + b end
+        local function drive(a, b)
+          local s = 0
+          for i = 1, #{n} do s = s + add(a, b) end
+          return s
+        end
+        local r1 = drive(1, 2)       -- numeric: compiles with the inline
+        local r2 = drive("1", "2")   -- guard deopt: re-run, coerce, recompile
+        return r1, r2, add("2", "3")
+      LUA
+      r[0].should eq(3.0 * n)
+      r[1].should eq(3.0 * n)
+      r[2].should eq(5.0)
+    end
+
+    it "takes the slow path when the site rebinds to another proto" do
+      n = Lua::JIT::THRESHOLD + 100
+      k = Lua::JIT::THRESHOLD + 50
+      r = lua_run(<<-LUA)
+        local function f(x) return x * 2 end
+        local g = f
+        local s = 0
+        for i = 1, #{n} do
+          s = s + g(i)
+          if i == #{k} then g = function(x) return x + 1000 end end
+        end
+        return s, g(1), f(3)
+      LUA
+      exp = (1..n).sum { |i| i <= k ? i * 2 : i + 1000 }
+      r[0].should eq(exp)
+      r[1].should eq(1001.0)
+      r[2].should eq(6.0)
+    end
+
+    it "inlines fixed multi-result returns per want" do
+      n = Lua::JIT::THRESHOLD + 100
+      r = lua_run(<<-LUA)
+        local function two() return 1, 2 end
+        local a, b = 0, 0
+        for i = 1, #{n} do
+          local x, y = two()
+          a = a + x
+          b = b + y
+          two()
+        end
+        local c = two()
+        return a, b, c
+      LUA
+      r[0].should eq(n.to_f64)
+      r[1].should eq(2.0 * n)
+      r[2].should eq(1.0)
+    end
+
+    it "inlines upvalue reads and early returns" do
+      n = Lua::JIT::THRESHOLD + 100
+      r = lua_run(<<-LUA)
+        local k = 3
+        local function addk(x) return x + k end
+        local function sgn(x)
+          if x < 0 then return -1 end
+          if x > 0 then return 1 end
+          return 0
+        end
+        local s, t, u = 0, 0, 0
+        for i = 1, #{n} do s = s + addk(i); t = t + sgn(i); u = u + sgn(-i) end
+        return s, t, u, addk(10), sgn(0)
+      LUA
+      r[0].should eq((1..n).sum { |i| i + 3 }.to_f64)
+      r[1].should eq(n.to_f64)
+      r[2].should eq(-n.to_f64)
+      r[3].should eq(13.0)
+      r[4].should eq(0.0)
+    end
+
+    it "raises proper errors from an inlined callee" do
+      n = Lua::JIT::THRESHOLD + 100
+      r = lua_run(<<-LUA)
+        local function add(a, b) return a + b end
+        for i = 1, #{n} do add(i, 1) end
+        local ok, err = pcall(add, {}, 1)
+        local ok2, r2 = pcall(add, 2, 5)
+        return ok, (err:match("arithmetic") ~= nil), ok2, r2
+      LUA
+      r[0].should be_false
+      r[1].should be_true
+      r[2].should be_true
+      r[3].should eq(7.0)
+    end
+
+    it "keeps NaN compare semantics in machine code" do
+      n = Lua::JIT::THRESHOLD + 100
+      r = lua_run(<<-LUA)
+        local function ne(a, b) return a ~= b end
+        local function eq(a, b) return a == b end
+        local nan = 0 / 0
+        for i = 1, #{n} do ne(i, i + 1); eq(i, i) end
+        return ne(nan, nan), eq(nan, nan), ne(1, 2), eq(2, 2)
+      LUA
+      r[0].should be_true # UNE, not ONE: NaN ~= NaN is true in Lua
+      r[1].should be_false
+      r[2].should be_true
+      r[3].should be_true
+    end
+  end
+
+  # Weak tables put the loop back-edge GC in play: the JIT back-edge gate
+  # runs the same weak-GC tick as the interpreter (stale-register clear +
+  # weak sweep every 32nd edge) instead of deopting the whole loop, so a
+  # hot loop *waiting* on a weak-table sweep still observes it clear.
+  it "hot loops keep driving the weak-table sweep from machine code" do
+    r = lua_run(<<-LUA)
+      local t = setmetatable({}, {__mode = 'v'})
+      do
+        local held = { 1 }
+        t.held = held
+      end
+      local n = 0
+      while t.held ~= nil and n < 500000 do
+        n = n + 1
+        local junk = { n } -- allocation pressure: Boehm reclaims `held`
+      end
+      return t.held == nil, n < 500000
+    LUA
+    r[0].should be_true
+    r[1].should be_true
+  end
+
+  it "reports finalizer errors from the weak-GC tick without crashing" do
+    r = lua_run(<<-LUA)
+      local ok, err = pcall(function()
+        local t = setmetatable({}, {__mode = 'v'})
+        do
+          local d = setmetatable({}, {__gc = function() error("boom") end})
+          t.d = d
+        end
+        local n = 0
+        while t.d ~= nil and n < 500000 do
+          n = n + 1
+          local junk = { n }
+        end
+        return "no-error"
+      end)
+      return ok, err
+    LUA
+    # __gc errors are warned, not raised (5.1 luaC semantics): the loop
+    # finishes normally and pcall sees the inner return value.
+    r[0].should be_true
+    r[1].should eq("no-error")
   end
 end

@@ -44,3 +44,4 @@ rescue e : Lua::SyntaxError
   STDERR.puts "lua5: #{e.message}"
   exit 1
 end
+STDERR.puts "lua5-jit: dispatch_count=#{Lua.dispatch_count}" if ENV["LUA5_JIT_DEBUG"]? == "count"
