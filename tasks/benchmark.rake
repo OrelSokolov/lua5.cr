@@ -130,8 +130,13 @@ namespace :benchmark do
 
   desc "Run bench suite on the Crystal interpreter (builds bin/lua5; optional: one bench name)"
   task :clua, [:bench] do |_t, args|
-    # Build only when missing or REBUILD=1 — see tasks/build.rake
-    Rake::Task["build:release"].invoke unless File.executable?(CLUA_BIN) && ENV["REBUILD"] != "1"
+    # Build when missing, REBUILD=1, or any source is newer than the binary.
+    # Without the mtime check a stale bin/lua5 silently gets benchmarked:
+    # it cost us a phantom 41s xr-update (pre-snapshot pairs code) measured
+    # at a rev whose sources already contained the fix.
+    stale = !File.executable?(CLUA_BIN) ||
+            Dir.glob(File.join(REPO_ROOT, "src", "**", "*.cr")).any? { |f| File.mtime(f) > File.mtime(CLUA_BIN) }
+    Rake::Task["build:release"].invoke if stale || ENV["REBUILD"] == "1"
     run_suite("clua", args[:bench])
   end
 end
