@@ -3,6 +3,14 @@
 # (return-based yield transport + resume_co state swap).
 module Lua::Stdlib
   module Coroutine
+    # Cached result arrays: a fresh [s] per call churned the GC in
+    # coroutine-heavy loops (coro-mgr polls status after every resume);
+    # consumers copy the value out immediately, like Lua::EMPTY_VALS
+    S_SUSPENDED = ["suspended"] of LuaValue
+    S_RUNNING   = ["running"] of LuaValue
+    S_NORMAL    = ["normal"] of LuaValue
+    S_DEAD      = ["dead"] of LuaValue
+
     def self.install(i : Interp)
       co_lib = LuaTable.new
 
@@ -13,9 +21,12 @@ module Lua::Stdlib
 
       co_lib.raw_set("resume", LuaFunction.new("resume", ->(i2 : Interp, args : Array(LuaValue)) {
         co = args[0]?
-        i2.arg_error(1, "resume", "coroutine expected") unless co.is_a?(LuaCoroutine)
-        rest = args.size > 1 ? args[1..] : ([] of LuaValue)
-        i2.resume_co(co, rest)
+        unless co.is_a?(LuaCoroutine)
+          i2.arg_error(1, "resume", "coroutine expected")
+        end
+        # values start past the coroutine argument; resume_co takes the
+        # offset directly — no args[1..] slice per resume
+        i2.resume_co(co, args, 1)
       }))
 
       co_lib.raw_set("yield", LuaFunction.new("yield", ->(i2 : Interp, args : Array(LuaValue)) {
@@ -24,14 +35,15 @@ module Lua::Stdlib
 
       co_lib.raw_set("status", LuaFunction.new("status", ->(i2 : Interp, args : Array(LuaValue)) {
         co = args[0]?
-        i2.arg_error(1, "status", "coroutine expected") unless co.is_a?(LuaCoroutine)
-        s = case co.status
-            when .suspended? then "suspended"
-            when .running?   then "running"
-            when .normal?    then "normal"
-            else                  "dead"
-            end
-        [s] of LuaValue
+        unless co.is_a?(LuaCoroutine)
+          i2.arg_error(1, "status", "coroutine expected")
+        end
+        case co.status
+        when .suspended? then S_SUSPENDED
+        when .running?   then S_RUNNING
+        when .normal?    then S_NORMAL
+        else                  S_DEAD
+        end
       }))
 
       co_lib.raw_set("wrap", LuaFunction.new("wrap", ->(i2 : Interp, args : Array(LuaValue)) {

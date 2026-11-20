@@ -1265,8 +1265,13 @@ module Lua
     property native_stack = [] of NativeEntry
     # The CALL/TAILCALL site that suspended on a yield (@suspending return
     # transport, vm.cr): frame, abs result register (-1 for a tail call),
-    # CALL C operand, tail-call flag.
-    property yield_call : {Frame, Int32, Int32, Bool}? = nil
+    # CALL C operand, tail-call flag. Flat fields, not a boxed tuple: one
+    # park per yield made the tuple allocation churn on coroutine-heavy
+    # scripts (coro-mgr).
+    property yf_frame : Frame? = nil
+    property yf_ra : Int32 = -2
+    property yf_c : Int32 = 0
+    property? yf_tail = false
     property? first_resume = true
     # Hooks are per-state (5.1 lua_sethook/getthread): swapped with the
     # stacks on resume. err_death: frames are kept (not released) after an
@@ -1278,7 +1283,10 @@ module Lua
     property? err_death = false
 
     def initialize(@fn)
-      @stack = Array(LuaValue).new(256, nil.as(LuaValue))
+      # 5.1 BASIC_STACK_SIZE: small start, grown by ensure_stack on demand —
+      # thousands of parked coroutines with a 256-slot prefill made the GC
+      # mark phase dominate coroutine-heavy scripts (coro-mgr)
+      @stack = Array(LuaValue).new(40, nil.as(LuaValue))
       @frames = [] of Frame
     end
 
@@ -1291,6 +1299,7 @@ module Lua
       @open_upvals = [] of UpValue
       @open_max = -1
       @native_stack = [] of NativeEntry
+      @yf_frame = nil
     end
 
     def gc_mark_children(m : GcMark) : Nil

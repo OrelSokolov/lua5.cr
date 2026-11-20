@@ -843,9 +843,22 @@ module Lua::JIT
           emit_forprep(pc, a, bb)
         when .forloop?
           emit_forloop(pc, a, bb)
-        when .tailcall?, .vararg?
-          # deopt wholesale: the interpreter runs the rest of the function
-          # (TAILCALL slides the frame; VARARG re-runs with frame.varargs)
+        when .tailcall?
+          if Compiler::NATIVE_CALL && bb >= 0 && (fnn = native_target(pc))
+            # A tail call to a recorded NATIVE needs no frame slide: call it,
+            # then RETURN the results (the frame dies right after — the
+            # interpreter's TAILCALL does call_value + frame_return). The
+            # wholesale deopt below cost one deopt per call on every
+            # `return native(...)` factory (oop's Entity.new: 4.5k deopts).
+            emit_tailcall_native(pc, a, bb, fnn)
+          else
+            # deopt wholesale: the interpreter runs the rest of the function
+            # (TAILCALL slides the frame)
+            st = call_fp(:deopt, [@interp, @clp, @base, @i32.const_int(pc), @want])
+            b.ret(st)
+          end
+        when .vararg?
+          # deopt wholesale: the interpreter re-runs with frame.varargs
           st = call_fp(:deopt, [@interp, @clp, @base, @i32.const_int(pc), @want])
           b.ret(st)
         when .tforcall?
@@ -906,7 +919,12 @@ module Lua::JIT
         # stage func/state/control at a+3 (the results window — func and
         # args sit exactly where the callee frame expects them)
         3.times { |i| b.store(load_slot(a + i), slot(a + 3 + i)) }
-        if Compiler::NATIVE_CALL && (fnn = native_target(pc))
+        # A loop that tiered up before its first interpreted step has no
+        # recorded iterator — fall back to the canonical `next` object so
+        # pairs-loops still get the guarded native hop (a miss on another
+        # iterator just takes the generic dispatch)
+        fnn = Compiler::NATIVE_CALL ? (native_target(pc) || Lua::Stdlib::Base::NEXT_FN) : nil
+        if fnn
           # recorded native iterator (pairs/next): the M4 identity guard
           # and a single jit_call_native hop replace the dispatch helper —
           # xr-update's 2.4M-step pairs loop paid the full dispatch per step
@@ -1007,6 +1025,67 @@ module Lua::JIT
         b.position_at_end(join)
         kill_all # the native may have run arbitrary Lua
         emit_tforcall_next(pc, a, off)
+      end
+
+      # TAILCALL of a recorded native (see the .tailcall? dispatch): guard
+      # tag + object identity + hooks off, close this frame's upvalues, one
+      # C-ABI hop to jit_call_native (want=-1: results land at R[a..]), then
+      # RETURN the results with a dynamic count (the RETURN contract:
+      # values end at stack[base..]). A guard miss deopts — the
+      # interpreter's TAILCALL handler redoes the whole slide semantics.
+      private def emit_tailcall_native(pc : Int32, a : Int32, argn : Int32,
+                                       fn : LuaFunction) : Nil
+        b = @b
+        slow = new_block("tcslow#{pc}")
+        vf = load_slot(a)
+        ok = b.icmp(LLVM::IntPredicate::EQ, b.extract_value(vf, 0),
+          @i32.const_int(Layout.tag_fun))
+        ok = b.and(ok, b.icmp(LLVM::IntPredicate::EQ, b.extract_value(vf, 1),
+          @i64.const_int(fn.as(Void*).address.to_i64!)))
+        ho = b.load(@i32, tbl_fld(@interp, Layout.i_hook_on))
+        ok = b.and(ok, b.icmp(LLVM::IntPredicate::EQ, ho, @i32.const_int(0)))
+        go = new_block("tcgo#{pc}")
+        b.cond(ok, go, slow)
+        b.position_at_end(go)
+        # close this frame's upvalues before it dies (the interpreter's
+        # TAILCALL closes at base before the call; retclose is the same
+        # guarded close and idempotent)
+        call_fp(:retclose, [@interp, @base])
+        fptr = int2ptr(@i64.const_int(fn.as(Void*).address.to_i64!))
+        newstk = LLVM::Value.new LibLLVM.build_call2(b, @helper_types[:calln],
+          @helpers[:calln],
+          ([@interp, fptr, @base, @i32.const_int(a), @i32.const_int(argn),
+            @i32.const_int(-1), @status_p] of LLVM::Value).to_unsafe.as(LibLLVM::ValueRef*), 7, "tcstk")
+        b.store(newstk, @cur_stack) # the native may reallocate the stack
+        st = b.load(@i32, @status_p)
+        bad = new_block("tcbad#{pc}")
+        copy = new_block("tccopy#{pc}")
+        b.cond(b.icmp(LLVM::IntPredicate::SLT, st, @i32.const_int(0)), bad, copy)
+        b.position_at_end(bad)
+        b.ret(st)
+        b.position_at_end(copy)
+        # RETURN with a dynamic count (native results: n at R[a..a+n-1] →
+        # slide down to R[0..n-1]) — the b == -1 RETURN shape
+        b.store(@i32.const_int(0), @ret_i)
+        loop_b = new_block("tcloop#{pc}")
+        body_b = new_block("tcbody#{pc}")
+        done_b = new_block("tcdone#{pc}")
+        b.br(loop_b)
+        b.position_at_end(loop_b)
+        iv = b.load(@i32, @ret_i)
+        b.cond(b.icmp(LLVM::IntPredicate::SLT, iv, st), body_b, done_b)
+        b.position_at_end(body_b)
+        stk = b.load(@lv_ptr, @cur_stack)
+        src = b.gep(@lv, stk, b.add(b.add(@base, @i32.const_int(a)), iv))
+        dst = b.gep(@lv, stk, b.add(@base, iv))
+        b.store(b.load(@lv, src), dst)
+        b.store(b.add(iv, @i32.const_int(1)), @ret_i)
+        b.br(loop_b)
+        b.position_at_end(done_b)
+        b.ret(st)
+        b.position_at_end(slow)
+        st2 = call_fp(:deopt, [@interp, @clp, @base, @i32.const_int(pc), @want])
+        b.ret(st2)
       end
 
       private def emit_loadk(pc : Int32, a : Int32, kb : Int32) : Nil

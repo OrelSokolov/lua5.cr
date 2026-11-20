@@ -39,7 +39,12 @@ module Lua::Pattern
     end
 
     # Try to match the pattern at position init. Returns result or nil.
+    # Caps are cleared here so ONE Matcher can be reused across positions
+    # (a successful match leaves its captures behind; a failed attempt
+    # unwinds them symmetrically, so a plain clear is exact either way).
     def match_at(init : Int32) : MatchResult?
+      @cap_start.clear
+      @cap_len.clear
       res = m(init, 0)
       return nil if res.nil?
       caps = [] of Cap

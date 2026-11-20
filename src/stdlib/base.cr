@@ -1,6 +1,59 @@
 # Base library. Port of MoonSharp StdLib/BaseLibrary.cs (lbaselib.c).
 module Lua::Stdlib
   module Base
+    # The canonical `next` function, ONE shared object like 5.1's luaB_next
+    # C closure (pairs(t) == pairs(u) is true there). The JIT's TFORCALL
+    # identity guard also specializes on it without call-site feedback —
+    # a generic-for loop that tiered up before its first interpreted step
+    # would otherwise stay on the generic dispatch forever (xr-update).
+    NEXT_FN = LuaFunction.new("next", ->(i2 : Interp, args : Array(LuaValue)) {
+      t = i2.table!(args, 0, "next")
+      k = args[1]?
+      # Key snapshot: built once per traversal, then each step is an
+      # O(1) advance (hint) + raw_get. Rebuilding raw_keys and linearly
+      # searching it on EVERY call made a pairs loop O(N²). Overwrites
+      # keep the snapshot; key-set changes drop it (iter_keys_reset!).
+      # Deleted keys may linger in it — raw_get skips them, which is
+      # exactly the 5.1 erase semantics. Never cached for weak tables.
+      keys = t.iter_keys
+      if keys.nil?
+        keys = t.raw_keys
+        t.iter_keys = keys unless t.weak_store?
+      end
+      idx : Int32
+      if k.nil?
+        idx = 0
+      elsif !t.next_hint_key.nil? && t.next_hint_idx >= 0 &&
+            t.next_hint_idx < keys.size && i2.lua_eq(t.next_hint_key, k)
+        idx = t.next_hint_idx + 1 # sequential advance — the hot path
+      else
+        found = keys.index { |x| i2.lua_eq(x, k) }
+        if found.nil?
+          # erased current key? resume from the recorded position (the
+          # following key now occupies that slot after removal; >= size
+          # just means the traversal is done)
+          if !t.next_hint_key.nil? && i2.lua_eq(t.next_hint_key, k) && t.next_hint_idx >= 0
+            idx = t.next_hint_idx
+          else
+            i2.raise_lua("invalid key to 'next'")
+          end
+        else
+          idx = found.not_nil! + 1
+        end
+      end
+      while idx < keys.size
+        key = keys[idx]
+        val = t.raw_get(key)
+        unless val.nil?
+          t.next_hint_key = key
+          t.next_hint_idx = idx
+          return i2.ret2(key, val) # scratch: no per-step allocation
+        end
+        idx += 1
+      end
+      [] of LuaValue
+    })
+
     def self.install(i : Interp)
       i.native("print") do |i2, args|
         i2.puts_out(args.map { |a| i2.lua_tostring(a) }.join("\t"))
@@ -46,59 +99,12 @@ module Lua::Stdlib
         end
       end
 
-      # next / pairs
-      nextfn = ->(i2 : Interp, args : Array(LuaValue)) {
-        t = i2.table!(args, 0, "next")
-        k = args[1]?
-        # Key snapshot: built once per traversal, then each step is an
-        # O(1) advance (hint) + raw_get. Rebuilding raw_keys and linearly
-        # searching it on EVERY call made a pairs loop O(N²). Overwrites
-        # keep the snapshot; key-set changes drop it (iter_keys_reset!).
-        # Deleted keys may linger in it — raw_get skips them, which is
-        # exactly the 5.1 erase semantics. Never cached for weak tables.
-        keys = t.iter_keys
-        if keys.nil?
-          keys = t.raw_keys
-          t.iter_keys = keys unless t.weak_store?
-        end
-        idx : Int32
-        if k.nil?
-          idx = 0
-        elsif !t.next_hint_key.nil? && t.next_hint_idx >= 0 &&
-              t.next_hint_idx < keys.size && i2.lua_eq(t.next_hint_key, k)
-          idx = t.next_hint_idx + 1 # sequential advance — the hot path
-        else
-          found = keys.index { |x| i2.lua_eq(x, k) }
-          if found.nil?
-            # erased current key? resume from the recorded position (the
-            # following key now occupies that slot after removal; >= size
-            # just means the traversal is done)
-            if !t.next_hint_key.nil? && i2.lua_eq(t.next_hint_key, k) && t.next_hint_idx >= 0
-              idx = t.next_hint_idx
-            else
-              i2.raise_lua("invalid key to 'next'")
-            end
-          else
-            idx = found.not_nil! + 1
-          end
-        end
-        while idx < keys.size
-          key = keys[idx]
-          val = t.raw_get(key)
-          unless val.nil?
-            t.next_hint_key = key
-            t.next_hint_idx = idx
-            return i2.ret2(key, val) # scratch: no per-step allocation
-          end
-          idx += 1
-        end
-        [] of LuaValue
-      }
-      i.native("next", &nextfn)
+      # next / pairs — the iterator is the canonical NEXT_FN object (above)
+      i.globals.raw_set("next", NEXT_FN)
 
       i.native("pairs") do |i2, args|
         t = i2.table!(args, 0, "pairs")
-        [LuaFunction.new("next", nextfn), t, nil] of LuaValue
+        [NEXT_FN, t, nil] of LuaValue
       end
 
       ipairs_iter = ->(i2 : Interp, args : Array(LuaValue)) {

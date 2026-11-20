@@ -8,6 +8,7 @@
 #   rake benchmark:lua      # PUC Lua 5.1.5   (bench/vendor)
 #   rake benchmark:jitlua   # LuaJIT 2.1 JIT  (bench/vendor)
 #   rake benchmark:clua     # Crystal interpreter (bin/lua5, built on demand)
+#   rake benchmark:all      # sequential run on every VM + report
 #   rake benchmark:report   # comparison table from bench/results/
 #
 # Env: BENCH_REPS (default 3), BENCH_TIMEOUT seconds (default: clua 120,

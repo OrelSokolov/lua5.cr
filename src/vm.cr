@@ -871,13 +871,23 @@ module Lua
     # run_frames entry points (frame counts) — one per nested VM re-entry.
     # coroutine.yield is only legal at depth 1 of the running coroutine.
     @entry_stack = [] of Int32
-    # The CALL/TAILCALL site that suspended on a yield: frame, abs result
-    # register (-1 for a tail call), CALL C operand, tail-call flag.
-    @yield_call : {Frame, Int32, Int32, Bool}? = nil
+    # The CALL/TAILCALL site that suspended on a yield (flat fields — a
+    # boxed tuple per yield was allocation churn on coroutine-heavy
+    # scripts): frame, abs result register (-1 for a tail call), CALL C
+    # operand, tail-call flag.
+    @yf_frame : Frame? = nil
+    @yf_ra : Int32 = -2
+    @yf_c : Int32 = 0
+    @yf_tail = false
     @suspending = false
     # The values passed to coroutine.yield while @suspending — consumed by
     # resume_co on its way out (return-based yield transport, no exception).
     @yield_values : Array(LuaValue) = Lua::EMPTY_VALS
+    # Reused [true, ...] result buffer of resume_co: filled and returned per
+    # resume. Every consumer (call_value/native call paths, coroutine.wrap)
+    # copies out of it before the next resume can possibly run, so reuse is
+    # safe; keeps resume/yield loops allocation-free (coro-mgr).
+    @resume_buf = [true] of LuaValue
     # loop back-edge counter for the weak-gated automatic GC
     @gc_tick = 0
     # Crystal-mediated Lua calls made from inside the current run_frames
@@ -1173,23 +1183,27 @@ module Lua
       nil
     end
 
-    # Place call results at R[ra] according to the CALL C operand.
-    private def store_results(frame : Frame, ra : Int32, c : Int32, r : Array(LuaValue)) : Nil
+    # Place call results at R[ra] according to the CALL C operand. rfrom:
+    # start index into `r` (resume_co passes the resume values past the
+    # coroutine argument without slicing a fresh array).
+    private def store_results(frame : Frame, ra : Int32, c : Int32, r : Array(LuaValue),
+                              rfrom : Int32 = 0) : Nil
       stack = @stack
       if c == -1
-        ensure_stack(ra + r.size + 4)
+        n = r.size - rfrom
+        ensure_stack(ra + n + 4)
         i = 0
-        while i < r.size
-          stack[ra + i] = r[i]
+        while i < n
+          stack[ra + i] = r[rfrom + i]
           i += 1
         end
-        frame.top = ra + r.size
+        frame.top = ra + n
       elsif c == 0
         frame.top = ra
       else
         i = 0
         while i < c
-          stack[ra + i] = r[i]?
+          stack[ra + i] = r[rfrom + i]?
           i += 1
         end
         frame.top = ra + c
@@ -1198,7 +1212,7 @@ module Lua
 
     # Transfer `res` from the top frame back to its caller and pop it.
     # Returns true if that was the entry frame of this run_vm (finish up).
-    private def frame_return(frame : Frame, res : Array(LuaValue)) : Bool
+    private def frame_return(frame : Frame, res : Array(LuaValue), rfrom : Int32 = 0) : Bool
       stack = @stack
       cf = @fsize >= 2 ? @frames[@fsize - 2] : nil
       if cf.nil?
@@ -1206,19 +1220,20 @@ module Lua
         return true
       end
       ra = frame.base
-      ensure_stack(ra + {res.size, frame.want}.max + 4)
+      n = res.size - rfrom
+      ensure_stack(ra + {n, frame.want}.max + 4)
       i = 0
-      while i < res.size
-        stack[ra + i] = res[i]
+      while i < n
+        stack[ra + i] = res[rfrom + i]
         i += 1
       end
       case frame.want
       when -1
-        cf.top = ra + res.size
+        cf.top = ra + n
       when 0
         cf.top = ra
       else
-        i = res.size
+        i = n
         while i < frame.want
           stack[ra + i] = nil
           i += 1
@@ -1807,7 +1822,10 @@ module Lua
                 if @suspending
                   # coroutine.yield: the CALL resumes later with the
                   # yielded values as its results
-                  @yield_call = {frame, base + a, c, false}
+                  @yf_frame = frame
+                  @yf_ra = base + a
+                  @yf_c = c
+                  @yf_tail = false
                   results = @yield_values
                   done = true
                   break
@@ -1865,6 +1883,12 @@ module Lua
               else
                 @line = lines[pc - 1]
                 @vi_pc = pc - 1
+                # call-site feedback (M4): a recorded native tail call lets
+                # the compiler emit call+return instead of deopting — every
+                # `return native(...)` factory paid one deopt per call
+                # (oop's Entity.new: 4.5k deopts). Skipped in coroutines
+                # like the CALL record.
+                proto.fast1_record(pc - 1, fn) if fn.is_a?(LuaFunction) && b >= 0 && !@current_co
                 frame.pc = pc # call position while the native runs
                 if (vf = call_target(fn)) && (@hook_on & HOOK_CALL) != 0
                   fire_hook("call", nil, vf)
@@ -1872,7 +1896,10 @@ module Lua
                 r = call_value(fn, base + a, argn, a)
                 if @suspending
                   # tail call to yield: completes as this frame's return
-                  @yield_call = {frame, -1, 0, true}
+                  @yf_frame = frame
+                  @yf_ra = -1
+                  @yf_c = 0
+                  @yf_tail = true
                   results = @yield_values
                   done = true
                   break
@@ -2003,11 +2030,21 @@ module Lua
       Lua::EMPTY_VALS
     end
 
+    # Reset the reused [true, ...] resume-result buffer (see @resume_buf).
+    private def resume_buf : Array(LuaValue)
+      buf = @resume_buf
+      buf.clear
+      buf << true
+      buf
+    end
+
     # Resume a coroutine: swap its saved stacks in, run its body (first
     # resume) or continue from the suspended CALL/TAILCALL site, and swap
     # the caller's state back on the way out. Returns 5.1-style
-    # [true, yields/returns...] / [false, err].
-    def resume_co(co : LuaCoroutine, args : Array(LuaValue)) : Array(LuaValue)
+    # [true, yields/returns...] / [false, err]. `skip`: index into `args`
+    # where the resume values start (coroutine.resume passes the arg list
+    # as-is with skip=1 — no per-resume slice allocation).
+    def resume_co(co : LuaCoroutine, args : Array(LuaValue), skip : Int32 = 0) : Array(LuaValue)
       # 5.1: bad resumes return [false, msg] like a body error, not raise
       case co.status
       when .dead?    then return [false, "cannot resume dead coroutine"] of LuaValue
@@ -2032,7 +2069,17 @@ module Lua
       # Detach the suspended natives' arg buffers (call_value's pool): the
       # resumed coroutine reuses the same pool depths while this state is
       # parked, which would mutate the arrays these entries still name.
-      s_natives.map! { |(f, fs, a)| {f, fs, a.dup} }
+      # The TOP entry — the native whose call is running resume_co
+      # (coroutine.resume / a wrap closure) — pops before this state can
+      # run Lua again, so its buffer is never observable and is left
+      # aliased (coro-mgr: it was the only entry, duped on every resume).
+      s_last = s_natives.size - 1
+      s_i = 0
+      while s_i < s_last
+        f, fs, a = s_natives[s_i]
+        s_natives[s_i] = {f, fs, a.dup}
+        s_i += 1
+      end
       @native_stack = co.native_stack
       # per-state hooks (5.1 lua_sethook): swap with the stacks
       s_hook_fn, s_hook_mask, s_hook_count, s_hook_countdown = @hook_fn, @hook_mask, @hook_count, @hook_countdown
@@ -2049,21 +2096,30 @@ module Lua
       begin
         if co.first_resume?
           co.first_resume = false
-          res = call(co.fn, args)
+          vals = skip <= 0 ? args : (args.size > skip ? args[skip..] : Lua::EMPTY_VALS)
+          res = call(co.fn, vals)
         else
-          yf, yra, yc, _tail = co.yield_call.not_nil!
-          co.yield_call = nil
+          yf = co.yf_frame.not_nil!
+          yra = co.yf_ra
+          yc = co.yf_c
+          co.yf_frame = nil
           @suspending = false
           if yra == -1
             # the yield was a tail call: its values are the frame's results
             if @fsize == 1
               co.status = LuaCoroutine::Status::Dead
               co.release
-              return ([true] of LuaValue).concat(args)
+              buf = resume_buf
+              i = skip
+              while i < args.size
+                buf << args[i]
+                i += 1
+              end
+              return buf
             end
-            frame_return(yf, args)
+            frame_return(yf, args, skip)
           else
-            store_results(yf, yra, yc, args)
+            store_results(yf, yra, yc, args, skip)
           end
           # run to the next yield or the end of the coroutine BODY (frame 0):
           # frames above (e.g. the function the yield happened in) must
@@ -2081,13 +2137,16 @@ module Lua
           co.open_max = @open_max
           co.native_stack = @native_stack
           co.hook, co.hook_mask, co.hook_count, co.hook_countdown = @hook_fn, @hook_mask, @hook_count, @hook_countdown
-          co.yield_call = @yield_call
-          @yield_call = nil
-          ([true] of LuaValue).concat(@yield_values)
+          co.yf_frame = @yf_frame
+          co.yf_ra = @yf_ra
+          co.yf_c = @yf_c
+          co.yf_tail = @yf_tail
+          @yf_frame = nil
+          resume_buf.concat(@yield_values)
         else
           co.status = LuaCoroutine::Status::Dead
           co.release
-          ([true] of LuaValue).concat(res)
+          resume_buf.concat(res)
         end
       rescue e : LuaError
         co.status = LuaCoroutine::Status::Dead
@@ -2102,7 +2161,7 @@ module Lua
         co.open_max = @open_max
         co.native_stack = @native_stack
         co.hook, co.hook_mask, co.hook_count, co.hook_countdown = @hook_fn, @hook_mask, @hook_count, @hook_countdown
-        co.yield_call = nil
+        co.yf_frame = nil
         [false, e.value] of LuaValue
       rescue e : Exception
         # Crystal-level failure inside the coroutine: no silent degradation

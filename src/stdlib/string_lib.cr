@@ -140,31 +140,37 @@ module Lua::Stdlib
         max = args.size > 3 ? (Lua.tonumber(args[3]) || -1).to_i : -1
         pat, anchored = strip_anchor(p)
         buf = IO::Memory.new
+        # ONE matcher for the whole traversal — a fresh Matcher per position
+        # was one heap allocation per subject byte (news: ~30M allocs)
+        mcher = Pattern::Matcher.new(pat, s)
         count = 0
         pos = 0
+        run = 0 # unmatched bytes since the last flush
         while count != max
-          m = Pattern::Matcher.new(pat, s).match_at(pos)
+          m = mcher.match_at(pos)
           if m
             count += 1
+            if pos > run
+              buf.write(s[run...pos])
+              run = pos
+            end
             add_replacement(i2, buf, s, pos, m, repl)
             e = m.end_pos
             if e > pos
-              pos = e
+              run = pos = e
             elsif pos < s.size # empty match: copy one byte and advance
-              buf.write_byte(s[pos])
               pos += 1
-            else # empty match at end of subject: done (lstrlib breaks here)
+            else # empty match at end of subject: done (lstrlib breaks)
               break
             end
           elsif pos < s.size
-            buf.write_byte(s[pos])
             pos += 1
           else
             break
           end
           break if anchored
         end
-        buf.write(s[pos..]) if pos < s.size
+        buf.write(s[run..]) if run < s.size
         [String.new(buf.to_slice), count.to_f64] of LuaValue
       }))
 

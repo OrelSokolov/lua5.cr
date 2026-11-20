@@ -139,4 +139,16 @@ namespace :benchmark do
     Rake::Task["build:release"].invoke if stale || ENV["REBUILD"] == "1"
     run_suite("clua", args[:bench])
   end
+
+  # Sequential benchmark of everything: full suite on every VM, then the
+  # comparison report. clua builds bin/lua5 on demand via its own staleness
+  # check; env vars (BENCH_REPS, BENCH_TIMEOUT, REBUILD) apply as usual.
+  desc "Run bench suite on every VM sequentially, print report"
+  task :all do
+    %w[lua jitlua jitoff clua].each do |vm|
+      puts "\n==> benchmark:#{vm}"
+      Rake::Task["benchmark:#{vm}"].invoke
+    end
+    Rake::Task["benchmark:report"].invoke
+  end
 end

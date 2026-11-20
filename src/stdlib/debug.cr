@@ -100,7 +100,7 @@ module Lua
     # or died inside — reconstructed from the top frame's pending CALL
     # instruction, exactly the ci 5.1 leaves on the coroutine's stack.
     private def co_pending_native(co : LuaCoroutine) : {LuaValue, Array(LuaValue)}?
-      return nil unless co.fsize > 0 && (co.yield_call || co.err_death?)
+      return nil unless co.fsize > 0 && (co.yf_frame || co.err_death?)
       fr = co.frames[co.fsize - 1]
       pc = fr.pc - 1
       return nil if pc < 0
